@@ -1,0 +1,17 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    # arm64, like the Pis. The runner kernel allows kprobes in privileged containers.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: docker build --target test -t ebpf-netmon:test .
+      - name: Smoke test
+        run: docker run --rm --privileged ebpf-netmon:test
