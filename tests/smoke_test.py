@@ -45,9 +45,28 @@ def udp_traffic():
     rx.close()
 
 
+def check_sampled(out):
+    """-k 1 prints at most one row per report, each with a scale >= 1."""
+    rows = [json.loads(line) for line in out.splitlines()]
+    per_report = {}
+    for row in rows:
+        per_report[row["ts"]] = per_report.get(row["ts"], 0) + 1
+        if row["scale"] < 1:
+            sys.exit(f"FAIL: scale below 1: {row}")
+    if not rows or max(per_report.values()) > 1:
+        sys.exit(f"FAIL: want 1 row per report with -k 1, got {per_report}")
+    print("sampled rows per report:", per_report)
+
+
 def main():
     netmon = subprocess.Popen(
         ["netmon", "-j", "-n", "0", "-i", "1", "-c", "4"],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    # A second instance keeps one row per report via priority sampling.
+    sampled = subprocess.Popen(
+        ["netmon", "-j", "-k", "1", "-i", "1", "-c", "4"],
         stdout=subprocess.PIPE,
         text=True,
     )
@@ -55,8 +74,10 @@ def main():
     tcp_traffic()
     udp_traffic()
     out, _ = netmon.communicate(timeout=30)
-    if netmon.returncode != 0:
-        sys.exit(f"netmon exited with {netmon.returncode}")
+    sampled_out, _ = sampled.communicate(timeout=30)
+    if netmon.returncode != 0 or sampled.returncode != 0:
+        sys.exit(f"netmon exited with {netmon.returncode}, {sampled.returncode}")
+    check_sampled(sampled_out)
 
     # Sender and receiver are both this process, so expect at least the
     # payload in each direction.
