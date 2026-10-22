@@ -136,8 +136,9 @@ scripts/install_service.sh
 
 It installs `netmon` and a systemd service that reports every 10 seconds
 to `/var/lib/netmon/raw`. The raw files are kept as written; converting
-them to Parquet is a separate step. Nothing deletes old files yet, at
-roughly 10-20 MB a day per Pi.
+them to Parquet is a separate step. Nothing deletes old files yet. An idle
+Pi writes about 650 rows (120 KB) an hour, or 3 MB a day; busier Pis write
+more.
 
 ## Run a Docker-built binary on a Pi
 
