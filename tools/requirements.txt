@@ -1,0 +1,2 @@
+# For tools/to_iceberg.py. Day partitioning needs pyiceberg-core.
+pyiceberg[pyarrow,sql-sqlite,pyiceberg-core]==0.12.0
