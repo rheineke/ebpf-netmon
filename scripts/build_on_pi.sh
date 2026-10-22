@@ -2,9 +2,9 @@
 # Builds netmon natively on a Raspberry Pi (Raspberry Pi OS / Debian trixie,
 # arm64) and runs the tests. Run it from a clone of this repo:
 #
-#   scripts/build-on-pi.sh            install packages, build, run all tests
-#   scripts/build-on-pi.sh --no-deps  skip apt-get (packages already installed)
-#   scripts/build-on-pi.sh --no-smoke skip the smoke test, which needs sudo
+#   scripts/build_on_pi.sh            install packages, build, run all tests
+#   scripts/build_on_pi.sh --no-deps  skip apt-get (packages already installed)
+#   scripts/build_on_pi.sh --no-smoke skip the smoke test, which needs sudo
 #
 # The binary ends up in build/netmon. Run it with: sudo build/netmon
 set -eu

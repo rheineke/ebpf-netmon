@@ -53,7 +53,7 @@ On a Pi running Raspberry Pi OS (Debian trixie, arm64), from a clone of
 this repo:
 
 ```sh
-scripts/build-on-pi.sh
+scripts/build_on_pi.sh
 sudo build/netmon
 ```
 
