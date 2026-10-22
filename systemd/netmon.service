@@ -1,0 +1,19 @@
+# Captures netmon reports to /var/lib/netmon/raw/YYYY-MM-DD/HH.jsonl (UTC).
+# Install with scripts/install_service.sh.
+[Unit]
+Description=netmon per-process network byte counts
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/netmon -i 10 -n 0 -o /var/lib/netmon/raw
+Restart=on-failure
+RestartSec=10
+StateDirectory=netmon
+# Loading BPF needs root, but nothing else does.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

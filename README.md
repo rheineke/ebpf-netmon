@@ -13,7 +13,8 @@ last interval, and the NFS file bytes it read and wrote, like `top`:
 ```
 
 Options: `-i` interval in seconds (default 2), `-c` number of reports,
-`-n` rows (0 = all), `-k` priority-sample rows (see below), `-j` JSON lines.
+`-n` rows (0 = all), `-k` priority-sample rows (see below), `-j` JSON lines,
+`-o DIR` JSON lines appended to hourly files (see Capture).
 
 It uses kprobes on `tcp_sendmsg`, `tcp_cleanup_rbuf`, `udp(v6)_sendmsg` and
 `udp(v6)_recvmsg`, and kretprobes on `nfs_file_read`, `nfs_file_splice_read`
@@ -116,6 +117,27 @@ sudo python3 tests/nfs_test.py FILE_ON_NFS [DIR_ON_NFS]
 
 CI runs it against a loopback NFS export. On a Pi 4 it matched exactly for
 the Synology NAS (read-only) and a loopback export (read and write).
+
+## Capture
+
+`netmon -o DIR` appends each report as JSON lines to
+`DIR/YYYY-MM-DD/HH.jsonl`, one file per UTC hour, so a file is complete
+once its hour has passed. Each row is one process in one interval:
+
+```json
+{"ts":1792666261,"host":"pi64-dev","interval_s":10,"pid":4309,"uid":0,"comm":"nfsd","tcp_tx":84,"tcp_rx":120,"udp_tx":0,"udp_rx":0,"nfs_read":0,"nfs_write":0,"scale":1}
+```
+
+To capture continuously on a Pi, after `scripts/build_on_pi.sh`:
+
+```sh
+scripts/install_service.sh
+```
+
+It installs `netmon` and a systemd service that reports every 10 seconds
+to `/var/lib/netmon/raw`. The raw files are kept as written; converting
+them to Parquet is a separate step. Nothing deletes old files yet, at
+roughly 10-20 MB a day per Pi.
 
 ## Run a Docker-built binary on a Pi
 
