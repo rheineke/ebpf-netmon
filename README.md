@@ -69,8 +69,7 @@ docker build --target lint .   # clang-tidy, which needs Linux headers
 
 CI also scans the whole git history with gitleaks, runs the unit and smoke
 tests under ASan and UBSan (`make sanitize`, or
-`docker build --target sanitize`), and runs CodeQL on the C/C++, Python and
-workflows.
+`docker build --target sanitize`).
 
 ## Build on a Pi
 
