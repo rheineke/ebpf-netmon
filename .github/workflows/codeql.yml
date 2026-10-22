@@ -28,12 +28,13 @@ jobs:
     # Debian trixie, like the Pis, for bpftool and a recent libbpf.
     container: debian:trixie
     steps:
-      - name: Install build packages
-        if: matrix.build-mode == 'manual'
+      # CodeQL needs git and python3 for every language.
+      - name: Install packages
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends bpftool clang g++ \
-            libbpf-dev libelf-dev linux-libc-dev llvm make zlib1g-dev
+          apt-get install -y --no-install-recommends ca-certificates git \
+            python3 bpftool clang g++ libbpf-dev libelf-dev linux-libc-dev \
+            llvm make zlib1g-dev
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
