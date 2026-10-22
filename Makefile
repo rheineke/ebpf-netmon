@@ -2,7 +2,8 @@
 ARCH := $(shell uname -m | sed -e 's/x86_64/x86/' -e 's/aarch64/arm64/')
 MULTIARCH := $(shell $(CC) -print-multiarch)
 CLANG ?= clang
-BPFTOOL ?= bpftool
+# Debian installs bpftool in /usr/sbin, which is not on a normal user's PATH.
+BPFTOOL ?= $(or $(shell command -v bpftool),/usr/sbin/bpftool)
 CXXFLAGS ?= -O2 -g -Wall -Wextra -Werror
 BUILD := build
 
@@ -17,7 +18,7 @@ $(BUILD)/netmon.bpf.o: src/netmon.bpf.c src/netmon.h | $(BUILD)
 		-I/usr/include/$(MULTIARCH) -c $< -o $@
 
 $(BUILD)/netmon.skel.h: $(BUILD)/netmon.bpf.o
-	$(BPFTOOL) gen skeleton $< > $@
+	$(BPFTOOL) gen skeleton $< > $@.tmp && mv $@.tmp $@
 
 # libbpf is linked statically so the binary only needs libelf and zlib.
 $(BUILD)/netmon: src/netmon.cpp src/netmon.h src/priority_sample.h \
