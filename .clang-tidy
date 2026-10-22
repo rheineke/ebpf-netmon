@@ -1,0 +1,21 @@
+# Bug-finding and performance checks; style is left to clang-format.
+# Disabled:
+#   clang-analyzer-unix.Malloc: false positive in the bpftool skeleton,
+#     which frees through libbpf.
+#   performance-enum-size: netmon.h is shared with the BPF C code, which
+#     has no std::uint8_t.
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  clang-analyzer-*,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  -clang-analyzer-unix.Malloc,
+  performance-*,
+  -performance-enum-size,
+  modernize-use-nullptr,
+  modernize-use-override,
+  readability-container-size-empty,
+  readability-redundant-string-cstr
+WarningsAsErrors: "*"

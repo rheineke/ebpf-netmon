@@ -21,5 +21,13 @@ ENTRYPOINT ["netmon"]
 FROM runtime AS test
 RUN apt-get update && apt-get install -y --no-install-recommends python3 \
     && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
 COPY tests ./tests
 ENTRYPOINT ["python3", "tests/smoke_test.py"]
+
+# clang-tidy on the C++, which needs the generated skeleton and libbpf headers.
+FROM build AS lint
+RUN apt-get update && apt-get install -y --no-install-recommends clang-tidy \
+    && rm -rf /var/lib/apt/lists/*
+COPY .clang-tidy ./
+RUN make tidy

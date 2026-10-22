@@ -11,10 +11,12 @@ jobs:
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
-      - name: ShellCheck
+      # Formatters and linters from .pre-commit-config.yaml; fails on any change.
+      - name: pre-commit
         run: |
-          command -v shellcheck || sudo apt-get install -y shellcheck
-          shellcheck scripts/*.sh
+          pipx run pre-commit run --all-files --show-diff-on-failure
+      - name: clang-tidy
+        run: docker build --target lint .
       - name: Build
         run: docker build --target test -t ebpf-netmon:test .
       - name: Smoke test
