@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: (MIT OR GPL-2.0-only)
 /*
- * Per-process TCP/UDP byte counts.
+ * Per-process TCP/UDP byte counts, and NFS file bytes read and written.
  *
  * Every probe reads only integer arguments and return values, never kernel
  * structs, so this needs no CO-RE and no kernel BTF. Raspberry Pi kernels
@@ -79,4 +79,29 @@ SEC("kretprobe/udpv6_recvmsg")
 int BPF_KRETPROBE(udpv6_recvmsg_ret, int ret)
 {
 	return account(NETMON_UDP_RX, ret);
+}
+
+/*
+ * NFS reads and writes go over the wire from kernel threads (nfsiod,
+ * rpciod), so the socket probes above cannot see which process asked for
+ * them. These run in the calling process and return the file bytes it read
+ * or wrote, including reads served from the page cache.
+ */
+SEC("kretprobe/nfs_file_read")
+int BPF_KRETPROBE(nfs_file_read_ret, long ret)
+{
+	return account(NETMON_NFS_READ, ret);
+}
+
+/* sendfile() and splice() from an NFS file, e.g. a media server streaming. */
+SEC("kretprobe/nfs_file_splice_read")
+int BPF_KRETPROBE(nfs_file_splice_read_ret, long ret)
+{
+	return account(NETMON_NFS_READ, ret);
+}
+
+SEC("kretprobe/nfs_file_write")
+int BPF_KRETPROBE(nfs_file_write_ret, long ret)
+{
+	return account(NETMON_NFS_WRITE, ret);
 }

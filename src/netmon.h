@@ -8,6 +8,8 @@ enum netmon_counter {
 	NETMON_TCP_RX,
 	NETMON_UDP_TX,
 	NETMON_UDP_RX,
+	NETMON_NFS_READ, /* file bytes, not wire bytes; see netmon.bpf.c */
+	NETMON_NFS_WRITE,
 	NETMON_NR_COUNTERS,
 };
 
