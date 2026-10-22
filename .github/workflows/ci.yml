@@ -35,6 +35,20 @@ jobs:
         run: docker build --target test -t ebpf-netmon:test .
       - name: Smoke test
         run: docker run --rm --privileged ebpf-netmon:test
+      # A loopback NFS export on the runner. --pid=host because netmon
+      # reports host pids, and the test looks for its own.
+      - name: NFS test
+        run: |
+          sudo apt-get install -y -qq nfs-kernel-server
+          sudo mkdir -p /srv/nfstest /mnt/nfstest
+          echo "/srv/nfstest 127.0.0.1(rw,sync,no_subtree_check,no_root_squash)" \
+            | sudo tee -a /etc/exports
+          sudo exportfs -ra
+          sudo mount -t nfs4 127.0.0.1:/srv/nfstest /mnt/nfstest
+          head -c 30000000 /dev/urandom | sudo tee /srv/nfstest/sample.bin >/dev/null
+          docker run --rm --privileged --pid=host -v /mnt/nfstest:/mnt/nfstest \
+            --entrypoint python3 ebpf-netmon:test \
+            tests/nfs_test.py /mnt/nfstest/sample.bin /mnt/nfstest
       # The same script a Pi runs, as a non-root user with sudo, so PATH
       # matches a normal Pi login.
       - name: Build script
