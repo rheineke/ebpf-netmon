@@ -15,7 +15,7 @@
 
 struct PrioritySample {
 	std::size_t index;  // into the weights passed in
-	double scale;	    // estimate / weight; multiply every counter by it
+	double scale;  // estimate / weight; multiply every counter by it
 };
 
 // Weights must be positive. Returns all records with scale 1 when n <= k.

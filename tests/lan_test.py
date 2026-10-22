@@ -45,7 +45,7 @@ def serve():
     try:
         while True:
             got["udp_rx"] += len(udp.recv(2048))
-    except socket.timeout:
+    except TimeoutError:
         pass
     print(f"from {peer[0]}: {got}", flush=True)
 
@@ -76,8 +76,10 @@ def send(host):
         udp.sendto(b"u" * DATAGRAM_SIZE, (host, PORT))
         if i % 100 == 0:
             time.sleep(0.01)  # pace so a LAN switch does not drop bursts
-    print(f"sent {TCP_BYTES} TCP, received {got} TCP, "
-          f"sent {DATAGRAMS * DATAGRAM_SIZE} UDP")
+    print(
+        f"sent {TCP_BYTES} TCP, received {got} TCP, "
+        f"sent {DATAGRAMS * DATAGRAM_SIZE} UDP"
+    )
 
 
 def main():

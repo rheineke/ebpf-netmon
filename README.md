@@ -47,6 +47,25 @@ docker build --target runtime -t ebpf-netmon .
 docker run --rm --privileged ebpf-netmon        # watch the Docker VM
 ```
 
+## Linters and formatters
+
+[pre-commit](https://pre-commit.com) runs them on each commit, and CI runs
+them on every file:
+
+```sh
+pip install pre-commit && pre-commit install
+pre-commit run --all-files
+docker build --target lint .   # clang-tidy, which needs Linux headers
+```
+
+| Language | Formatter | Linter |
+|---|---|---|
+| C (BPF), C++ | clang-format (kernel style, `.clang-format`) | clang-tidy (`.clang-tidy`), compiler `-Wall -Werror` |
+| Python | ruff format | ruff check (`ruff.toml`) |
+| Shell | shfmt (Google style: `-i 2 -ci -bn`) | ShellCheck |
+| Dockerfile | | hadolint (`.hadolint.yaml`) |
+| GitHub Actions | | actionlint |
+
 ## Build on a Pi
 
 On a Pi running Raspberry Pi OS (Debian trixie, arm64), from a clone of

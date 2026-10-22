@@ -1,0 +1,6 @@
+# Python 3.13 is what Debian trixie (the Pis) ships.
+target-version = "py313"
+
+[lint]
+# pycodestyle, pyflakes, isort, pyupgrade, bugbear.
+select = ["E", "F", "W", "I", "UP", "B"]

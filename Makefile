@@ -7,7 +7,7 @@ BPFTOOL ?= $(or $(shell command -v bpftool),/usr/sbin/bpftool)
 CXXFLAGS ?= -O2 -g -Wall -Wextra -Werror
 BUILD := build
 
-.PHONY: all test clean
+.PHONY: all test tidy clean
 all: $(BUILD)/netmon
 
 $(BUILD):
@@ -33,6 +33,11 @@ $(BUILD)/priority_sample_test: tests/priority_sample_test.cpp \
 
 test: $(BUILD)/priority_sample_test
 	$<
+
+# Lints the C++; the BPF C is checked by clang -Wall -Werror above.
+tidy: $(BUILD)/netmon.skel.h
+	clang-tidy --quiet --header-filter="src/.*" --exclude-header-filter="build/.*" src/netmon.cpp tests/priority_sample_test.cpp -- \
+		-std=c++20 -I$(BUILD) -Isrc
 
 clean:
 	rm -rf $(BUILD)

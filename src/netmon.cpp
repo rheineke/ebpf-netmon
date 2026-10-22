@@ -53,15 +53,16 @@ struct Row {
 
 void usage(const char *prog)
 {
-	std::fprintf(stderr,
-		     "usage: %s [-i seconds] [-c count] [-n top | -k sample] [-j]\n"
-		     "  -i  interval between reports (default 2)\n"
-		     "  -c  number of reports, then exit (default: until ^C)\n"
-		     "  -n  rows per report (default 10, 0 = all)\n"
-		     "  -k  priority-sample this many rows per report, with\n"
-		     "      unbiased estimates (see README); overrides -n\n"
-		     "  -j  JSON lines instead of a table\n",
-		     prog);
+	std::fprintf(
+		stderr,
+		"usage: %s [-i seconds] [-c count] [-n top | -k sample] [-j]\n"
+		"  -i  interval between reports (default 2)\n"
+		"  -c  number of reports, then exit (default: until ^C)\n"
+		"  -n  rows per report (default 10, 0 = all)\n"
+		"  -k  priority-sample this many rows per report, with\n"
+		"      unbiased estimates (see README); overrides -n\n"
+		"  -j  JSON lines instead of a table\n",
+		prog);
 }
 
 bool parse_options(int argc, char **argv, Options &opts)
@@ -69,7 +70,9 @@ bool parse_options(int argc, char **argv, Options &opts)
 	int c;
 	while ((c = getopt(argc, argv, "i:c:n:k:jh")) != -1) {
 		switch (c) {
-		case 'i': opts.interval_s = std::max(1, std::atoi(optarg)); break;
+		case 'i':
+			opts.interval_s = std::max(1, std::atoi(optarg));
+			break;
 		case 'c': opts.count = std::max(0, std::atoi(optarg)); break;
 		case 'n': opts.top = std::max(0, std::atoi(optarg)); break;
 		case 'k': opts.sample = std::max(0, std::atoi(optarg)); break;
@@ -168,6 +171,7 @@ std::vector<Row> sample_rows(std::vector<Row> rows, size_t k,
 			     std::mt19937_64 &rng)
 {
 	std::vector<double> weights;
+	weights.reserve(rows.size());
 	for (const Row &r : rows)
 		weights.push_back(static_cast<double>(r.total()));
 	std::vector<Row> kept;
@@ -201,7 +205,8 @@ void print_table(const std::vector<Row> &rows, const Options &opts)
 	for (size_t i = 0; i < n; ++i) {
 		const Row &r = rows[i];
 		std::printf("%8u %6u %-16s %9s %9s %9s %9s", r.pid, r.uid,
-			    r.comm.c_str(), human(r.delta[NETMON_TCP_TX]).c_str(),
+			    r.comm.c_str(),
+			    human(r.delta[NETMON_TCP_TX]).c_str(),
 			    human(r.delta[NETMON_TCP_RX]).c_str(),
 			    human(r.delta[NETMON_UDP_TX]).c_str(),
 			    human(r.delta[NETMON_UDP_RX]).c_str());
@@ -214,19 +219,21 @@ void print_table(const std::vector<Row> &rows, const Options &opts)
 
 void print_json(const std::vector<Row> &rows, const Options &opts)
 {
-	long long ts = std::chrono::duration_cast<std::chrono::seconds>(
-			       std::chrono::system_clock::now().time_since_epoch())
-			       .count();
+	long long ts =
+		std::chrono::duration_cast<std::chrono::seconds>(
+			std::chrono::system_clock::now().time_since_epoch())
+			.count();
 	size_t n = rows_to_print(rows, opts);
 	for (size_t i = 0; i < n; ++i) {
 		const Row &r = rows[i];
-		std::printf("{\"ts\":%lld,\"interval_s\":%d,\"pid\":%u,\"uid\":%u,"
-			    "\"comm\":\"%s\",\"tcp_tx\":%llu,\"tcp_rx\":%llu,"
-			    "\"udp_tx\":%llu,\"udp_rx\":%llu,\"scale\":%.17g}\n",
-			    ts, opts.interval_s, r.pid, r.uid,
-			    json_escape(r.comm).c_str(), r.delta[NETMON_TCP_TX],
-			    r.delta[NETMON_TCP_RX], r.delta[NETMON_UDP_TX],
-			    r.delta[NETMON_UDP_RX], r.scale);
+		std::printf(
+			"{\"ts\":%lld,\"interval_s\":%d,\"pid\":%u,\"uid\":%u,"
+			"\"comm\":\"%s\",\"tcp_tx\":%llu,\"tcp_rx\":%llu,"
+			"\"udp_tx\":%llu,\"udp_rx\":%llu,\"scale\":%.17g}\n",
+			ts, opts.interval_s, r.pid, r.uid,
+			json_escape(r.comm).c_str(), r.delta[NETMON_TCP_TX],
+			r.delta[NETMON_TCP_RX], r.delta[NETMON_UDP_TX],
+			r.delta[NETMON_UDP_RX], r.scale);
 	}
 	std::fflush(stdout);
 }

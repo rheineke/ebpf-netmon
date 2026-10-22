@@ -1,0 +1,30 @@
+# Linux kernel style (tabs, 80 columns), which the BPF code follows; the
+# C++ uses the same settings. Trimmed from the kernel's own .clang-format.
+BasedOnStyle: LLVM
+UseTab: ForContinuationAndIndentation
+IndentWidth: 8
+TabWidth: 8
+ContinuationIndentWidth: 8
+ColumnLimit: 80
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterFunction: true
+  AfterNamespace: false
+  AfterStruct: false
+  AfterEnum: false
+  AfterControlStatement: Never
+  BeforeElse: false
+AccessModifierOffset: -8
+AllowShortBlocksOnASingleLine: Never
+AllowShortFunctionsOnASingleLine: All
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: true
+IndentCaseLabels: false
+AlignConsecutiveMacros: false
+SortIncludes: Never
+SpacesBeforeTrailingComments: 2
+ReflowComments: false
+PenaltyBreakBeforeFirstCallParameter: 1000
+BreakStringLiterals: false
+AlignTrailingComments: false
