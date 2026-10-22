@@ -7,7 +7,7 @@ BPFTOOL ?= $(or $(shell command -v bpftool),/usr/sbin/bpftool)
 CXXFLAGS ?= -O2 -g -Wall -Wextra -Werror
 BUILD := build
 
-.PHONY: all test tidy clean
+.PHONY: all test tidy sanitize clean
 all: $(BUILD)/netmon
 
 $(BUILD):
@@ -38,6 +38,13 @@ test: $(BUILD)/priority_sample_test
 tidy: $(BUILD)/netmon.skel.h
 	clang-tidy --quiet --header-filter="src/.*" --exclude-header-filter="build/.*" src/netmon.cpp tests/priority_sample_test.cpp -- \
 		-std=c++20 -I$(BUILD) -Isrc
+
+# The same build with ASan and UBSan in build/asan; any report is fatal.
+# Runs the unit tests; the Docker sanitize stage also runs the smoke test.
+SANITIZE := -fsanitize=address,undefined -fno-sanitize-recover=all \
+	-fno-omit-frame-pointer
+sanitize:
+	$(MAKE) BUILD=$(BUILD)/asan CXXFLAGS="$(CXXFLAGS) $(SANITIZE)" all test
 
 clean:
 	rm -rf $(BUILD)

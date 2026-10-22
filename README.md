@@ -64,7 +64,13 @@ docker build --target lint .   # clang-tidy, which needs Linux headers
 | Python | ruff format | ruff check (`ruff.toml`) |
 | Shell | shfmt (Google style: `-i 2 -ci -bn`) | ShellCheck |
 | Dockerfile | | hadolint (`.hadolint.yaml`) |
-| GitHub Actions | | actionlint |
+| GitHub Actions | | actionlint, zizmor (security) |
+| Everything | | gitleaks (secrets), typos (spelling) |
+
+CI also scans the whole git history with gitleaks, runs the unit and smoke
+tests under ASan and UBSan (`make sanitize`, or
+`docker build --target sanitize`), and runs CodeQL on the C/C++, Python and
+workflows.
 
 ## Build on a Pi
 

@@ -239,9 +239,9 @@ void print_json(const std::vector<Row> &rows, const Options &opts)
 }
 
 // Attaches each probe on its own so a kernel missing one symbol still runs.
-int attach(netmon_bpf *skel)
+std::vector<bpf_link *> attach(netmon_bpf *skel)
 {
-	int attached = 0;
+	std::vector<bpf_link *> links;
 	bpf_program *prog;
 	bpf_object__for_each_program(prog, skel->obj)
 	{
@@ -251,9 +251,16 @@ int attach(netmon_bpf *skel)
 				     bpf_program__section_name(prog));
 			continue;
 		}
-		++attached;  // links are released when the process exits
+		links.push_back(link);
 	}
-	return attached;
+	return links;
+}
+
+void detach(std::vector<bpf_link *> &links)
+{
+	for (bpf_link *link : links)
+		bpf_link__destroy(link);
+	links.clear();
 }
 
 }  // namespace
@@ -272,7 +279,8 @@ int main(int argc, char **argv)
 				     "(run as root?)\n");
 		return 1;
 	}
-	if (attach(skel) == 0) {
+	std::vector<bpf_link *> links = attach(skel);
+	if (links.empty()) {
 		netmon_bpf__destroy(skel);
 		return 1;
 	}
@@ -298,6 +306,7 @@ int main(int argc, char **argv)
 			print_table(rows, opts);
 	}
 
+	detach(links);
 	netmon_bpf__destroy(skel);
 	return 0;
 }
