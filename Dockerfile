@@ -7,7 +7,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /src
 COPY Makefile ./
 COPY src ./src
-RUN make
+COPY tests ./tests
+RUN make all test
 
 FROM debian:trixie-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
