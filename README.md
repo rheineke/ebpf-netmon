@@ -47,7 +47,40 @@ docker build --target runtime -t ebpf-netmon .
 docker run --rm --privileged ebpf-netmon        # watch the Docker VM
 ```
 
-## Run on a Pi
+## Build on a Pi
+
+On a Pi running Raspberry Pi OS (Debian trixie, arm64), from a clone of
+this repo:
+
+```sh
+scripts/build-on-pi.sh
+sudo build/netmon
+```
+
+The script installs the build packages with apt, checks that the kernel has
+BPF and kprobes, builds, and runs the unit and smoke tests. Use `--no-deps`
+to skip apt and `--no-smoke` to skip the smoke test, which needs sudo.
+Tested on a Pi 4 with kernel 6.18.50+rpt-rpi-v8.
+
+To check the counts over a real network, run the Pi side first, then the
+sender on another machine (needs only python3):
+
+```sh
+sudo python3 tests/lan_test.py serve        # on the Pi
+python3 tests/lan_test.py send PI_ADDRESS   # on another machine
+```
+
+It moves 100 MiB of TCP each way and 6 MB of UDP, and passes when netmon's
+counts for the server process match the bytes that actually arrived.
+
+### NFS traffic
+
+NFS reads and writes happen in the kernel, so netmon counts them under the
+kernel threads that do the socket I/O (`kworker/...-nfsiod`, `-xprtiod`,
+`-rpciod`), not under the process that read the file. Reading a 22 MB file
+from an NFS mount showed about 22 MB of `tcp_rx` spread over those threads.
+
+## Run a Docker-built binary on a Pi
 
 The binary links libbpf statically and needs only `libelf1t64` and `zlib1g`:
 

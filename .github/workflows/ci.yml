@@ -15,3 +15,12 @@ jobs:
         run: docker build --target test -t ebpf-netmon:test .
       - name: Smoke test
         run: docker run --rm --privileged ebpf-netmon:test
+      # The same script a Pi runs, as a non-root user with sudo, so PATH
+      # matches a normal Pi login.
+      - name: Build script
+        run: |
+          docker run --rm --privileged -v "$PWD":/repo debian:trixie sh -c '
+            apt-get update -qq && apt-get install -y -qq sudo >/dev/null &&
+            useradd -m pi && echo "pi ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/pi &&
+            cp -r /repo /home/pi/ebpf-netmon && chown -R pi /home/pi/ebpf-netmon &&
+            su pi -c "cd ~/ebpf-netmon && scripts/build-on-pi.sh"'
