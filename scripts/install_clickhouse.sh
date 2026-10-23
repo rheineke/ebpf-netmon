@@ -44,11 +44,15 @@ if grep -qw asimddp /proc/cpuinfo && grep -qw atomics /proc/cpuinfo; then
 else
   url=https://builds.clickhouse.com/master/aarch64v80compat/clickhouse
   echo "== Downloading the nightly ARMv8.0 build, $url"
-  tmp=$(mktemp -d)
+  # /var/tmp, not /tmp: a Pi's /tmp is in RAM, and the binary unpacks to
+  # about 800 MB.
+  tmp=$(mktemp -d -p /var/tmp)
   trap 'rm -rf "$tmp"' EXIT
   curl -fsSL -o "$tmp/clickhouse" "$url"
   chmod +x "$tmp/clickhouse"
   echo "sha512 $(sha512sum "$tmp/clickhouse" | cut -d' ' -f1)"
+  # Unpack and run it before stopping the running server.
+  "$tmp/clickhouse" local -q 'SELECT version()'
   sudo systemctl stop clickhouse-server 2>/dev/null || true
   (cd "$tmp" && sudo ./clickhouse install --noninteractive >/dev/null)
   sudo install -m 644 systemd/clickhouse-server.service /etc/systemd/system/
