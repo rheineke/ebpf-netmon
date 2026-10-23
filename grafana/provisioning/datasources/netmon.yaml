@@ -1,0 +1,12 @@
+apiVersion: 1
+datasources:
+  - name: ClickHouse
+    uid: netmon-clickhouse
+    type: grafana-clickhouse-datasource
+    isDefault: true
+    jsonData:
+      host: 127.0.0.1
+      port: 9000
+      protocol: native
+      username: grafana
+      defaultDatabase: netmon

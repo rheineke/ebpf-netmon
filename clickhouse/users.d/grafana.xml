@@ -1,0 +1,21 @@
+<!-- A read-only user for Grafana. The server listens on 127.0.0.1 only. -->
+<clickhouse>
+    <profiles>
+        <grafana>
+            <readonly>2</readonly>
+            <max_memory_usage>1000000000</max_memory_usage>
+            <max_execution_time>60</max_execution_time>
+        </grafana>
+    </profiles>
+    <users>
+        <grafana>
+            <no_password/>
+            <networks>
+                <ip>127.0.0.1</ip>
+                <ip>::1</ip>
+            </networks>
+            <profile>grafana</profile>
+            <quota>default</quota>
+        </grafana>
+    </users>
+</clickhouse>
