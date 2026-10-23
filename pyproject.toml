@@ -1,0 +1,15 @@
+# Python dependencies for tools/ and tests/. Not a package: uv only manages
+# the environment, from uv.lock.
+#   uv run tests/iceberg_test.py
+[project]
+name = "ebpf-netmon"
+version = "0"
+requires-python = ">=3.13"
+dependencies = [
+    # Day partitioning needs pyiceberg-core.
+    "pyiceberg[pyarrow,sql-sqlite,pyiceberg-core]==0.12.0",
+]
+
+[tool.uv]
+package = false
+required-version = ">=0.13.5"

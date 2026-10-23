@@ -1,0 +1,10 @@
+# Five minutes past each hour, after netmon has moved on to the next file.
+[Unit]
+Description=Hourly netmon to Iceberg
+
+[Timer]
+OnCalendar=*:05
+Persistent=true
+
+[Install]
+WantedBy=timers.target
