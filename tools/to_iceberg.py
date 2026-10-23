@@ -3,14 +3,15 @@
   python3 tools/to_iceberg.py --raw DIR --warehouse DIR
 
 Reads each RAW/.../YYYY-MM-DD/HH.jsonl from the last --days days whose UTC
-hour has ended, and appends the hours not already in the table to
-netmon.traffic in WAREHOUSE, as Parquet partitioned by day. The raw files are
-left as they are.
+hour has ended, and loads it into netmon.traffic in WAREHOUSE, as Parquet
+partitioned by day. RAW may hold several hosts' files, e.g. RAW/HOST/....
+The raw files are left as they are.
 
-An hour counts as loaded when the table has any row for that host and hour.
-Each run commits all new hours in one append, so a crash loads all of them
-or none. The catalog is a SQLite file in the warehouse; run one converter
-per warehouse.
+A file is loaded again when it has more rows than the table holds for its
+host and hour, so an hour copied before it was complete (a NAS that was
+down) is replaced once the rest arrives. Each run commits in one
+transaction, so a crash loads all of its hours or none. The catalog is a
+SQLite file in the warehouse; run one converter per warehouse.
 """
 
 import argparse
@@ -21,6 +22,7 @@ import sys
 from pathlib import Path
 
 import pyarrow as pa
+import pyarrow.compute as pc
 from pyiceberg.catalog.sql import SqlCatalog
 from pyiceberg.expressions import And, EqualTo, GreaterThanOrEqual, LessThan
 from pyiceberg.partitioning import PartitionField, PartitionSpec
@@ -120,43 +122,64 @@ def read_rows(path):
     return rows
 
 
-def loaded(table, host, start):
-    """True if the table already has rows for this host and hour."""
-    end = start + dt.timedelta(hours=1)
+def hour_counts(table, oldest):
+    """Rows in the table per (host, hour) from oldest on."""
     scan = table.scan(
-        row_filter=And(
-            EqualTo("host", host),
-            GreaterThanOrEqual("ts", start.isoformat()),
-            LessThan("ts", end.isoformat()),
-        ),
-        selected_fields=("host",),
-        limit=1,
+        row_filter=GreaterThanOrEqual("ts", oldest.isoformat()),
+        selected_fields=("host", "ts"),
+    ).to_arrow()
+    hours = pa.table(
+        {
+            "host": scan["host"],
+            "hour": pc.floor_temporal(scan["ts"], unit="hour"),
+        }
     )
-    return scan.to_arrow().num_rows > 0
+    counts = hours.group_by(["host", "hour"]).aggregate([([], "count_all")])
+    return {(r["host"], r["hour"]): r["count_all"] for r in counts.to_pylist()}
+
+
+def hour_filter(host, start):
+    return And(
+        EqualTo("host", host),
+        GreaterThanOrEqual("ts", start.isoformat()),
+        LessThan("ts", (start + dt.timedelta(hours=1)).isoformat()),
+    )
 
 
 def convert(raw, warehouse, now=None, days=7):
-    """Appends every finished, unloaded hour. Returns the rows appended."""
+    """Loads every finished hour the table lacks rows of. Returns rows added."""
     now = now or dt.datetime.now(dt.UTC)
     this_hour = now.replace(minute=0, second=0, microsecond=0)
     oldest = this_hour - dt.timedelta(days=days)
     table = open_table(warehouse)
-    new_rows, files = [], []
+    counts = hour_counts(table, oldest)
+    new_rows, replace, files = [], [], []
     for path in sorted(Path(raw).rglob("*.jsonl")):
         start = hour_of(path)
         if start is None or not oldest <= start < this_hour:
             continue  # not a raw file, too old, or still being written
-        # One host per file; an hour already loaded is skipped as a whole.
+        # Counting lines is cheap; parse only files that may have new rows.
         host = first_host(path)
-        if host is None or loaded(table, host, start):
+        if host is None or path.read_bytes().count(b"\n") <= counts.get(
+            (host, start), 0
+        ):
             continue
-        new_rows.extend(read_rows(path))
+        # A file has one host unless the machine was renamed mid-hour.
+        rows = read_rows(path)
+        keys = {(row["host"], start) for row in rows}
+        if len(rows) <= sum(counts.get(key, 0) for key in keys):
+            continue  # the extra lines were malformed
+        new_rows.extend(rows)
         files.append(path)
+        replace.extend(key for key in keys if key in counts)
     if new_rows:
-        table.append(pa.Table.from_pylist(new_rows, schema=ARROW_SCHEMA))
+        with table.transaction() as tx:
+            for host, start in replace:
+                tx.delete(hour_filter(host, start))
+            tx.append(pa.Table.from_pylist(new_rows, schema=ARROW_SCHEMA))
     for path in files:
         print(f"loaded {path}")
-    return len(new_rows)
+    return len(new_rows) - sum(counts[key] for key in replace)
 
 
 def main():
@@ -168,7 +191,7 @@ def main():
     )
     args = parser.parse_args()
     n = convert(args.raw, args.warehouse, days=args.days)
-    print(f"appended {n} rows to {TABLE}")
+    print(f"added {n} rows to {TABLE}")
 
 
 if __name__ == "__main__":
