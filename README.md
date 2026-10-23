@@ -125,7 +125,7 @@ the Synology NAS (read-only) and a loopback export (read and write).
 once its hour has passed. Each row is one process in one interval:
 
 ```json
-{"ts":1792666261,"host":"pi64-dev","interval_s":10,"pid":4309,"uid":0,"comm":"nfsd","tcp_tx":84,"tcp_rx":120,"udp_tx":0,"udp_rx":0,"nfs_read":0,"nfs_write":0,"scale":1}
+{"ts":1792666261,"host":"raspberrypi","interval_s":10,"pid":4309,"uid":0,"comm":"nfsd","tcp_tx":84,"tcp_rx":120,"udp_tx":0,"udp_rx":0,"nfs_read":0,"nfs_write":0,"scale":1}
 ```
 
 To capture continuously on a Pi, after `scripts/build_on_pi.sh`:
@@ -154,7 +154,7 @@ scripts/install_converter.sh WAREHOUSE
 
 `uv run tests/iceberg_test.py` tests it. The Python dependencies are in
 `pyproject.toml`, pinned in `uv.lock`.
-On pi64-dev, 1 MB of raw JSON became 108 KB of Parquet.
+On a Pi 4, 1 MB of raw JSON became 108 KB of Parquet.
 
 ## ClickHouse and Grafana
 
