@@ -156,6 +156,28 @@ scripts/install_converter.sh WAREHOUSE
 `pyproject.toml`, pinned in `uv.lock`.
 On pi64-dev, 1 MB of raw JSON became 108 KB of Parquet.
 
+## ClickHouse and Grafana
+
+On the machine that holds the warehouse (pi64-dev):
+
+```sh
+scripts/install_clickhouse.sh WAREHOUSE
+scripts/install_grafana.sh
+```
+
+ClickHouse listens on 127.0.0.1 only. Its view `netmon.traffic` reads the
+Iceberg table with `icebergLocal`, so each query sees the latest hour the
+converter loaded. Grafana serves the `netmon traffic` dashboard on port
+3000; the first login is admin/admin. Data lags by up to an hour, because
+the converter loads only finished hours.
+
+ClickHouse releases need ARMv8.2 (Pi 5) and die with "Illegal instruction"
+on a Pi 4 (ARMv8.0). On a Pi 4 the script installs ClickHouse's nightly
+ARMv8.0 build, which has no releases.
+
+`tests/dashboard_test.py` loads known rows into a warehouse and checks
+every dashboard query's totals through ClickHouse; CI runs it.
+
 ## Run a Docker-built binary on a Pi
 
 The binary links libbpf statically and needs only `libelf1t64` and `zlib1g`:

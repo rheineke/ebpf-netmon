@@ -31,6 +31,13 @@ jobs:
           enable-cache: false
       - name: Iceberg converter test
         run: uv run --locked tests/iceberg_test.py
+      # Installs the release ClickHouse (the runner is ARMv8.2) on the runner.
+      - name: Dashboard queries
+        run: |
+          uv sync --locked
+          sudo .venv/bin/python tests/dashboard_test.py load /var/lib/netmon-test
+          scripts/install_clickhouse.sh /var/lib/netmon-test
+          python3 tests/dashboard_test.py check
       - name: clang-tidy
         run: docker build --target lint .
       - name: ASan and UBSan

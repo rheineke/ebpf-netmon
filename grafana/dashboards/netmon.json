@@ -1,0 +1,464 @@
+{
+  "uid": "netmon-traffic",
+  "title": "netmon traffic",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "refresh": "",
+  "tags": [
+    "netmon"
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "host",
+        "label": "Host",
+        "type": "query",
+        "datasource": {
+          "type": "grafana-clickhouse-datasource",
+          "uid": "netmon-clickhouse"
+        },
+        "query": "SELECT DISTINCT host FROM netmon.traffic ORDER BY host",
+        "definition": "SELECT DISTINCT host FROM netmon.traffic ORDER BY host",
+        "includeAll": true,
+        "multi": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "refresh": 2
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Totals in range",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "netmon-clickhouse"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "decbytes"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "none",
+        "graphMode": "none"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "netmon-clickhouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT sum(tcp_tx * scale) AS `TCP sent`, sum(tcp_rx * scale) AS `TCP received`,\n  sum(udp_tx * scale) AS `UDP sent`, sum(udp_rx * scale) AS `UDP received`,\n  sum(nfs_read * scale) AS `NFS read`, sum(nfs_write * scale) AS `NFS written`\nFROM netmon.traffic WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Network by process (top 10)",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "netmon-clickhouse"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "netmon-clickhouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "timeseries",
+          "rawSql": "WITH top AS (\n  SELECT comm FROM netmon.traffic WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)\n  GROUP BY comm ORDER BY sum((tcp_tx + tcp_rx + udp_tx + udp_rx) * scale) DESC LIMIT 10\n)\nSELECT $__timeInterval(ts) AS time, comm,\n  sum((tcp_tx + tcp_rx + udp_tx + udp_rx) * scale) / $__interval_s AS bytes_per_s\nFROM netmon.traffic\nWHERE host IN (${host:singlequote}) AND $__timeFilter(ts) AND comm IN top\nGROUP BY time, comm ORDER BY time"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Sent by process",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "netmon-clickhouse"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 13
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "netmon-clickhouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "timeseries",
+          "rawSql": "WITH top AS (\n  SELECT comm FROM netmon.traffic WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)\n  GROUP BY comm ORDER BY sum((tcp_tx + udp_tx) * scale) DESC LIMIT 10\n)\nSELECT $__timeInterval(ts) AS time, comm,\n  sum((tcp_tx + udp_tx) * scale) / $__interval_s AS bytes_per_s\nFROM netmon.traffic\nWHERE host IN (${host:singlequote}) AND $__timeFilter(ts) AND comm IN top\nGROUP BY time, comm ORDER BY time"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Received by process",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "netmon-clickhouse"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 13
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "netmon-clickhouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "timeseries",
+          "rawSql": "WITH top AS (\n  SELECT comm FROM netmon.traffic WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)\n  GROUP BY comm ORDER BY sum((tcp_rx + udp_rx) * scale) DESC LIMIT 10\n)\nSELECT $__timeInterval(ts) AS time, comm,\n  sum((tcp_rx + udp_rx) * scale) / $__interval_s AS bytes_per_s\nFROM netmon.traffic\nWHERE host IN (${host:singlequote}) AND $__timeFilter(ts) AND comm IN top\nGROUP BY time, comm ORDER BY time"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "NFS read by process",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "netmon-clickhouse"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 22
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "netmon-clickhouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "timeseries",
+          "rawSql": "WITH top AS (\n  SELECT comm FROM netmon.traffic WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)\n  GROUP BY comm ORDER BY sum((nfs_read) * scale) DESC LIMIT 10\n)\nSELECT $__timeInterval(ts) AS time, comm,\n  sum((nfs_read) * scale) / $__interval_s AS bytes_per_s\nFROM netmon.traffic\nWHERE host IN (${host:singlequote}) AND $__timeFilter(ts) AND comm IN top\nGROUP BY time, comm ORDER BY time"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "NFS written by process",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "netmon-clickhouse"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 22
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "netmon-clickhouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "timeseries",
+          "rawSql": "WITH top AS (\n  SELECT comm FROM netmon.traffic WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)\n  GROUP BY comm ORDER BY sum((nfs_write) * scale) DESC LIMIT 10\n)\nSELECT $__timeInterval(ts) AS time, comm,\n  sum((nfs_write) * scale) / $__interval_s AS bytes_per_s\nFROM netmon.traffic\nWHERE host IN (${host:singlequote}) AND $__timeFilter(ts) AND comm IN top\nGROUP BY time, comm ORDER BY time"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Network by user id",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "netmon-clickhouse"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 31
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "netmon-clickhouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "timeseries",
+          "rawSql": "WITH top AS (\n  SELECT toString(uid) FROM netmon.traffic WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)\n  GROUP BY toString(uid) ORDER BY sum((tcp_tx + tcp_rx + udp_tx + udp_rx) * scale) DESC LIMIT 10\n)\nSELECT $__timeInterval(ts) AS time, toString(uid),\n  sum((tcp_tx + tcp_rx + udp_tx + udp_rx) * scale) / $__interval_s AS bytes_per_s\nFROM netmon.traffic\nWHERE host IN (${host:singlequote}) AND $__timeFilter(ts) AND toString(uid) IN top\nGROUP BY time, toString(uid) ORDER BY time"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "table",
+      "title": "Top processes in range",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "netmon-clickhouse"
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 40
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "decbytes"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "pids"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "none"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "netmon-clickhouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT host, comm, uniqExact(pid) AS pids,\n  sum((tcp_tx + udp_tx) * scale) AS sent, sum((tcp_rx + udp_rx) * scale) AS received,\n  sum(nfs_read * scale) AS nfs_read, sum(nfs_write * scale) AS nfs_written\nFROM netmon.traffic WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)\nGROUP BY host, comm ORDER BY sent + received + nfs_read + nfs_written DESC LIMIT 50"
+        }
+      ]
+    }
+  ]
+}
