@@ -158,7 +158,7 @@ On pi64-dev, 1 MB of raw JSON became 108 KB of Parquet.
 
 ## ClickHouse and Grafana
 
-On the machine that holds the warehouse (pi64-dev):
+On the machine that holds the warehouse:
 
 ```sh
 scripts/install_clickhouse.sh WAREHOUSE
