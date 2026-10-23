@@ -180,22 +180,30 @@ On a Pi 4, 1 MB of raw JSON became 108 KB of Parquet.
 On the machine that holds the warehouse:
 
 ```sh
-scripts/install_clickhouse.sh WAREHOUSE
+scripts/install_clickhouse.sh WAREHOUSE [RAW]
 scripts/install_grafana.sh
 ```
 
-ClickHouse listens on 127.0.0.1 only. Its view `netmon.traffic` reads the
-Iceberg table with `icebergLocal`, so each query sees the latest hour the
-converter loaded. Grafana serves the `netmon traffic` dashboard on port
-3000; the first login is admin/admin. Data lags by up to an hour, because
-the converter loads only finished hours.
+ClickHouse listens on 127.0.0.1 only. It has two views:
+
+- `netmon.traffic` reads the Iceberg table with `icebergLocal`, up to the
+  last hour the converter loaded.
+- `netmon.traffic_live` adds rows from the last two days of raw files in
+  RAW for hours not yet in Iceberg, so it is as recent as the raw files:
+  about a minute behind with the per-minute sync. Queries take about half
+  a second longer on a Pi 4.
+
+Grafana serves the `netmon traffic` dashboard on port 3000, from
+`netmon.traffic_live`, refreshing every 30 seconds. The first login is
+admin/admin.
 
 ClickHouse releases need ARMv8.2 (Pi 5) and die with "Illegal instruction"
 on a Pi 4 (ARMv8.0). On a Pi 4 the script installs ClickHouse's nightly
 ARMv8.0 build, which has no releases.
 
-`tests/dashboard_test.py` loads known rows into a warehouse and checks
-every dashboard query's totals through ClickHouse; CI runs it.
+`tests/dashboard_test.py` checks every dashboard query's totals through
+ClickHouse, with the latest hour only in raw files and again once it is
+converted; CI runs it.
 
 ## Run a Docker-built binary on a Pi
 

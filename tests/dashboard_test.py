@@ -1,12 +1,16 @@
 """Checks the Grafana dashboard's queries against ClickHouse.
 
-  uv run tests/dashboard_test.py load WAREHOUSE   # as root, or with write access
-  scripts/install_clickhouse.sh WAREHOUSE
-  python3 tests/dashboard_test.py check
+  uv run tests/dashboard_test.py load DIR      # as root, or with write access
+  scripts/install_clickhouse.sh DIR/warehouse DIR/raw
+  python3 tests/dashboard_test.py check DIR
+  uv run tests/dashboard_test.py convert DIR   # then check again
 
-load writes two hosts of known traffic into a new Iceberg table. check runs
-every panel of grafana/dashboards/netmon.json through clickhouse-client, as
-Grafana's user, with Grafana's macros filled in, and checks the totals.
+load writes four hours of known traffic from two hosts, ending in the
+current hour, to DIR/raw, and converts the first three into DIR/warehouse.
+check runs every panel of grafana/dashboards/netmon.json through
+clickhouse-client, as Grafana's user, with Grafana's macros filled in, and
+checks the totals, so the live view must add the last hour from the raw
+files. convert loads that hour too; the totals must not change.
 """
 
 import datetime as dt
@@ -14,36 +18,41 @@ import json
 import re
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-START = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
-HOURS, ROWS = 3, 6  # per host, rows per hour
+HOURS, ROWS = 4, 6  # per host, rows per hour
 COUNTERS = {"tcp_tx": 1, "tcp_rx": 2, "udp_tx": 3, "udp_rx": 4, "nfs_read": 5}
 COUNTERS["nfs_write"] = 6
 SCALE = 2.0
+START = None  # the first hour; load picks it, the others read it from DIR
 
 
-def load(warehouse):
+def convert(test_dir, hours):
     sys.path.insert(0, str(ROOT / "tools"))
     import to_iceberg
 
-    with tempfile.TemporaryDirectory() as raw:
-        for host in ("pi-a", "pi-b"):
-            for h in range(HOURS):
-                start = START + dt.timedelta(hours=h)
-                path = Path(raw, host, f"{start:%Y-%m-%d}", f"{start:%H}.jsonl")
-                path.parent.mkdir(parents=True, exist_ok=True)
-                with open(path, "w") as f:
-                    for i in range(ROWS):
-                        row = {"ts": int(start.timestamp()) + 600 * i, "host": host}
-                        row |= {"interval_s": 10, "pid": 100 + i % 2, "uid": i % 2}
-                        row |= {"comm": f"proc{i % 2}", "scale": SCALE}
-                        f.write(json.dumps(row | COUNTERS) + "\n")
-        now = START + dt.timedelta(days=1)
-        n = to_iceberg.convert(raw, warehouse, now, days=2)
+    now = START + dt.timedelta(hours=hours)
+    n = to_iceberg.convert(test_dir / "raw", test_dir / "warehouse", now, days=2)
     print(f"loaded {n} rows")
+
+
+def load(test_dir):
+    this_hour = dt.datetime.now(dt.UTC).replace(minute=0, second=0, microsecond=0)
+    start = this_hour - dt.timedelta(hours=HOURS - 1)
+    test_dir.mkdir(parents=True, exist_ok=True)
+    (test_dir / "start").write_text(start.isoformat())
+    for host in ("pi-a", "pi-b"):
+        for h in range(HOURS):
+            hour = start + dt.timedelta(hours=h)
+            path = test_dir / "raw" / host / f"{hour:%Y-%m-%d}" / f"{hour:%H}.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w") as f:
+                for i in range(ROWS):
+                    row = {"ts": int(hour.timestamp()) + 600 * i, "host": host}
+                    row |= {"interval_s": 10, "pid": 100 + i % 2, "uid": i % 2}
+                    row |= {"comm": f"proc{i % 2}", "scale": SCALE}
+                    f.write(json.dumps(row | COUNTERS) + "\n")
 
 
 def fill_macros(sql):
@@ -85,6 +94,10 @@ def check_eq(name, got, want):
 def check():
     dash = json.loads((ROOT / "grafana/dashboards/netmon.json").read_text())
     per_host = HOURS * ROWS * SCALE  # each counter's weight per host
+    iceberg = query("SELECT count() AS n FROM netmon.traffic")[0]["n"]
+    live = query("SELECT count() AS n FROM netmon.traffic_live")[0]["n"]
+    print(f"info: {iceberg} rows in Iceberg, {live} live")
+    check_eq("live rows", int(live), HOURS * ROWS * 2)
     hosts = [r["host"] for r in query(dash["templating"]["list"][0]["query"])]
     check_eq("host variable", hosts, ["pi-a", "pi-b"])
     for panel in dash["panels"]:
@@ -118,9 +131,15 @@ def check():
 
 
 if __name__ == "__main__":
-    if sys.argv[1:2] == ["load"] and len(sys.argv) == 3:
-        load(sys.argv[2])
-    elif sys.argv[1:] == ["check"]:
-        check()
-    else:
+    if len(sys.argv) != 3 or sys.argv[1] not in ("load", "check", "convert"):
         sys.exit(__doc__)
+    test_dir = Path(sys.argv[2])
+    if sys.argv[1] == "load":
+        load(test_dir)
+    START = dt.datetime.fromisoformat((test_dir / "start").read_text())
+    if sys.argv[1] == "load":
+        convert(test_dir, HOURS - 1)  # the last hour stays raw
+    elif sys.argv[1] == "convert":
+        convert(test_dir, HOURS)
+    else:
+        check()

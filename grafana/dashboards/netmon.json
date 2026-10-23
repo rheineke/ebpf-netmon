@@ -2,13 +2,13 @@
   "uid": "netmon-traffic",
   "title": "netmon traffic",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "editable": false,
   "time": {
-    "from": "now-24h",
+    "from": "now-6h",
     "to": "now"
   },
-  "refresh": "",
+  "refresh": "30s",
   "tags": [
     "netmon"
   ],
@@ -22,8 +22,8 @@
           "type": "grafana-clickhouse-datasource",
           "uid": "netmon-clickhouse"
         },
-        "query": "SELECT DISTINCT host FROM netmon.traffic ORDER BY host",
-        "definition": "SELECT DISTINCT host FROM netmon.traffic ORDER BY host",
+        "query": "SELECT DISTINCT host FROM netmon.traffic_live ORDER BY host",
+        "definition": "SELECT DISTINCT host FROM netmon.traffic_live ORDER BY host",
         "includeAll": true,
         "multi": true,
         "current": {
@@ -76,7 +76,7 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "table",
-          "rawSql": "SELECT sum(tcp_tx * scale) AS `TCP sent`, sum(tcp_rx * scale) AS `TCP received`,\n  sum(udp_tx * scale) AS `UDP sent`, sum(udp_rx * scale) AS `UDP received`,\n  sum(nfs_read * scale) AS `NFS read`, sum(nfs_write * scale) AS `NFS written`\nFROM netmon.traffic WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)"
+          "rawSql": "SELECT sum(tcp_tx * scale) AS `TCP sent`, sum(tcp_rx * scale) AS `TCP received`,\n  sum(udp_tx * scale) AS `UDP sent`, sum(udp_rx * scale) AS `UDP received`,\n  sum(nfs_read * scale) AS `NFS read`, sum(nfs_write * scale) AS `NFS written`\nFROM netmon.traffic_live WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)"
         }
       ]
     },
@@ -131,9 +131,10 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "timeseries",
-          "rawSql": "WITH top AS (\n  SELECT comm FROM netmon.traffic WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)\n  GROUP BY comm ORDER BY sum((tcp_tx + tcp_rx + udp_tx + udp_rx) * scale) DESC LIMIT 10\n)\nSELECT $__timeInterval(ts) AS time, comm,\n  sum((tcp_tx + tcp_rx + udp_tx + udp_rx) * scale) / $__interval_s AS bytes_per_s\nFROM netmon.traffic\nWHERE host IN (${host:singlequote}) AND $__timeFilter(ts) AND comm IN top\nGROUP BY time, comm ORDER BY time"
+          "rawSql": "WITH top AS (\n  SELECT comm FROM netmon.traffic_live WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)\n  GROUP BY comm ORDER BY sum((tcp_tx + tcp_rx + udp_tx + udp_rx) * scale) DESC LIMIT 10\n)\nSELECT $__timeInterval(ts) AS time, comm,\n  sum((tcp_tx + tcp_rx + udp_tx + udp_rx) * scale) / $__interval_s AS bytes_per_s\nFROM netmon.traffic_live\nWHERE host IN (${host:singlequote}) AND $__timeFilter(ts) AND comm IN top\nGROUP BY time, comm ORDER BY time"
         }
-      ]
+      ],
+      "interval": "10s"
     },
     {
       "id": 3,
@@ -186,9 +187,10 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "timeseries",
-          "rawSql": "WITH top AS (\n  SELECT comm FROM netmon.traffic WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)\n  GROUP BY comm ORDER BY sum((tcp_tx + udp_tx) * scale) DESC LIMIT 10\n)\nSELECT $__timeInterval(ts) AS time, comm,\n  sum((tcp_tx + udp_tx) * scale) / $__interval_s AS bytes_per_s\nFROM netmon.traffic\nWHERE host IN (${host:singlequote}) AND $__timeFilter(ts) AND comm IN top\nGROUP BY time, comm ORDER BY time"
+          "rawSql": "WITH top AS (\n  SELECT comm FROM netmon.traffic_live WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)\n  GROUP BY comm ORDER BY sum((tcp_tx + udp_tx) * scale) DESC LIMIT 10\n)\nSELECT $__timeInterval(ts) AS time, comm,\n  sum((tcp_tx + udp_tx) * scale) / $__interval_s AS bytes_per_s\nFROM netmon.traffic_live\nWHERE host IN (${host:singlequote}) AND $__timeFilter(ts) AND comm IN top\nGROUP BY time, comm ORDER BY time"
         }
-      ]
+      ],
+      "interval": "10s"
     },
     {
       "id": 4,
@@ -241,9 +243,10 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "timeseries",
-          "rawSql": "WITH top AS (\n  SELECT comm FROM netmon.traffic WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)\n  GROUP BY comm ORDER BY sum((tcp_rx + udp_rx) * scale) DESC LIMIT 10\n)\nSELECT $__timeInterval(ts) AS time, comm,\n  sum((tcp_rx + udp_rx) * scale) / $__interval_s AS bytes_per_s\nFROM netmon.traffic\nWHERE host IN (${host:singlequote}) AND $__timeFilter(ts) AND comm IN top\nGROUP BY time, comm ORDER BY time"
+          "rawSql": "WITH top AS (\n  SELECT comm FROM netmon.traffic_live WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)\n  GROUP BY comm ORDER BY sum((tcp_rx + udp_rx) * scale) DESC LIMIT 10\n)\nSELECT $__timeInterval(ts) AS time, comm,\n  sum((tcp_rx + udp_rx) * scale) / $__interval_s AS bytes_per_s\nFROM netmon.traffic_live\nWHERE host IN (${host:singlequote}) AND $__timeFilter(ts) AND comm IN top\nGROUP BY time, comm ORDER BY time"
         }
-      ]
+      ],
+      "interval": "10s"
     },
     {
       "id": 5,
@@ -296,9 +299,10 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "timeseries",
-          "rawSql": "WITH top AS (\n  SELECT comm FROM netmon.traffic WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)\n  GROUP BY comm ORDER BY sum((nfs_read) * scale) DESC LIMIT 10\n)\nSELECT $__timeInterval(ts) AS time, comm,\n  sum((nfs_read) * scale) / $__interval_s AS bytes_per_s\nFROM netmon.traffic\nWHERE host IN (${host:singlequote}) AND $__timeFilter(ts) AND comm IN top\nGROUP BY time, comm ORDER BY time"
+          "rawSql": "WITH top AS (\n  SELECT comm FROM netmon.traffic_live WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)\n  GROUP BY comm ORDER BY sum((nfs_read) * scale) DESC LIMIT 10\n)\nSELECT $__timeInterval(ts) AS time, comm,\n  sum((nfs_read) * scale) / $__interval_s AS bytes_per_s\nFROM netmon.traffic_live\nWHERE host IN (${host:singlequote}) AND $__timeFilter(ts) AND comm IN top\nGROUP BY time, comm ORDER BY time"
         }
-      ]
+      ],
+      "interval": "10s"
     },
     {
       "id": 6,
@@ -351,9 +355,10 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "timeseries",
-          "rawSql": "WITH top AS (\n  SELECT comm FROM netmon.traffic WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)\n  GROUP BY comm ORDER BY sum((nfs_write) * scale) DESC LIMIT 10\n)\nSELECT $__timeInterval(ts) AS time, comm,\n  sum((nfs_write) * scale) / $__interval_s AS bytes_per_s\nFROM netmon.traffic\nWHERE host IN (${host:singlequote}) AND $__timeFilter(ts) AND comm IN top\nGROUP BY time, comm ORDER BY time"
+          "rawSql": "WITH top AS (\n  SELECT comm FROM netmon.traffic_live WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)\n  GROUP BY comm ORDER BY sum((nfs_write) * scale) DESC LIMIT 10\n)\nSELECT $__timeInterval(ts) AS time, comm,\n  sum((nfs_write) * scale) / $__interval_s AS bytes_per_s\nFROM netmon.traffic_live\nWHERE host IN (${host:singlequote}) AND $__timeFilter(ts) AND comm IN top\nGROUP BY time, comm ORDER BY time"
         }
-      ]
+      ],
+      "interval": "10s"
     },
     {
       "id": 7,
@@ -406,9 +411,10 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "timeseries",
-          "rawSql": "WITH top AS (\n  SELECT toString(uid) FROM netmon.traffic WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)\n  GROUP BY toString(uid) ORDER BY sum((tcp_tx + tcp_rx + udp_tx + udp_rx) * scale) DESC LIMIT 10\n)\nSELECT $__timeInterval(ts) AS time, toString(uid),\n  sum((tcp_tx + tcp_rx + udp_tx + udp_rx) * scale) / $__interval_s AS bytes_per_s\nFROM netmon.traffic\nWHERE host IN (${host:singlequote}) AND $__timeFilter(ts) AND toString(uid) IN top\nGROUP BY time, toString(uid) ORDER BY time"
+          "rawSql": "WITH top AS (\n  SELECT toString(uid) FROM netmon.traffic_live WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)\n  GROUP BY toString(uid) ORDER BY sum((tcp_tx + tcp_rx + udp_tx + udp_rx) * scale) DESC LIMIT 10\n)\nSELECT $__timeInterval(ts) AS time, toString(uid),\n  sum((tcp_tx + tcp_rx + udp_tx + udp_rx) * scale) / $__interval_s AS bytes_per_s\nFROM netmon.traffic_live\nWHERE host IN (${host:singlequote}) AND $__timeFilter(ts) AND toString(uid) IN top\nGROUP BY time, toString(uid) ORDER BY time"
         }
-      ]
+      ],
+      "interval": "10s"
     },
     {
       "id": 8,
@@ -456,7 +462,7 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "table",
-          "rawSql": "SELECT host, comm, uniqExact(pid) AS pids,\n  sum((tcp_tx + udp_tx) * scale) AS sent, sum((tcp_rx + udp_rx) * scale) AS received,\n  sum(nfs_read * scale) AS nfs_read, sum(nfs_write * scale) AS nfs_written\nFROM netmon.traffic WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)\nGROUP BY host, comm ORDER BY sent + received + nfs_read + nfs_written DESC LIMIT 50"
+          "rawSql": "SELECT host, comm, uniqExact(pid) AS pids,\n  sum((tcp_tx + udp_tx) * scale) AS sent, sum((tcp_rx + udp_rx) * scale) AS received,\n  sum(nfs_read * scale) AS nfs_read, sum(nfs_write * scale) AS nfs_written\nFROM netmon.traffic_live WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)\nGROUP BY host, comm ORDER BY sent + received + nfs_read + nfs_written DESC LIMIT 50"
         }
       ]
     }
