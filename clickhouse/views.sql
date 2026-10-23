@@ -22,7 +22,7 @@ FROM file(
      comm String, tcp_tx Int64, tcp_rx Int64, udp_tx Int64, udp_rx Int64,
      nfs_read Int64, nfs_write Int64, scale Float64'
 )
-WHERE toDate(extract(_path, '(\d{4}-\d{2}-\d{2})/\d{2}\.jsonl$'))
+WHERE toDateOrZero(extract(_path, '(\d{4}-\d{2}-\d{2})/\d{2}\.jsonl$'))
         >= toDate(now('UTC')) - 1
     AND (host, toStartOfHour(toDateTime(ts, 'UTC'))) NOT IN (
         SELECT DISTINCT host, toStartOfHour(ts)
