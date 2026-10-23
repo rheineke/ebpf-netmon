@@ -1,6 +1,6 @@
-"""Unit test for tools/to_iceberg.py; needs tools/requirements.txt, not root.
+"""Unit test for tools/to_iceberg.py. Needs no root.
 
-python3 tests/iceberg_test.py
+uv run tests/iceberg_test.py
 """
 
 import datetime as dt

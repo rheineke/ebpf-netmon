@@ -152,7 +152,8 @@ hour:
 scripts/install_converter.sh WAREHOUSE
 ```
 
-`python3 tests/iceberg_test.py` tests it; it needs `tools/requirements.txt`.
+`uv run tests/iceberg_test.py` tests it. The Python dependencies are in
+`pyproject.toml`, pinned in `uv.lock`.
 On pi64-dev, 1 MB of raw JSON became 108 KB of Parquet.
 
 ## Run a Docker-built binary on a Pi

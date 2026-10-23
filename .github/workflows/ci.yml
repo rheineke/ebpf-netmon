@@ -25,10 +25,12 @@ jobs:
         run: >
           docker run --rm -v "$PWD":/repo ghcr.io/gitleaks/gitleaks:v8.30.1
           git --redact --verbose /repo
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        with:
+          version: 0.13.5
+          enable-cache: false
       - name: Iceberg converter test
-        run: >
-          docker run --rm -v "$PWD":/repo -w /repo python:3.13-slim sh -c
-          "pip install -q -r tools/requirements.txt && python3 tests/iceberg_test.py"
+        run: uv run --locked tests/iceberg_test.py
       - name: clang-tidy
         run: docker build --target lint .
       - name: ASan and UBSan

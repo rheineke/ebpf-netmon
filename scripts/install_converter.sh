@@ -15,10 +15,24 @@ fi
 warehouse=$1
 cd "$(dirname "$0")/.."
 
-echo "== Installing Python packages in /opt/netmon/venv"
-sudo apt-get install -y --no-install-recommends python3-venv
-sudo python3 -m venv /opt/netmon/venv
-sudo /opt/netmon/venv/bin/pip install --quiet -r tools/requirements.txt
+uv_version=0.13.5
+if ! uv --version 2>/dev/null | grep -q "^uv $uv_version"; then
+  echo "== Installing uv $uv_version to /usr/local/bin"
+  tarball=uv-$(uname -m)-unknown-linux-gnu.tar.gz
+  tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' EXIT
+  base=https://github.com/astral-sh/uv/releases/download/$uv_version
+  curl -fsSL -o "$tmp/$tarball" "$base/$tarball"
+  curl -fsSL -o "$tmp/$tarball.sha256" "$base/$tarball.sha256"
+  (cd "$tmp" && sha256sum -c "$tarball.sha256")
+  tar -xzf "$tmp/$tarball" -C "$tmp"
+  sudo install -m 755 "$tmp/${tarball%.tar.gz}/uv" /usr/local/bin/uv
+fi
+
+echo "== Installing Python packages from uv.lock in /opt/netmon/venv"
+# The system Python, so apt keeps it patched.
+sudo UV_PROJECT_ENVIRONMENT=/opt/netmon/venv UV_PYTHON_DOWNLOADS=never \
+  /usr/local/bin/uv sync --locked --no-install-project --python /usr/bin/python3
 sudo install -m 644 tools/to_iceberg.py /opt/netmon/to_iceberg.py
 
 echo "== Installing the hourly timer"
