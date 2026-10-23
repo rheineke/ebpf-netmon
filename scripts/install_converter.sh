@@ -25,6 +25,11 @@ echo "== Installing the hourly timer"
 echo "WAREHOUSE=$warehouse" | sudo tee /etc/default/netmon-iceberg >/dev/null
 sudo install -m 644 systemd/netmon-iceberg.service systemd/netmon-iceberg.timer \
   /etc/systemd/system/
+# If WAREHOUSE is on a mount (a NAS), skip runs while it is unmounted rather
+# than write a second warehouse under the empty mount point.
+sudo mkdir -p /etc/systemd/system/netmon-iceberg.service.d
+printf '[Unit]\nRequiresMountsFor=%s\n' "$warehouse" \
+  | sudo tee /etc/systemd/system/netmon-iceberg.service.d/warehouse.conf >/dev/null
 sudo systemctl daemon-reload
 sudo systemctl enable --now netmon-iceberg.timer
 
