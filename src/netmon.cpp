@@ -1,4 +1,4 @@
-// netmon: print per-process TCP/UDP bytes every interval, like top.
+// netmon: print per-process TCP/UDP/NFS bytes every interval, like top.
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <getopt.h>
@@ -6,12 +6,13 @@
 
 #include <algorithm>
 #include <array>
-#include <chrono>
+#include <cerrno>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 #include <random>
 #include <fstream>
 #include <string>
@@ -34,6 +35,7 @@ struct Options {
 	int top = 10;
 	int sample = 0;  // priority-sample this many rows; 0 = off
 	bool json = false;
+	std::string out_dir;  // hourly JSON-lines files instead of stdout
 };
 
 struct Row {
@@ -56,19 +58,21 @@ void usage(const char *prog)
 	std::fprintf(
 		stderr,
 		"usage: %s [-i seconds] [-c count] [-n top | -k sample] [-j]\n"
+		"          [-o dir]\n"
 		"  -i  interval between reports (default 2)\n"
 		"  -c  number of reports, then exit (default: until ^C)\n"
 		"  -n  rows per report (default 10, 0 = all)\n"
 		"  -k  priority-sample this many rows per report, with\n"
 		"      unbiased estimates (see README); overrides -n\n"
-		"  -j  JSON lines instead of a table\n",
+		"  -j  JSON lines instead of a table\n"
+		"  -o  append JSON lines to dir/YYYY-MM-DD/HH.jsonl (UTC)\n",
 		prog);
 }
 
 bool parse_options(int argc, char **argv, Options &opts)
 {
 	int c;
-	while ((c = getopt(argc, argv, "i:c:n:k:jh")) != -1) {
+	while ((c = getopt(argc, argv, "i:c:n:k:o:jh")) != -1) {
 		switch (c) {
 		case 'i':
 			opts.interval_s = std::max(1, std::atoi(optarg));
@@ -77,6 +81,10 @@ bool parse_options(int argc, char **argv, Options &opts)
 		case 'n': opts.top = std::max(0, std::atoi(optarg)); break;
 		case 'k': opts.sample = std::max(0, std::atoi(optarg)); break;
 		case 'j': opts.json = true; break;
+		case 'o':
+			opts.out_dir = optarg;
+			opts.json = true;
+			break;
 		default: return false;
 		}
 	}
@@ -219,27 +227,80 @@ void print_table(const std::vector<Row> &rows, const Options &opts)
 	std::fflush(stdout);
 }
 
-void print_json(const std::vector<Row> &rows, const Options &opts)
+// Returns false if the write failed, e.g. the disk is full.
+bool print_json(std::FILE *out, std::time_t ts, const std::string &host,
+		const std::vector<Row> &rows, const Options &opts)
 {
-	long long ts =
-		std::chrono::duration_cast<std::chrono::seconds>(
-			std::chrono::system_clock::now().time_since_epoch())
-			.count();
 	size_t n = rows_to_print(rows, opts);
 	for (size_t i = 0; i < n; ++i) {
 		const Row &r = rows[i];
-		std::printf(
-			"{\"ts\":%lld,\"interval_s\":%d,\"pid\":%u,\"uid\":%u,"
+		std::fprintf(
+			out,
+			"{\"ts\":%lld,\"host\":\"%s\",\"interval_s\":%d,"
+			"\"pid\":%u,\"uid\":%u,"
 			"\"comm\":\"%s\",\"tcp_tx\":%llu,\"tcp_rx\":%llu,"
 			"\"udp_tx\":%llu,\"udp_rx\":%llu,\"nfs_read\":%llu,"
 			"\"nfs_write\":%llu,\"scale\":%.17g}\n",
-			ts, opts.interval_s, r.pid, r.uid,
+			static_cast<long long>(ts), host.c_str(),
+			opts.interval_s, r.pid, r.uid,
 			json_escape(r.comm).c_str(), r.delta[NETMON_TCP_TX],
 			r.delta[NETMON_TCP_RX], r.delta[NETMON_UDP_TX],
 			r.delta[NETMON_UDP_RX], r.delta[NETMON_NFS_READ],
 			r.delta[NETMON_NFS_WRITE], r.scale);
 	}
-	std::fflush(stdout);
+	return std::fflush(out) == 0 && !std::ferror(out);
+}
+
+// Appends to dir/YYYY-MM-DD/HH.jsonl for the UTC hour of each report, so
+// files are complete once the hour has passed and easy to convert in bulk.
+class HourlyFiles {
+public:
+	explicit HourlyFiles(std::string dir) : dir_(std::move(dir)) {}
+	HourlyFiles(const HourlyFiles &) = delete;
+	HourlyFiles &operator=(const HourlyFiles &) = delete;
+	~HourlyFiles() { close(); }
+
+	std::FILE *at(std::time_t ts)
+	{
+		std::tm tm{};
+		gmtime_r(&ts, &tm);
+		char day[16], hour[16];
+		std::strftime(day, sizeof(day), "%F", &tm);
+		std::strftime(hour, sizeof(hour), "%H.jsonl", &tm);
+		std::filesystem::path path =
+			std::filesystem::path(dir_) / day / hour;
+		if (file_ && path == path_)
+			return file_;
+		close();
+		std::error_code ec;
+		std::filesystem::create_directories(path.parent_path(), ec);
+		file_ = std::fopen(path.c_str(), "a");
+		if (!file_)
+			std::fprintf(stderr, "netmon: cannot open %s: %s\n",
+				     path.c_str(), std::strerror(errno));
+		path_ = path;
+		return file_;
+	}
+
+private:
+	void close()
+	{
+		if (file_)
+			std::fclose(file_);
+		file_ = nullptr;
+	}
+
+	std::string dir_;
+	std::filesystem::path path_;
+	std::FILE *file_ = nullptr;
+};
+
+std::string host_name()
+{
+	char buf[256] = {};
+	if (gethostname(buf, sizeof(buf) - 1) != 0)
+		return "unknown";
+	return json_escape(buf);
 }
 
 // Attaches each probe on its own so a kernel missing one symbol still runs.
@@ -296,6 +357,9 @@ int main(int argc, char **argv)
 	std::unordered_map<unsigned int, netmon_traffic> prev;
 	collect(map_fd, prev);  // baseline: report only traffic from now on
 	std::mt19937_64 rng(std::random_device{}());
+	const std::string host = host_name();
+	HourlyFiles files(opts.out_dir);
+	int rc = 0;
 
 	for (int report = 0; !g_stop && (!opts.count || report < opts.count);
 	     ++report) {
@@ -304,13 +368,20 @@ int main(int argc, char **argv)
 		auto rows = collect(map_fd, prev);
 		if (opts.sample)
 			rows = sample_rows(std::move(rows), opts.sample, rng);
-		if (opts.json)
-			print_json(rows, opts);
-		else
+		if (!opts.json) {
 			print_table(rows, opts);
+			continue;
+		}
+		std::time_t now = std::time(nullptr);
+		std::FILE *out = opts.out_dir.empty() ? stdout : files.at(now);
+		if (!out || !print_json(out, now, host, rows, opts)) {
+			std::fprintf(stderr, "netmon: write failed\n");
+			rc = 1;
+			break;
+		}
 	}
 
 	detach(links);
 	netmon_bpf__destroy(skel);
-	return 0;
+	return rc;
 }

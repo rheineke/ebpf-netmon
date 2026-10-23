@@ -3,10 +3,13 @@
 Needs root and a kernel that allows kprobes: docker run --privileged.
 """
 
+import glob
 import json
+import os
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -58,6 +61,22 @@ def check_sampled(out):
     print("sampled rows per report:", per_report)
 
 
+def check_files(out_dir, stdout_lines):
+    """-o writes the same JSON as -j into out_dir/YYYY-MM-DD/HH.jsonl."""
+    paths = glob.glob(os.path.join(out_dir, "*", "*.jsonl"))
+    rows = [json.loads(line) for p in paths for line in open(p)]
+    if not rows:
+        sys.exit(f"FAIL: no rows in {out_dir}: {paths}")
+    for p in paths:
+        day, hour = p.split(os.sep)[-2:]
+        if len(day) != 10 or len(hour) != len("HH.jsonl"):
+            sys.exit(f"FAIL: unexpected file name {p}")
+    stdout_keys = set(json.loads(stdout_lines.splitlines()[0]))
+    if set(rows[0]) != stdout_keys or rows[0]["host"] != socket.gethostname():
+        sys.exit(f"FAIL: file rows differ from stdout rows: {rows[0]}")
+    print(f"-o wrote {len(rows)} rows to {len(paths)} file(s)")
+
+
 def main():
     netmon = subprocess.Popen(
         ["netmon", "-j", "-n", "0", "-i", "1", "-c", "4"],
@@ -70,6 +89,11 @@ def main():
         stdout=subprocess.PIPE,
         text=True,
     )
+    # A third writes hourly files, the way the systemd service runs it.
+    out_dir = tempfile.mkdtemp()
+    to_files = subprocess.Popen(
+        ["netmon", "-n", "0", "-i", "1", "-c", "4", "-o", out_dir]
+    )
     time.sleep(1.5)  # let the probes attach and the baseline read happen
     tcp_traffic()
     udp_traffic()
@@ -78,6 +102,9 @@ def main():
     if netmon.returncode != 0 or sampled.returncode != 0:
         sys.exit(f"netmon exited with {netmon.returncode}, {sampled.returncode}")
     check_sampled(sampled_out)
+    if to_files.wait(timeout=30) != 0:
+        sys.exit(f"netmon -o exited with {to_files.returncode}")
+    check_files(out_dir, out)
 
     # Sender and receiver are both this process, so expect at least the
     # payload in each direction.
