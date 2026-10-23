@@ -1,0 +1,3 @@
+[default.extend-words]
+# nfs-kernel-server's command, not a misspelling of "exports".
+exportfs = "exportfs"

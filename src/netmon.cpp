@@ -198,18 +198,20 @@ void print_table(const std::vector<Row> &rows, const Options &opts)
 	char ts[32];
 	std::strftime(ts, sizeof(ts), "%F %T", std::localtime(&now));
 	std::printf("\n%s  bytes in the last %ds\n", ts, opts.interval_s);
-	std::printf("%8s %6s %-16s %9s %9s %9s %9s%s\n", "PID", "UID", "COMM",
-		    "TCP_TX", "TCP_RX", "UDP_TX", "UDP_RX",
-		    opts.sample ? "    SCALE" : "");
+	std::printf("%8s %6s %-16s %9s %9s %9s %9s %9s %9s%s\n", "PID", "UID",
+		    "COMM", "TCP_TX", "TCP_RX", "UDP_TX", "UDP_RX", "NFS_RD",
+		    "NFS_WR", opts.sample ? "    SCALE" : "");
 	size_t n = rows_to_print(rows, opts);
 	for (size_t i = 0; i < n; ++i) {
 		const Row &r = rows[i];
-		std::printf("%8u %6u %-16s %9s %9s %9s %9s", r.pid, r.uid,
-			    r.comm.c_str(),
+		std::printf("%8u %6u %-16s %9s %9s %9s %9s %9s %9s", r.pid,
+			    r.uid, r.comm.c_str(),
 			    human(r.delta[NETMON_TCP_TX]).c_str(),
 			    human(r.delta[NETMON_TCP_RX]).c_str(),
 			    human(r.delta[NETMON_UDP_TX]).c_str(),
-			    human(r.delta[NETMON_UDP_RX]).c_str());
+			    human(r.delta[NETMON_UDP_RX]).c_str(),
+			    human(r.delta[NETMON_NFS_READ]).c_str(),
+			    human(r.delta[NETMON_NFS_WRITE]).c_str());
 		if (opts.sample)
 			std::printf(" %8.2f", r.scale);
 		std::printf("\n");
@@ -229,19 +231,21 @@ void print_json(const std::vector<Row> &rows, const Options &opts)
 		std::printf(
 			"{\"ts\":%lld,\"interval_s\":%d,\"pid\":%u,\"uid\":%u,"
 			"\"comm\":\"%s\",\"tcp_tx\":%llu,\"tcp_rx\":%llu,"
-			"\"udp_tx\":%llu,\"udp_rx\":%llu,\"scale\":%.17g}\n",
+			"\"udp_tx\":%llu,\"udp_rx\":%llu,\"nfs_read\":%llu,"
+			"\"nfs_write\":%llu,\"scale\":%.17g}\n",
 			ts, opts.interval_s, r.pid, r.uid,
 			json_escape(r.comm).c_str(), r.delta[NETMON_TCP_TX],
 			r.delta[NETMON_TCP_RX], r.delta[NETMON_UDP_TX],
-			r.delta[NETMON_UDP_RX], r.scale);
+			r.delta[NETMON_UDP_RX], r.delta[NETMON_NFS_READ],
+			r.delta[NETMON_NFS_WRITE], r.scale);
 	}
 	std::fflush(stdout);
 }
 
 // Attaches each probe on its own so a kernel missing one symbol still runs.
-int attach(netmon_bpf *skel)
+std::vector<bpf_link *> attach(netmon_bpf *skel)
 {
-	int attached = 0;
+	std::vector<bpf_link *> links;
 	bpf_program *prog;
 	bpf_object__for_each_program(prog, skel->obj)
 	{
@@ -251,9 +255,16 @@ int attach(netmon_bpf *skel)
 				     bpf_program__section_name(prog));
 			continue;
 		}
-		++attached;  // links are released when the process exits
+		links.push_back(link);
 	}
-	return attached;
+	return links;
+}
+
+void detach(std::vector<bpf_link *> &links)
+{
+	for (bpf_link *link : links)
+		bpf_link__destroy(link);
+	links.clear();
 }
 
 }  // namespace
@@ -272,7 +283,8 @@ int main(int argc, char **argv)
 				     "(run as root?)\n");
 		return 1;
 	}
-	if (attach(skel) == 0) {
+	std::vector<bpf_link *> links = attach(skel);
+	if (links.empty()) {
 		netmon_bpf__destroy(skel);
 		return 1;
 	}
@@ -298,6 +310,7 @@ int main(int argc, char **argv)
 			print_table(rows, opts);
 	}
 
+	detach(links);
 	netmon_bpf__destroy(skel);
 	return 0;
 }

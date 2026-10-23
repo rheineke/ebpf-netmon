@@ -5,18 +5,19 @@ eBPF network traffic monitoring for Raspberry Pis (Debian trixie, arm64).
 ## netmon
 
 `netmon` prints the TCP and UDP bytes each process sent and received in the
-last interval, like `top`:
+last interval, and the NFS file bytes it read and wrote, like `top`:
 
 ```
-     PID    UID COMM                TCP_TX    TCP_RX    UDP_TX    UDP_RX
-    1207    501 sshd                  196B        0B        0B        0B
+     PID    UID COMM                TCP_TX    TCP_RX    UDP_TX    UDP_RX    NFS_RD    NFS_WR
+     850    999 Plex Media Serv         0B        0B      687B      1.1K     12.0M        0B
 ```
 
 Options: `-i` interval in seconds (default 2), `-c` number of reports,
 `-n` rows (0 = all), `-k` priority-sample rows (see below), `-j` JSON lines.
 
 It uses kprobes on `tcp_sendmsg`, `tcp_cleanup_rbuf`, `udp(v6)_sendmsg` and
-`udp(v6)_recvmsg`, and reads only their integer arguments and return values.
+`udp(v6)_recvmsg`, and kretprobes on `nfs_file_read`, `nfs_file_splice_read`
+and `nfs_file_write`. It reads only their integer arguments and return values.
 So it needs no CO-RE and no kernel BTF, which Raspberry Pi kernels don't ship.
 
 ## Priority sampling
@@ -64,7 +65,12 @@ docker build --target lint .   # clang-tidy, which needs Linux headers
 | Python | ruff format | ruff check (`ruff.toml`) |
 | Shell | shfmt (Google style: `-i 2 -ci -bn`) | ShellCheck |
 | Dockerfile | | hadolint (`.hadolint.yaml`) |
-| GitHub Actions | | actionlint |
+| GitHub Actions | | actionlint, zizmor (security) |
+| Everything | | gitleaks (secrets), typos (spelling) |
+
+CI also scans the whole git history with gitleaks, runs the unit and smoke
+tests under ASan and UBSan (`make sanitize`, or
+`docker build --target sanitize`).
 
 ## Build on a Pi
 
@@ -94,10 +100,22 @@ counts for the server process match the bytes that actually arrived.
 
 ### NFS traffic
 
-NFS reads and writes happen in the kernel, so netmon counts them under the
-kernel threads that do the socket I/O (`kworker/...-nfsiod`, `-xprtiod`,
-`-rpciod`), not under the process that read the file. Reading a 22 MB file
-from an NFS mount showed about 22 MB of `tcp_rx` spread over those threads.
+The NFS client sends and receives in kernel threads (`kworker/...-nfsiod`,
+`-xprtiod`, `-rpciod`), so the wire bytes show up as their `tcp_rx`/`tcp_tx`.
+`NFS_RD` and `NFS_WR` charge the file bytes to the process that read or wrote
+them, through `read()`, `sendfile()`/`splice()` or `write()`. They count
+file bytes, not wire bytes: reads served from the page cache count too, and
+memory-mapped access does not.
+
+To check it on a machine with an NFS mount (the directory is optional and
+must be writable):
+
+```sh
+sudo python3 tests/nfs_test.py FILE_ON_NFS [DIR_ON_NFS]
+```
+
+CI runs it against a loopback NFS export. On a Pi 4 it matched exactly for
+the Synology NAS (read-only) and a loopback export (read and write).
 
 ## Run a Docker-built binary on a Pi
 

@@ -25,6 +25,14 @@ WORKDIR /src
 COPY tests ./tests
 ENTRYPOINT ["python3", "tests/smoke_test.py"]
 
+# ASan/UBSan builds: unit tests at build time, smoke test at run time.
+FROM build AS sanitize
+RUN apt-get update && apt-get install -y --no-install-recommends python3 \
+    && rm -rf /var/lib/apt/lists/*
+RUN make sanitize
+ENV PATH=/src/build/asan:$PATH
+ENTRYPOINT ["python3", "tests/smoke_test.py"]
+
 # clang-tidy on the C++, which needs the generated skeleton and libbpf headers.
 FROM build AS lint
 RUN apt-get update && apt-get install -y --no-install-recommends clang-tidy \
