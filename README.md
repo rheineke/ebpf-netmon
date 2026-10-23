@@ -140,6 +140,21 @@ them to Parquet is a separate step. Nothing deletes old files yet. An idle
 Pi writes about 650 rows (120 KB) an hour, or 3 MB a day; busier Pis write
 more.
 
+## Iceberg
+
+`tools/to_iceberg.py` appends each finished hour of raw files to the
+Iceberg table `netmon.traffic`, stored as Parquet and partitioned by day,
+with a SQLite catalog in the warehouse directory. An hour that is already
+in the table is skipped, so reruns are safe. To run it at five past every
+hour:
+
+```sh
+scripts/install_converter.sh WAREHOUSE
+```
+
+`python3 tests/iceberg_test.py` tests it; it needs `tools/requirements.txt`.
+On pi64-dev, 1 MB of raw JSON became 108 KB of Parquet.
+
 ## Run a Docker-built binary on a Pi
 
 The binary links libbpf statically and needs only `libelf1t64` and `zlib1g`:
