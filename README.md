@@ -197,6 +197,28 @@ Grafana serves the `netmon traffic` dashboard on port 3000, from
 `netmon.traffic_live`, refreshing every 30 seconds. The first login is
 admin/admin.
 
+### Alerts
+
+`install_grafana.sh` also installs three alert rules, evaluated every
+minute, in `grafana/provisioning/alerting/netmon-rules.yaml`:
+
+| Rule | Fires when |
+|---|---|
+| Host stopped reporting | a host seen in the last day has had no rows for 5 minutes |
+| Process moving over 10 MB/s | one process averages over 10 MB/s sent or received for 5 minutes |
+| Iceberg converter behind | the newest row in Iceberg is over 2 hours old |
+
+To get them by email, run this on the Grafana machine, in a terminal:
+
+```sh
+scripts/configure_alert_email.sh
+```
+
+It asks for the address and an SMTP login (for Gmail, an app password)
+and stores them in `/etc/grafana/netmon-alerts.env`, readable only by root
+and Grafana. Renaming a host makes its old name fire "Host stopped
+reporting" until a day after its last row.
+
 ClickHouse releases need ARMv8.2 (Pi 5) and die with "Illegal instruction"
 on a Pi 4 (ARMv8.0). On a Pi 4 the script installs ClickHouse's nightly
 ARMv8.0 build, which has no releases.

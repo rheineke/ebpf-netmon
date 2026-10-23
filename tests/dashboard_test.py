@@ -10,7 +10,8 @@ current hour, to DIR/raw, and converts the first three into DIR/warehouse.
 check runs every panel of grafana/dashboards/netmon.json through
 clickhouse-client, as Grafana's user, with Grafana's macros filled in, and
 checks the totals, so the live view must add the last hour from the raw
-files. convert loads that hour too; the totals must not change.
+files. It also runs every alert rule's query, which needs the dev
+dependencies (uv sync). convert loads that hour too; the totals must not change.
 """
 
 import datetime as dt
@@ -75,7 +76,14 @@ def fill_macros(sql):
 
 def query(sql):
     out = subprocess.run(
-        ["clickhouse-client", "--user", "grafana", "--format", "JSONEachRow"],
+        [
+            "clickhouse-client",
+            "--user",
+            "grafana",
+            "--format",
+            "JSONEachRow",
+            "--output_format_json_quote_64bit_integers=0",
+        ],
         input=fill_macros(sql),
         capture_output=True,
         text=True,
@@ -127,7 +135,32 @@ def check():
         else:
             check_eq(f"{title}: rows", len(rows), 4)  # 2 hosts x 2 comms
             check_eq(f"{title}: pids", {r["pids"] for r in rows}, {1})
+    check_alerts()
     print("PASS")
+
+
+def check_alerts():
+    """Each alert query must give Grafana one number per row, labelled by
+    its string columns, or the rule cannot evaluate."""
+    import yaml
+
+    path = ROOT / "grafana/provisioning/alerting/netmon-rules.yaml"
+    for rule in yaml.safe_load(path.read_text())["groups"][0]["rules"]:
+        query_step, threshold = rule["data"]
+        rows = query(query_step["model"]["rawSql"])
+        title = rule["title"]
+        if rule["uid"] == "netmon-host-silent":
+            check_eq(
+                f"{title}: hosts", sorted(r["host"] for r in rows), ["pi-a", "pi-b"]
+            )
+        if rule["uid"] == "netmon-converter-behind":
+            check_eq(f"{title}: rows", len(rows), 1)
+        for row in rows:
+            kinds = sorted(type(v).__name__ for v in row.values())
+            numbers = [k for k in kinds if k in ("int", "float")]
+            if len(numbers) != 1 or set(kinds) - {"int", "float", "str"}:
+                sys.exit(f"FAIL: {title}: row {row} is not one number and labels")
+        check_eq(f"{title}: threshold step", threshold["model"]["expression"], "A")
 
 
 if __name__ == "__main__":

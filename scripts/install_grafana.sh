@@ -20,13 +20,15 @@ sudo grafana cli plugins install grafana-clickhouse-datasource
 # grafana cli ran as root; the server installs its own plugins there too.
 sudo chown -R grafana:grafana /var/lib/grafana/plugins
 
-echo "== Provisioning the data source and dashboard"
+echo "== Provisioning the data source, dashboard and alert rules"
 sudo install -m 644 grafana/provisioning/datasources/netmon.yaml \
   /etc/grafana/provisioning/datasources/
 sudo install -m 644 grafana/provisioning/dashboards/netmon.yaml \
   /etc/grafana/provisioning/dashboards/
 sudo install -d /var/lib/grafana/dashboards/netmon
 sudo install -m 644 grafana/dashboards/netmon.json /var/lib/grafana/dashboards/netmon/
+sudo install -m 640 -o root -g grafana grafana/provisioning/alerting/netmon-rules.yaml \
+  /etc/grafana/provisioning/alerting/
 
 sudo systemctl daemon-reload
 sudo systemctl enable grafana-server
