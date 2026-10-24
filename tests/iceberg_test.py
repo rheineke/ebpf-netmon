@@ -1,13 +1,19 @@
 """Unit test for tools/to_iceberg.py. Needs no root.
 
 uv run tests/iceberg_test.py
+
+Partway through, it moves the table from the default SQLite catalog to
+$NETMON_TEST_CATALOG (a SQLAlchemy URI), or to a second SQLite file.
 """
 
 import datetime as dt
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
+
+from pyiceberg.exceptions import NoSuchTableError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 import to_iceberg  # noqa: E402
@@ -73,19 +79,45 @@ def main():
         check("hosts", sorted(set(table["host"].to_pylist())), ["pi-a", "pi-b"])
         check("nfs_write total", sum(table["nfs_write"].to_pylist()), 6 * 19)
         check("ts is UTC", str(table.schema.field("ts").type), "timestamp[us, tz=UTC]")
+        metadata = len(list(warehouse.rglob("*.metadata.json")))
+        to_iceberg.convert(raw, warehouse, later)
+        check(
+            "a run with nothing to add writes no metadata",
+            len(list(warehouse.rglob("*.metadata.json"))),
+            metadata,
+        )
+
+        # Moving to another catalog adopts the newest metadata.
+        uri = os.environ.get("NETMON_TEST_CATALOG") or f"sqlite:///{tmp}/moved.db"
+        catalog = to_iceberg.open_catalog(warehouse, uri)
+        try:  # a previous run's table; its files are gone
+            catalog.drop_table(to_iceberg.TABLE)
+        except NoSuchTableError:
+            pass
+        moved = to_iceberg.open_table(warehouse, uri).scan().to_arrow()
+        check("moved catalog has the rows", moved.num_rows, 19)
+
+        def load(now):
+            return to_iceberg.convert(raw, warehouse, now, catalog_uri=uri)
 
         # A NAS copy of pi-c's 10:00 file stopped partway through, then the
         # rest arrived, along with a late hour.
         write_hour(raw, "pi-c", h10, 3)
-        check("partial hour loads", to_iceberg.convert(raw, warehouse, later), 3)
+        check("partial hour loads", load(later), 3)
+        refused = False
+        try:
+            to_iceberg.open_table(warehouse)  # the SQLite catalog, now stale
+        except SystemExit:
+            refused = True
+        check("the old catalog refuses to run", refused, True)
         write_hour(raw, "pi-c", h10, 8)
         write_hour(raw, "pi-c", h10 - dt.timedelta(hours=1), 2)
         check(
             "completed hour replaced, late hour added",
-            to_iceberg.convert(raw, warehouse, later),
+            load(later),
             5 + 2,
         )
-        check("then nothing", to_iceberg.convert(raw, warehouse, later), 0)
+        check("then nothing", load(later), 0)
 
         # pi-d was renamed pi-e partway through its 10:00 hour.
         write_hour(raw, "pi-d", h10, 4)
@@ -94,10 +126,10 @@ def main():
             for line in path.read_text().splitlines():
                 row = json.loads(line) | {"host": "pi-e"}
                 f.write(json.dumps(row | {"ts": row["ts"] + 1800}) + "\n")
-        check("renamed mid-hour loads", to_iceberg.convert(raw, warehouse, later), 8)
-        check("and stays loaded", to_iceberg.convert(raw, warehouse, later), 0)
+        check("renamed mid-hour loads", load(later), 8)
+        check("and stays loaded", load(later), 0)
 
-        table = to_iceberg.open_table(warehouse).scan().to_arrow()
+        table = to_iceberg.open_table(warehouse, uri).scan().to_arrow()
         hosts = table["host"].to_pylist()
         check("pi-d and pi-e rows", (hosts.count("pi-d"), hosts.count("pi-e")), (4, 4))
         check("pi-c rows, no duplicates", hosts.count("pi-c"), 8 + 2)
@@ -109,6 +141,11 @@ def main():
         ]
         check("rows unique", len(set(keys)), len(keys))
         check("pi-a and pi-b untouched", hosts.count("pi-a") + hosts.count("pi-b"), 19)
+        check(
+            "the moved catalog commits the newest metadata",
+            to_iceberg.open_table(warehouse, uri).metadata_location,
+            to_iceberg.newest_metadata(warehouse).as_uri(),
+        )
         files = list(warehouse.rglob("*.parquet"))
         check(
             "parquet partitioned by day",

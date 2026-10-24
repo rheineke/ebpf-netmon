@@ -1,15 +1,16 @@
 # Loads finished hours of raw files into the Iceberg table. Install with
-# scripts/install_converter.sh, which writes WAREHOUSE and RAW to
-# /etc/default/netmon-iceberg.
+# scripts/install_converter.sh, which writes WAREHOUSE, RAW and CATALOG to
+# /etc/default/netmon-iceberg. An empty CATALOG means SQLite in WAREHOUSE.
 [Unit]
 Description=netmon raw JSON lines to Iceberg
-After=network-online.target remote-fs.target
+# postgresql.service only orders the two when the catalog is PostgreSQL.
+After=network-online.target remote-fs.target postgresql.service
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 EnvironmentFile=/etc/default/netmon-iceberg
-ExecStart=/opt/netmon/venv/bin/python /opt/netmon/to_iceberg.py --warehouse ${WAREHOUSE} --raw ${RAW}
+ExecStart=/opt/netmon/venv/bin/python /opt/netmon/to_iceberg.py --warehouse ${WAREHOUSE} --raw ${RAW} --catalog ${CATALOG}
 NoNewPrivileges=yes
 ProtectHome=yes
 PrivateTmp=yes

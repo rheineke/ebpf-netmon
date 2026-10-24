@@ -171,6 +171,25 @@ is unmounted the sync and the converter skip their runs, and the next sync
 catches up. Each row carries the host name it was captured under, so
 renaming a Pi starts a new host in the table.
 
+### PostgreSQL catalog
+
+The catalog only records where the table's current metadata file is; the
+data and metadata stay in the warehouse. To keep it in PostgreSQL on the
+converter's machine instead of SQLite:
+
+```sh
+scripts/install_postgres.sh
+scripts/install_converter.sh WAREHOUSE RAW \
+  'postgresql+psycopg2://netmon@/netmon?host=/var/run/postgresql'
+```
+
+PostgreSQL is reached over its Unix socket only, with no password. On its
+first run the converter adopts the table already in the warehouse, so
+nothing is copied; ClickHouse reads the warehouse directly and doesn't
+change. The old catalog then refuses to run, since its metadata is out of
+date; to move back, remove `netmon.traffic` from it (for SQLite, move
+`catalog.db` away) and switch the URI back.
+
 `uv run tests/iceberg_test.py` tests it. The Python dependencies are in
 `pyproject.toml`, pinned in `uv.lock`.
 On a Pi 4, 1 MB of raw JSON became 108 KB of Parquet.
