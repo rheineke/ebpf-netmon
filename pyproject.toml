@@ -6,8 +6,8 @@ name = "ebpf-netmon"
 version = "0"
 requires-python = ">=3.13"
 dependencies = [
-    # Day partitioning needs pyiceberg-core.
-    "pyiceberg[pyarrow,sql-sqlite,pyiceberg-core]==0.12.0",
+    # Day partitioning needs pyiceberg-core; sql-postgres is for --catalog.
+    "pyiceberg[pyarrow,sql-sqlite,sql-postgres,pyiceberg-core]==0.12.0",
 ]
 
 [tool.uv]

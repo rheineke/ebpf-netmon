@@ -31,6 +31,11 @@ jobs:
           enable-cache: false
       - name: Iceberg converter test
         run: uv run --locked tests/iceberg_test.py
+      - name: Iceberg converter test, PostgreSQL catalog
+        run: |
+          scripts/install_postgres.sh "$(id -un)"
+          NETMON_TEST_CATALOG='postgresql+psycopg2://netmon@/netmon?host=/var/run/postgresql' \
+            uv run --locked tests/iceberg_test.py
       # Installs the release ClickHouse (the runner is ARMv8.2) on the runner.
       - name: Dashboard queries
         run: |

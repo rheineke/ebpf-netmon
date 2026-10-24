@@ -2,20 +2,23 @@
 # Installs the hourly raw-to-Iceberg converter on a machine already running
 # the netmon service (scripts/install_service.sh).
 #
-#   scripts/install_converter.sh WAREHOUSE [RAW]
+#   scripts/install_converter.sh WAREHOUSE [RAW [CATALOG]]
 #
 # WAREHOUSE is where the Iceberg table goes, e.g. an NFS mount on a NAS.
 # RAW holds the raw files, by default this machine's /var/lib/netmon/raw; to
 # load several hosts, point it at the folder scripts/install_sync.sh copies
-# them to. Run one converter per warehouse. Re-run to upgrade or move it.
+# them to. CATALOG is a SQLAlchemy URI for the catalog, by default a SQLite
+# file in WAREHOUSE (see scripts/install_postgres.sh). Run one converter per
+# warehouse. Re-run to upgrade or move it.
 set -eu
 
-if [ $# -lt 1 ] || [ $# -gt 2 ]; then
-  sed -n '2,11s/^# \{0,1\}//p' "$0" >&2
+if [ $# -lt 1 ] || [ $# -gt 3 ]; then
+  sed -n '2,13s/^# \{0,1\}//p' "$0" >&2
   exit 2
 fi
 warehouse=$1
 raw=${2:-/var/lib/netmon/raw}
+catalog=${3:-}
 cd "$(dirname "$0")/.."
 
 uv_version=0.13.5
@@ -40,7 +43,7 @@ sudo UV_PROJECT_ENVIRONMENT=/opt/netmon/venv UV_PYTHON_DOWNLOADS=never \
 sudo install -m 644 tools/to_iceberg.py /opt/netmon/to_iceberg.py
 
 echo "== Installing the hourly timer"
-printf 'WAREHOUSE=%s\nRAW=%s\n' "$warehouse" "$raw" \
+printf 'WAREHOUSE=%s\nRAW=%s\nCATALOG=%s\n' "$warehouse" "$raw" "$catalog" \
   | sudo tee /etc/default/netmon-iceberg >/dev/null
 sudo install -m 644 systemd/netmon-iceberg.service systemd/netmon-iceberg.timer \
   /etc/systemd/system/
