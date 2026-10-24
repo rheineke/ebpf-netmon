@@ -228,7 +228,11 @@ ClickHouse listens on 127.0.0.1 only. It has two views:
 - `netmon.traffic_live` adds rows from the last two days of raw files in
   RAW for hours not yet in Iceberg, so it is as recent as the raw files:
   about a minute behind with the per-minute sync. Queries take about half
-  a second longer on a Pi 4.
+  a second longer on a Pi 4. An hour the converter loaded before all of
+  it arrived shows its late rows after the next run, at five past.
+
+Grafana's ClickHouse user, `grafana`, may only read these views; they read
+the files as `netmon_views`, which can't log in.
 
 Grafana serves the `netmon traffic` dashboard on port 3000, from
 `netmon.traffic_live`, refreshing every 30 seconds. The first login is
@@ -241,7 +245,7 @@ minute, in `grafana/provisioning/alerting/netmon-rules.yaml`:
 
 | Rule | Fires when |
 |---|---|
-| Host stopped reporting | a host seen in the last day has had no rows for 5 minutes |
+| Host stopped reporting | a host seen in the last 7 days has had no rows for 5 minutes |
 | Process moving over 10 MB/s | one process averages over 10 MB/s sent or received for 5 minutes |
 | Iceberg converter behind | the newest row in Iceberg is over 2 hours old |
 
@@ -254,7 +258,8 @@ scripts/configure_alert_email.sh
 It asks for the address and an SMTP login (for Gmail, an app password)
 and stores them in `/etc/grafana/netmon-alerts.env`, readable only by root
 and Grafana. Renaming a host makes its old name fire "Host stopped
-reporting" until a day after its last row.
+reporting" until 7 days after its last row, when the alert resolves; so
+does a host that stays down that long.
 
 ClickHouse releases need ARMv8.2 (Pi 5) and die with "Illegal instruction"
 on a Pi 4 (ARMv8.0). On a Pi 4 the script installs ClickHouse's nightly

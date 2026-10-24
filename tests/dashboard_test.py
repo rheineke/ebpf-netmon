@@ -147,7 +147,25 @@ def check():
             check_eq(f"{title}: rows", len(rows), 4)  # 2 hosts x 2 comms
             check_eq(f"{title}: pids", {r["pids"] for r in rows}, {1})
     check_alerts()
+    check_locked_down()
     print("PASS")
+
+
+def check_locked_down():
+    """Grafana's user can't reach files, URLs or its limits but by the views."""
+    for sql in (
+        "SELECT count() FROM file('**/*.jsonl', 'LineAsString')",
+        "INSERT INTO FUNCTION file('grafana.txt', 'LineAsString') SELECT 'x'",
+        "SELECT * FROM url('http://127.0.0.1:8123/?query=SELECT%201', 'LineAsString')",
+        "SELECT 1 SETTINGS max_memory_usage = 0",
+        "DROP VIEW netmon.traffic_live",
+    ):
+        out = subprocess.run(
+            ["clickhouse-client", "--user", "grafana", "-q", sql],
+            capture_output=True,
+            text=True,
+        )
+        check_eq(f"refused: {sql}", out.returncode != 0, True)
 
 
 def check_alerts():

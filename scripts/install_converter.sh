@@ -8,22 +8,29 @@
 # RAW holds the raw files, by default this machine's /var/lib/netmon/raw; to
 # load several hosts, point it at the folder scripts/install_sync.sh copies
 # them to. CATALOG is a SQLAlchemy URI for the catalog (see
-# scripts/install_postgres.sh); left out, it stays as installed, and '' is a
-# SQLite file in WAREHOUSE. Run one converter per warehouse. Re-run to
-# upgrade or move it.
+# scripts/install_postgres.sh), and '' is a SQLite file in WAREHOUSE. Left
+# out, RAW and CATALOG stay as installed. Run one converter per warehouse.
+# Re-run to upgrade or move it.
 set -eu
 
 if [ $# -lt 1 ] || [ $# -gt 3 ]; then
   sed -n '2,13s/^# \{0,1\}//p' "$0" >&2
   exit 2
 fi
+installed() { sed -n "s/^$1=//p" /etc/default/netmon-iceberg 2>/dev/null || true; }
 warehouse=$1
-raw=${2:-/var/lib/netmon/raw}
+if [ $# -ge 2 ]; then
+  raw=$2
+else
+  raw=$(installed RAW)
+  raw=${raw:-/var/lib/netmon/raw}
+fi
 if [ $# -eq 3 ]; then
   catalog=$3
 else
-  catalog=$(sed -n 's/^CATALOG=//p' /etc/default/netmon-iceberg 2>/dev/null || true)
+  catalog=$(installed CATALOG)
 fi
+echo "== RAW=$raw CATALOG=${catalog:-(SQLite in WAREHOUSE)}"
 cd "$(dirname "$0")/.."
 
 uv_version=0.13.5

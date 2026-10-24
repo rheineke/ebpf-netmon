@@ -26,9 +26,9 @@ expires snapshots older than --keep-days (28), and deletes files no
 remaining snapshot uses. Time travel works back --keep-days.
 
 Runs take turns through a lock file (--lock), and a run that stops partway
-leaves a marker in the warehouse so the next one on the same machine
-deletes the metadata it wrote but never committed. Only main() does these;
-call convert() and maintain() only while no other run can.
+leaves a marker on this machine's disk (--marker), so the next one deletes
+the metadata it wrote but never committed. Only main() does these; call
+convert() and maintain() only while no other run can.
 """
 
 import argparse
@@ -94,6 +94,7 @@ ARROW_SCHEMA = pa.schema(
 
 
 LOCK = "/run/netmon-iceberg.lock"  # in /run, which only root can write
+MARKER = "/var/lib/netmon/iceberg-run.json"  # local, and kept across reboots
 COMPACT_MAX_ROWS = 1_000_000  # bigger days stay as they are, to bound memory
 # NNNNN-UUID.metadata.json, numbered from 00000 by each commit.
 METADATA_NAME = re.compile(r"(\d+)-.+\.metadata\.json")
@@ -137,30 +138,38 @@ def newest_metadata(warehouse):
     return next((path for path, _ in reversed(files) if complete(path)), None)
 
 
-def run_marker(warehouse):
-    """Present while a run of main() is loading or maintaining, so the next
-    run knows when one stopped partway, even across a reboot. It names the
-    machine and the metadata file the run started from."""
-    return Path(warehouse).resolve() / ".netmon-iceberg-run"
+def storage_time(folder):
+    """Now, by the clock of the machine storing folder (a NAS)."""
+    with tempfile.NamedTemporaryFile(dir=folder) as probe:
+        return Path(probe.name).stat().st_mtime
 
 
-def recover(warehouse, catalog_uri=None):
-    """If the last run stopped partway, deletes the metadata files it wrote
-    after its last commit: the catalog never took them, and their rows load
-    again from the raw files. Only when that run was on this machine and
-    this catalog has moved on only from where it started, so another
-    machine's catalog or an older copy of this one is left to open_table()
-    to refuse."""
-    marker = run_marker(warehouse)
-    if not marker.exists():
-        return
+def mark_run(marker, warehouse, table):
+    """Notes, while a run of main() loads or maintains, the warehouse, the
+    metadata file it started from and when, so the next run can tell that
+    it stopped partway, even across a reboot."""
+    warehouse = Path(warehouse).resolve()
+    run = {"warehouse": str(warehouse), "start": table.metadata_location}
+    run["started"] = storage_time(local_path(table.metadata_location).parent)
+    Path(marker).write_text(json.dumps(run))
+
+
+def recover(warehouse, catalog_uri, marker):
+    """If the last run on this machine stopped partway, deletes the metadata
+    files it wrote after its last commit: the catalog never took them, and
+    their rows load again from the raw files. Only when this catalog has
+    moved on only from where that run started, so an older copy of it is
+    left to open_table() to refuse."""
+    warehouse = Path(warehouse).resolve()
     try:
-        run = json.loads(marker.read_text())
+        run = json.loads(Path(marker).read_text())
+    except FileNotFoundError:
+        return
     except ValueError:
         run = {}
-    if run.get("host") != socket.gethostname() or "start" not in run:
+    if run.get("warehouse") != str(warehouse) or not {"start", "started"} <= run.keys():
         return
-    table = load_table(open_catalog(Path(warehouse).resolve(), catalog_uri))
+    table = load_table(open_catalog(warehouse, catalog_uri))
     if table is None:
         return
     current = local_path(table.metadata_location)
@@ -170,12 +179,11 @@ def recover(warehouse, catalog_uri=None):
     files = metadata_files(warehouse)
     if local_path(run["start"]) not in history or current not in files:
         return
-    started = marker.stat().st_mtime
     for path, version in files.items():
-        if version > files[current] and path.stat().st_mtime >= started:
+        if version > files[current] and path.stat().st_mtime >= run["started"]:
             print(f"deleting uncommitted {path}")
             path.unlink()
-    marker.unlink()
+    Path(marker).unlink()
 
 
 def load_table(catalog):
@@ -233,10 +241,9 @@ def hour_of(path):
     """RAW/.../2026-10-22/11.jsonl -> 2026-10-22 11:00 UTC, or None."""
     try:
         day = dt.date.fromisoformat(path.parent.name)
-        hour = int(path.stem)
+        return dt.datetime(day.year, day.month, day.day, int(path.stem), tzinfo=dt.UTC)
     except ValueError:
         return None
-    return dt.datetime(day.year, day.month, day.day, hour, tzinfo=dt.UTC)
 
 
 def first_host(path):
@@ -244,9 +251,11 @@ def first_host(path):
     with open(path) as f:
         for line in f:
             try:
-                return json.loads(line).get("host", socket.gethostname())
+                row = json.loads(line)
             except ValueError:
                 continue
+            if isinstance(row, dict):
+                return row.get("host", socket.gethostname())
     return None
 
 
@@ -262,11 +271,20 @@ def read_rows(path):
                 for name in COUNTERS:
                     row.setdefault(name, 0)  # before NFS counters existed
                 rows.append(row)
-            except (ValueError, KeyError, TypeError):
+            except (ValueError, KeyError, TypeError, OverflowError, OSError):
                 bad += 1
     if bad:
         print(f"{path}: skipped {bad} malformed line(s)", file=sys.stderr)
     return rows
+
+
+def raw_files(raw):
+    """RAW's raw files, skipping folders starting with . # or @ (Synology's
+    #recycle and @eaDir)."""
+    raw = Path(raw)
+    for path in sorted(raw.rglob("*.jsonl")):
+        if not any(part[0] in ".#@" for part in path.relative_to(raw).parts[:-1]):
+            yield path
 
 
 def hour_counts(table, oldest):
@@ -300,8 +318,8 @@ def convert(raw, warehouse, now=None, days=7, catalog_uri=None):
     oldest = this_hour - dt.timedelta(days=days)
     table = open_table(warehouse, catalog_uri)
     counts = hour_counts(table, oldest)
-    new_rows, replace, files = [], [], []
-    for path in sorted(Path(raw).rglob("*.jsonl")):
+    hours, files = {}, []  # (host, hour) -> {row's values: row}
+    for path in raw_files(raw):
         start = hour_of(path)
         if start is None or not oldest <= start < this_hour:
             continue  # not a raw file, too old, or still being written
@@ -316,17 +334,23 @@ def convert(raw, warehouse, now=None, days=7, catalog_uri=None):
         keys = {(row["host"], start) for row in rows}
         if len(rows) <= sum(counts.get(key, 0) for key in keys):
             continue  # the extra lines were malformed
-        new_rows.extend(rows)
+        for row in rows:
+            values = tuple(row.get(name) for name in ARROW_SCHEMA.names)
+            hours.setdefault((row["host"], start), {})[values] = row
         files.append(path)
-        replace.extend(key for key in keys if key in counts)
-    if new_rows:
+    # Two copies of an hour (a renamed Pi's old folder, a backup) share their
+    # rows, which count once.
+    new = {key: rows for key, rows in hours.items() if len(rows) > counts.get(key, 0)}
+    replace = [key for key in new if key in counts]
+    if new:
         with table.transaction() as tx:
             for host, start in replace:
                 tx.delete(hour_filter(host, start))
-            tx.append(pa.Table.from_pylist(new_rows, schema=ARROW_SCHEMA))
+            rows = [row for hour in new.values() for row in hour.values()]
+            tx.append(pa.Table.from_pylist(rows, schema=ARROW_SCHEMA))
     for path in files:
         print(f"loaded {path}")
-    return len(new_rows) - sum(counts[key] for key in replace)
+    return sum(len(rows) for rows in new.values()) - sum(counts[k] for k in replace)
 
 
 def day_filter(start):
@@ -382,8 +406,7 @@ def delete_unreferenced(table, before):
     if missing := [path for path in keep if not path.exists()]:
         sys.exit(f"{root}: not deleting, the metadata names missing {missing[0]}")
     # Compare file times with the clock of the machine storing them (a NAS).
-    with tempfile.NamedTemporaryFile(dir=root) as probe:
-        skew = Path(probe.name).stat().st_mtime - time.time()
+    skew = storage_time(root) - time.time()
     deleted = 0
     for path in root.rglob("*"):
         if (
@@ -442,6 +465,11 @@ def main():
         default=LOCK,
         help=f"lock file, so that loads and maintenance take turns (default {LOCK})",
     )
+    parser.add_argument(
+        "--marker",
+        default=MARKER,
+        help=f"where a run notes it is going, on local disk (default {MARKER})",
+    )
     args = parser.parse_args()
     lock = open(args.lock, "w")
     try:
@@ -449,10 +477,10 @@ def main():
     except BlockingIOError:
         print("waiting for another run to finish", file=sys.stderr, flush=True)
         fcntl.flock(lock, fcntl.LOCK_EX)
-    recover(args.warehouse, args.catalog)
+    recover(args.warehouse, args.catalog, args.marker)
     table = open_table(args.warehouse, args.catalog)  # exits if it's stale
-    run = {"host": socket.gethostname(), "start": table.metadata_location}
-    run_marker(args.warehouse).write_text(json.dumps(run))
+    Path(args.marker).parent.mkdir(parents=True, exist_ok=True)
+    mark_run(args.marker, args.warehouse, table)
     if args.maintain:
         done = maintain(
             args.warehouse, keep_days=args.keep_days, catalog_uri=args.catalog
@@ -461,7 +489,7 @@ def main():
     else:
         n = convert(args.raw, args.warehouse, days=args.days, catalog_uri=args.catalog)
         print(f"added {n} rows to {TABLE}")
-    run_marker(args.warehouse).unlink()
+    Path(args.marker).unlink()
 
 
 if __name__ == "__main__":
