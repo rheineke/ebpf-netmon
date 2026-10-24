@@ -35,7 +35,8 @@ fi
 echo "== Installing Python packages from uv.lock in /opt/netmon/venv"
 # The system Python, so apt keeps it patched.
 sudo UV_PROJECT_ENVIRONMENT=/opt/netmon/venv UV_PYTHON_DOWNLOADS=never \
-  /usr/local/bin/uv sync --locked --no-install-project --python /usr/bin/python3
+  /usr/local/bin/uv sync --locked --no-dev --no-install-project \
+  --python /usr/bin/python3
 sudo install -m 644 tools/to_iceberg.py /opt/netmon/to_iceberg.py
 
 echo "== Installing the hourly timer"

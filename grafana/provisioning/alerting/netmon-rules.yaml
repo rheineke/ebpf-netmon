@@ -1,0 +1,108 @@
+# Alert rules over the netmon views, evaluated every minute. Each rule's
+# threshold is in its C step. Installed by scripts/install_grafana.sh; where
+# alerts go is set by scripts/configure_alert_email.sh.
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: netmon
+    folder: netmon
+    interval: 1m
+    rules:
+      # Hosts seen in the last day with no rows for 5 minutes: netmon, the
+      # sync or the NAS has stopped.
+      - uid: netmon-host-silent
+        title: Host stopped reporting
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "{{ $labels.host }} has sent no netmon rows for over 5 minutes"
+        data:
+          - refId: A
+            datasourceUid: netmon-clickhouse
+            relativeTimeRange: {from: 86400, to: 0}
+            model:
+              refId: A
+              editorType: sql
+              format: 1
+              queryType: table
+              rawSql: |-
+                SELECT host, dateDiff('second', max(ts), now()) AS seconds_silent
+                FROM netmon.traffic_live
+                WHERE ts >= now() - INTERVAL 1 DAY
+                GROUP BY host
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [300]}
+
+      # One process sending or receiving over 10 MB/s, averaged over the last
+      # 5 minutes.
+      - uid: netmon-high-traffic
+        title: Process moving over 10 MB/s
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "{{ $labels.comm }} on {{ $labels.host }} averaged over 10 MB/s for 5 minutes"
+        data:
+          - refId: A
+            datasourceUid: netmon-clickhouse
+            relativeTimeRange: {from: 600, to: 0}
+            model:
+              refId: A
+              editorType: sql
+              format: 1
+              queryType: table
+              rawSql: |-
+                SELECT host, comm,
+                  greatest(sum((tcp_tx + udp_tx) * scale),
+                    sum((tcp_rx + udp_rx) * scale)) / 300 AS bytes_per_s
+                FROM netmon.traffic_live
+                WHERE ts >= now() - INTERVAL 5 MINUTE
+                GROUP BY host, comm
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [10000000]}
+
+      # The converter loads each hour at :05, so Iceberg's newest row should
+      # never be much over an hour old.
+      - uid: netmon-converter-behind
+        title: Iceberg converter behind
+        condition: C
+        for: 0s
+        noDataState: Alerting
+        execErrState: Error
+        annotations:
+          summary: The newest row in Iceberg is over 2 hours old; check netmon-iceberg.service
+        data:
+          - refId: A
+            datasourceUid: netmon-clickhouse
+            relativeTimeRange: {from: 604800, to: 0}
+            model:
+              refId: A
+              editorType: sql
+              format: 1
+              queryType: table
+              rawSql: |-
+                SELECT dateDiff('second', max(ts), now()) AS seconds_behind
+                FROM netmon.traffic
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [7200]}

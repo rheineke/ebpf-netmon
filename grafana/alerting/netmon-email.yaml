@@ -1,0 +1,20 @@
+# Sends every alert to NETMON_ALERT_EMAIL, which grafana-server reads from
+# /etc/grafana/netmon-alerts.env. scripts/configure_alert_email.sh writes
+# that file and installs this one; it is not installed without it.
+apiVersion: 1
+contactPoints:
+  - orgId: 1
+    name: netmon email
+    receivers:
+      - uid: netmon-email
+        type: email
+        settings:
+          addresses: $NETMON_ALERT_EMAIL
+          singleEmail: true
+policies:
+  - orgId: 1
+    receiver: netmon email
+    group_by: [grafana_folder, alertname]
+    group_wait: 30s
+    group_interval: 5m
+    repeat_interval: 4h
