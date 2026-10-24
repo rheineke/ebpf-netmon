@@ -1,6 +1,6 @@
 """Append netmon's raw hourly JSON-lines files to an Iceberg table.
 
-  python3 tools/to_iceberg.py --raw DIR --warehouse DIR
+  python3 tools/to_iceberg.py --raw DIR --warehouse DIR [--catalog URI]
 
 Reads each RAW/.../YYYY-MM-DD/HH.jsonl from the last --days days whose UTC
 hour has ended, and loads it into netmon.traffic in WAREHOUSE, as Parquet
@@ -10,8 +10,15 @@ The raw files are left as they are.
 A file is loaded again when it has more rows than the table holds for its
 host and hour, so an hour copied before it was complete (a NAS that was
 down) is replaced once the rest arrives. Each run commits in one
-transaction, so a crash loads all of its hours or none. The catalog is a
-SQLite file in the warehouse; run one converter per warehouse.
+transaction, so a crash loads all of its hours or none. Run one converter
+per warehouse.
+
+The catalog, which points at the table's current metadata, is a SQLite file
+in the warehouse unless --catalog names a SQLAlchemy URI, such as
+postgresql+psycopg2://netmon@/netmon?host=/var/run/postgresql for a local
+PostgreSQL (scripts/install_postgres.sh). A catalog without the table
+adopts the newest metadata in the warehouse, so changing the URI moves the
+table to the new catalog. The old catalog then refuses to run.
 """
 
 import argparse
@@ -70,16 +77,44 @@ ARROW_SCHEMA = pa.schema(
 )
 
 
-def open_table(warehouse):
-    warehouse = Path(warehouse).resolve()
-    warehouse.mkdir(parents=True, exist_ok=True)
+def newest_metadata(warehouse):
+    """The table's newest metadata file in the warehouse, or None."""
+    metadata = Path(warehouse).resolve() / "netmon" / "traffic" / "metadata"
+    files = metadata.glob("*.metadata.json")
+    # NNNNN-UUID.metadata.json, numbered from 00000 by each commit.
+    return max(files, key=lambda p: (int(p.name.split("-")[0]), p.name), default=None)
+
+
+def open_catalog(warehouse, catalog_uri=None):
     catalog = SqlCatalog(
         "netmon",
-        uri=f"sqlite:///{warehouse / 'catalog.db'}",
+        uri=catalog_uri or f"sqlite:///{warehouse / 'catalog.db'}",
         warehouse=warehouse.as_uri(),
     )
     catalog.create_namespace_if_not_exists("netmon")
-    return catalog.create_table_if_not_exists(TABLE, schema=SCHEMA, partition_spec=SPEC)
+    return catalog
+
+
+def open_table(warehouse, catalog_uri=None):
+    warehouse = Path(warehouse).resolve()
+    warehouse.mkdir(parents=True, exist_ok=True)
+    catalog = open_catalog(warehouse, catalog_uri)
+    # Not create_table_if_not_exists: it writes a metadata file even when the
+    # table exists.
+    metadata = newest_metadata(warehouse)
+    if catalog.table_exists(TABLE):
+        table = catalog.load_table(TABLE)
+        if metadata and table.metadata_location != metadata.as_uri():
+            sys.exit(
+                f"{table.metadata_location} is not the newest metadata,"
+                f" {metadata}: another catalog has committed since. Remove"
+                f" {TABLE} from this catalog to adopt it."
+            )
+        return table
+    if metadata:
+        print(f"adopting {metadata}")
+        return catalog.register_table(TABLE, metadata.as_uri())
+    return catalog.create_table(TABLE, schema=SCHEMA, partition_spec=SPEC)
 
 
 def hour_of(path):
@@ -146,12 +181,12 @@ def hour_filter(host, start):
     )
 
 
-def convert(raw, warehouse, now=None, days=7):
+def convert(raw, warehouse, now=None, days=7, catalog_uri=None):
     """Loads every finished hour the table lacks rows of. Returns rows added."""
     now = now or dt.datetime.now(dt.UTC)
     this_hour = now.replace(minute=0, second=0, microsecond=0)
     oldest = this_hour - dt.timedelta(days=days)
-    table = open_table(warehouse)
+    table = open_table(warehouse, catalog_uri)
     counts = hour_counts(table, oldest)
     new_rows, replace, files = [], [], []
     for path in sorted(Path(raw).rglob("*.jsonl")):
@@ -187,10 +222,13 @@ def main():
     parser.add_argument("--raw", default="/var/lib/netmon/raw")
     parser.add_argument("--warehouse", required=True)
     parser.add_argument(
+        "--catalog", help="SQLAlchemy URI of the catalog (default: SQLite in WAREHOUSE)"
+    )
+    parser.add_argument(
         "--days", type=int, default=7, help="look back this many days (default 7)"
     )
     args = parser.parse_args()
-    n = convert(args.raw, args.warehouse, days=args.days)
+    n = convert(args.raw, args.warehouse, days=args.days, catalog_uri=args.catalog)
     print(f"added {n} rows to {TABLE}")
 
 
