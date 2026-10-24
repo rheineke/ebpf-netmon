@@ -227,9 +227,10 @@ ClickHouse listens on 127.0.0.1 only. It has two views:
   last hour the converter loaded.
 - `netmon.traffic_live` adds rows from the last two days of raw files in
   RAW for hours not yet in Iceberg, so it is as recent as the raw files:
-  about a minute behind with the per-minute sync. Queries take about half
-  a second longer on a Pi 4. An hour the converter loaded before all of
-  it arrived shows its late rows after the next run, at five past.
+  about a minute behind with the per-minute sync. It opens only the raw
+  files of hours not in Iceberg yet, found by path, so queries take about
+  0.4 s longer on a Pi 4. An hour the converter loaded before all of it
+  arrived shows its late rows after the next run, at five past.
 
 Grafana's ClickHouse user, `grafana`, may only read these views; they read
 the files as `netmon_views`, which can't log in.
