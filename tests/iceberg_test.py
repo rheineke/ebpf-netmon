@@ -7,17 +7,22 @@ $NETMON_TEST_CATALOG (a SQLAlchemy URI), or to a second SQLite file.
 """
 
 import datetime as dt
+import fcntl
 import json
 import os
+import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from pyiceberg.exceptions import NoSuchTableError
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+TOOLS = Path(__file__).resolve().parent.parent / "tools"
+sys.path.insert(0, str(TOOLS))
 import to_iceberg  # noqa: E402
 
+DAY = 86400
 NOW = dt.datetime(2026, 10, 22, 12, 30, tzinfo=dt.UTC)
 
 
@@ -44,6 +49,16 @@ def write_hour(raw, host, start, rows, extra=""):
             }
             f.write(json.dumps(row) + "\n")
         f.write(extra)
+
+
+def readable(table):
+    """Whether every snapshot's files are all there."""
+    try:
+        for snapshot in table.snapshots():
+            table.scan(snapshot_id=snapshot.snapshot_id).to_arrow()
+    except FileNotFoundError:
+        return False
+    return True
 
 
 def refuses(f, *args):
@@ -119,27 +134,45 @@ def main():
             True,
         )
 
-        # A lost commit leaves a second file of the current version, and a
-        # run that stops partway, a newer cut-off one.
+        # A run that stops partway can leave newer metadata files the
+        # catalog never took: cut off, or complete (its commit failed).
         current = to_iceberg.newest_metadata(warehouse)
         version = int(current.name.split("-")[0])
-        lost = current.with_name(f"{version:05d}-lost.metadata.json")
-        lost.write_text(current.read_text())
+        tie = current.with_name(f"{version:05d}-tie.metadata.json")
+        tie.write_text(current.read_text())
         cut = current.with_name(f"{version + 1:05d}-cut.metadata.json")
         cut.write_text(current.read_text()[:100])
         odd = current.with_name("odd.metadata.json")
         odd.write_text("{}")
         check(
-            "newest skips cut-off metadata",
-            to_iceberg.newest_metadata(warehouse) != cut,
+            "same-version, cut-off or oddly named files don't stop runs",
+            refuses(to_iceberg.open_table, warehouse, uri),
+            False,
+        )
+        failed = current.with_name(f"{version + 2:05d}-failed.metadata.json")
+        failed.write_text(current.read_text())
+        check(
+            "a complete newer file does",
+            refuses(to_iceberg.open_table, warehouse, uri),
             True,
         )
-        to_iceberg.open_table(warehouse, uri)
+        marker = to_iceberg.run_marker(warehouse)
+        marker.write_text("another catalog")
+        to_iceberg.recover(warehouse, uri)
         check(
-            "uncommitted metadata deleted, odd names left",
-            (lost.exists(), cut.exists(), odd.exists()),
-            (False, False, True),
+            "another catalog's run marker is left alone",
+            (failed.exists(), marker.exists()),
+            (True, True),
         )
+        marker.write_text(uri)
+        to_iceberg.recover(warehouse, uri)
+        check(
+            "after this catalog's run stopped, its newer files are deleted",
+            (tie.exists(), cut.exists(), failed.exists(), odd.exists()),
+            (True, False, False, True),
+        )
+        check("and the marker", marker.exists(), False)
+        tie.unlink()
         odd.unlink()
         check(
             "a warehouse path with a space is refused",
@@ -206,6 +239,40 @@ def main():
             to_iceberg.maintain(warehouse, catalog_uri=uri),
             {"days compacted": 1, "snapshots expired": 0, "files deleted": 0},
         )
+        table = to_iceberg.open_table(warehouse, uri)
+        check("snapshots kept", len(table.snapshots()) > 1, True)
+        metadata = warehouse / "netmon" / "traffic" / "metadata"
+        check(
+            "fresh unused files are kept",
+            to_iceberg.delete_unreferenced(
+                table, dt.datetime.now(dt.UTC) - dt.timedelta(days=1)
+            ),
+            0,
+        )
+        # Our clock 2 days behind the storage's: its file from 1.5 days ago
+        # is past the 1-day grace, and its new one isn't.
+        stamp = time.time()
+        old = metadata / "old.avro"
+        old.touch()
+        os.utime(old, (stamp - 1.5 * DAY, stamp - 1.5 * DAY))
+        clock = time.time
+        time.time = lambda: clock() - 2 * DAY
+        try:
+            local_now = dt.datetime.fromtimestamp(stamp - 2 * DAY, dt.UTC)
+            deleted = to_iceberg.delete_unreferenced(
+                table, local_now - dt.timedelta(days=1)
+            )
+        finally:
+            time.time = clock
+        check(
+            "the grace period follows the storage's clock",
+            (deleted, old.exists(), (metadata / "stray.avro").exists()),
+            (1, False, True),
+        )
+        far = dt.datetime.now(dt.UTC) + dt.timedelta(days=30)
+        to_iceberg.delete_unreferenced(table, far)
+        check("kept snapshots still read whole", readable(table), True)
+
         # A month on, everything is past --keep-days and the grace period.
         month = dt.datetime.now(dt.UTC) + dt.timedelta(days=30)
         done = to_iceberg.maintain(warehouse, month, catalog_uri=uri)
@@ -232,6 +299,38 @@ def main():
             {"days compacted": 0, "snapshots expired": 0, "files deleted": 0},
         )
         check("still loads", load(later + dt.timedelta(hours=1)), 0)
+
+        # main() waits for a run holding the lock, then recovers from the
+        # last run, which stopped partway, and loads.
+        current = to_iceberg.newest_metadata(warehouse)
+        version = int(current.name.split("-")[0])
+        failed = current.with_name(f"{version + 1:05d}-failed.metadata.json")
+        failed.write_text(current.read_text())
+        marker.write_text(uri)
+        lock = Path(tmp) / "lock"
+        run = [sys.executable, str(TOOLS / "to_iceberg.py"), "--raw", str(raw)]
+        run += ["--warehouse", str(warehouse), "--catalog", uri, "--lock", str(lock)]
+        with open(lock, "w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            proc = subprocess.Popen(run, stdout=subprocess.DEVNULL)
+            time.sleep(3)
+            check("a run waits for the lock", proc.poll(), None)
+        check("then runs", proc.wait(timeout=120), 0)
+        check("having deleted the uncommitted file", failed.exists(), False)
+        check("and leaves no run marker", marker.exists(), False)
+
+        table = to_iceberg.open_table(warehouse, uri)
+        data = next(iter(table.scan().plan_files())).file.file_path
+        to_iceberg.local_path(data).unlink()
+        (metadata / "stray.avro").touch()
+        check(
+            "cleanup deletes nothing when a referenced file is missing",
+            (
+                refuses(to_iceberg.delete_unreferenced, table, far),
+                any(metadata.glob("stray.avro")),
+            ),
+            (True, True),
+        )
     print("PASS")
 
 

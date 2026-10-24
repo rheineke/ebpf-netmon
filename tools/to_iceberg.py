@@ -23,9 +23,12 @@ table to the new catalog. The old catalog then refuses to run.
 
 --maintain, run weekly, compacts each finished day into one Parquet file,
 expires snapshots older than --keep-days (28), and deletes files no
-remaining snapshot uses. Time travel works back --keep-days. Runs take
-turns through a lock file (--lock), and each deletes metadata files that a
-stopped or failed run left uncommitted.
+remaining snapshot uses. Time travel works back --keep-days.
+
+Runs take turns through a lock file (--lock), and a run that stops partway
+leaves a marker in the warehouse so the next one deletes the metadata it
+wrote but never committed. Only main() does these; call convert() and
+maintain() only while no other run can.
 """
 
 import argparse
@@ -43,6 +46,7 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.compute as pc
 from pyiceberg.catalog.sql import SqlCatalog
+from pyiceberg.exceptions import NoSuchTableError
 from pyiceberg.expressions import And, EqualTo, GreaterThanOrEqual, LessThan
 from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
@@ -89,7 +93,7 @@ ARROW_SCHEMA = pa.schema(
 )
 
 
-LOCK = "/run/lock/netmon-iceberg.lock"
+LOCK = "/run/netmon-iceberg.lock"  # in /run, which only root can write
 COMPACT_MAX_ROWS = 1_000_000  # bigger days stay as they are, to bound memory
 # NNNNN-UUID.metadata.json, numbered from 00000 by each commit.
 METADATA_NAME = re.compile(r"(\d+)-.+\.metadata\.json")
@@ -112,11 +116,11 @@ def metadata_files(warehouse):
 
 def complete(path):
     """Whether a metadata file parses and its current snapshot's manifest
-    list exists. A run that stops partway through a commit, or loses a
-    commit, can leave one that doesn't."""
+    list exists. A run that stops partway through a commit can leave one
+    that doesn't. Read errors are raised, not taken as incomplete."""
     try:
         metadata = json.loads(path.read_text())
-    except (OSError, ValueError):
+    except ValueError:
         return False
     current = metadata.get("current-snapshot-id")
     if current in (None, -1):
@@ -133,21 +137,44 @@ def newest_metadata(warehouse):
     return next((path for path, _ in reversed(files) if complete(path)), None)
 
 
-def drop_uncommitted_metadata(table, warehouse):
-    """Deletes metadata files the catalog never committed: those not in the
-    table's history up to its current version, and incomplete ones. Runs
-    hold LOCK, so none is still being written."""
-    current = local_path(table.metadata_location)
-    history = {current} | {
-        local_path(entry.metadata_file) for entry in table.metadata.metadata_log
-    }
-    files = metadata_files(warehouse)
-    if current not in files:
-        return  # the catalog names a file elsewhere: leave it all alone
-    for path, version in files.items():
-        if path not in history and (version <= files[current] or not complete(path)):
-            print(f"deleting uncommitted {path}")
-            path.unlink()
+def run_marker(warehouse):
+    """Present while a run of main() is loading or maintaining, so the next
+    run knows when one stopped partway, even across a reboot."""
+    return Path(warehouse).resolve() / ".netmon-iceberg-run"
+
+
+def recover(warehouse, catalog_uri=None):
+    """If the last run with this catalog stopped partway, deletes the
+    metadata files it wrote after its last commit: the catalog never took
+    them. Their rows load again from the raw files."""
+    marker = run_marker(warehouse)
+    if not marker.exists() or marker.read_text() != (catalog_uri or ""):
+        return  # none stopped, or another catalog's run did
+    table = load_table(open_catalog(Path(warehouse).resolve(), catalog_uri))
+    if table:
+        files = metadata_files(warehouse)
+        current = files.get(local_path(table.metadata_location))
+        if current is None:
+            return  # its metadata is elsewhere; open_table() will say so
+        for path, version in files.items():
+            if version > current:
+                print(f"deleting uncommitted {path}")
+                path.unlink()
+    marker.unlink()
+
+
+def load_table(catalog):
+    """The catalog's table, or None if it has none. Exits if its metadata
+    file is gone, as when another catalog took the table over long ago."""
+    try:
+        return catalog.load_table(TABLE)
+    except NoSuchTableError:
+        return None
+    except FileNotFoundError as e:
+        sys.exit(
+            f"{e.filename or e}: this catalog's metadata is gone; another catalog"
+            f" has the table. Remove {TABLE} from this catalog to adopt it."
+        )
 
 
 def open_catalog(warehouse, catalog_uri=None):
@@ -169,16 +196,15 @@ def open_table(warehouse, catalog_uri=None):
     catalog = open_catalog(warehouse, catalog_uri)
     # Not create_table_if_not_exists: it writes a metadata file even when the
     # table exists.
-    if catalog.table_exists(TABLE):
-        table = catalog.load_table(TABLE)
-        drop_uncommitted_metadata(table, warehouse)
+    if table := load_table(catalog):
+        files = metadata_files(warehouse)
         metadata = newest_metadata(warehouse)
-        if metadata and metadata != local_path(table.metadata_location):
+        current = files.get(local_path(table.metadata_location), -1)
+        if metadata and files[metadata] > current:
             sys.exit(
                 f"{metadata} is newer than {table.metadata_location}, which"
-                f" this catalog has: another catalog has committed since, or a"
-                f" run stopped before committing it. Remove {TABLE} from this"
-                f" catalog to adopt it."
+                f" this catalog has: another catalog has committed since."
+                f" Remove {TABLE} from this catalog to adopt it."
             )
         return table
     metadata = newest_metadata(warehouse)
@@ -334,7 +360,10 @@ def delete_unreferenced(table, before):
     """Deletes files in the table's folder that nothing uses, if older than
     `before`, so a converter run in progress keeps its new files."""
     root = local_path(table.location())
-    keep = referenced_files(table)
+    try:
+        keep = referenced_files(table)
+    except FileNotFoundError as e:
+        sys.exit(f"{root}: not deleting, the metadata names missing {e.filename or e}")
     if missing := [path for path in keep if not path.exists()]:
         sys.exit(f"{root}: not deleting, the metadata names missing {missing[0]}")
     # Compare file times with the clock of the machine storing them (a NAS).
@@ -401,14 +430,18 @@ def main():
     args = parser.parse_args()
     lock = open(args.lock, "w")
     fcntl.flock(lock, fcntl.LOCK_EX)  # waits for a run already going
+    recover(args.warehouse, args.catalog)
+    open_table(args.warehouse, args.catalog)  # exits if the catalog is stale
+    run_marker(args.warehouse).write_text(args.catalog or "")
     if args.maintain:
         done = maintain(
             args.warehouse, keep_days=args.keep_days, catalog_uri=args.catalog
         )
         print(", ".join(f"{n} {what}" for what, n in done.items()))
-        return
-    n = convert(args.raw, args.warehouse, days=args.days, catalog_uri=args.catalog)
-    print(f"added {n} rows to {TABLE}")
+    else:
+        n = convert(args.raw, args.warehouse, days=args.days, catalog_uri=args.catalog)
+        print(f"added {n} rows to {TABLE}")
+    run_marker(args.warehouse).unlink()
 
 
 if __name__ == "__main__":

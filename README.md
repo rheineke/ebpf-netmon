@@ -177,12 +177,15 @@ Each load commits a snapshot, which keeps the table's past versions for
 time travel and rollback. Weekly, on Sunday at 03:30 UTC, the converter's
 installer also runs `to_iceberg.py --maintain`, which:
 
-- compacts each finished day into one Parquet file,
+- compacts each finished day of up to a million rows into one Parquet
+  file,
 - expires snapshots older than 28 days (`--keep-days`), so the metadata
   that every query reads stays small, and
 - deletes files that no remaining snapshot uses and are over a day old.
 
 The raw files are kept, so the table can always be rebuilt from them.
+Loads and maintenance take turns through a lock file, and a run that stops
+partway (a crash, a power cut) is cleaned up by the next one.
 
 ### PostgreSQL catalog
 
@@ -201,7 +204,8 @@ first run the converter adopts the table already in the warehouse, so
 nothing is copied; ClickHouse reads the warehouse directly and doesn't
 change. The old catalog then refuses to run, since its metadata is out of
 date; to move back, remove `netmon.traffic` from it (for SQLite, move
-`catalog.db` away) and switch the URI back.
+`catalog.db` away) and re-run `install_converter.sh` with that URI, or
+`''` for SQLite. Leaving the URI out keeps the installed one.
 
 `uv run tests/iceberg_test.py` tests it. The Python dependencies are in
 `pyproject.toml`, pinned in `uv.lock`.
