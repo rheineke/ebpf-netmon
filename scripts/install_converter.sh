@@ -19,7 +19,7 @@ if [ $# -lt 1 ] || [ $# -gt 3 ]; then
 fi
 installed() { sed -n "s/^$1=//p" /etc/default/netmon-iceberg 2>/dev/null || true; }
 warehouse=$1
-if [ $# -ge 2 ]; then
+if [ $# -ge 2 ] && [ -n "$2" ]; then
   raw=$2
 else
   raw=$(installed RAW)

@@ -280,7 +280,7 @@ def check_types(row):
             bits = 32 if field.type == pa.int32() else 64
             ok = type(value) is int and -(2 ** (bits - 1)) <= value < 2 ** (bits - 1)
         elif pa.types.is_floating(field.type):
-            ok = type(value) in (int, float)
+            ok = type(value) is float or (type(value) is int and abs(value) < 2**63)
         else:
             ok = isinstance(value, str)
         if not ok:
@@ -362,6 +362,10 @@ def convert(raw, warehouse, now=None, days=7, catalog_uri=None):
             continue
         # A file has one host unless the machine was renamed mid-hour.
         rows = read_rows(path)
+        end = start + dt.timedelta(hours=1)
+        if outside := sum(not start <= row["ts"] < end for row in rows):
+            print(f"{path}: skipped {outside} row(s) outside its hour", file=sys.stderr)
+            rows = [row for row in rows if start <= row["ts"] < end]
         keys = {(row["host"], start) for row in rows}
         if len(rows) <= sum(counts.get(key, 0) for key in keys):
             continue  # the extra lines were malformed

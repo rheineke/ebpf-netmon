@@ -20,7 +20,9 @@ SELECT ts, host, interval_s, pid, uid, comm, tcp_tx, tcp_rx, udp_tx, udp_rx,
     nfs_read, nfs_write, scale
 FROM netmon.traffic
 UNION ALL
-SELECT DISTINCT toDateTime64(ts, 6, 'UTC') AS ts, host, interval_s, pid, uid, comm,
+SELECT DISTINCT toDateTime64(ts, 6, 'UTC') AS ts, host, interval_s, pid, uid,
+    -- As the converter does: the kernel cuts names mid-character.
+    toValidUTF8(comm) AS comm,
     tcp_tx, tcp_rx, udp_tx, udp_rx, nfs_read, nfs_write, scale
 FROM file(
     '@RAW@/**/*.jsonl', JSONEachRow,

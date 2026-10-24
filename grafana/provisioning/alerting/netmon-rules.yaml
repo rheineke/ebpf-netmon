@@ -41,8 +41,8 @@ groups:
               conditions:
                 - evaluator: {type: gt, params: [300]}
 
-      # One process sending or receiving over 10 MB/s, averaged over the last
-      # 5 minutes.
+      # One process sending or receiving over 10 MB/s, averaged over 5
+      # minutes ending a minute ago, as the last minute may not be synced yet.
       - uid: netmon-high-traffic
         title: Process moving over 10 MB/s
         condition: C
@@ -65,7 +65,7 @@ groups:
                   greatest(sum((tcp_tx + udp_tx) * scale),
                     sum((tcp_rx + udp_rx) * scale)) / 300 AS bytes_per_s
                 FROM netmon.traffic_live
-                WHERE ts >= now() - INTERVAL 5 MINUTE
+                WHERE ts >= now() - INTERVAL 6 MINUTE AND ts < now() - INTERVAL 1 MINUTE
                 GROUP BY host, comm
           - refId: C
             datasourceUid: __expr__
@@ -98,6 +98,7 @@ groups:
               rawSql: |-
                 SELECT dateDiff('second', max(ts), now()) AS seconds_behind
                 FROM netmon.traffic
+                WHERE ts >= now() - INTERVAL 7 DAY  -- none: 1970, so it fires
           - refId: C
             datasourceUid: __expr__
             model:

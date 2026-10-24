@@ -246,7 +246,13 @@ def main():
         (path.parent / "-1.jsonl").write_text("x\n")
         good = json.loads(path.read_text().splitlines()[1])
         with open(path, "ab") as f:
-            for bad in ({"pid": "x"}, {"comm": None}, {"interval_s": 2**40}):
+            for bad in (
+                {"pid": "x"},
+                {"comm": None},
+                {"interval_s": 2**40},
+                {"scale": 2**63},
+                {"ts": good["ts"] + 7200},  # outside the file's hour
+            ):
                 f.write(json.dumps(good | bad).encode() + b"\n")
             del good["scale"]
             f.write(json.dumps(good).encode() + b"\n")
@@ -254,6 +260,7 @@ def main():
             cut = json.dumps(good | {"pid": 7, "comm": "calfX", "scale": 1})
             f.write(cut.encode().replace(b"calfX", b"calf\xc3") + b"\n")
         check("odd files and lines are skipped", load(later), 3)
+        check("and stay skipped", load(later), 0)
 
         table = to_iceberg.open_table(warehouse, uri).scan().to_arrow()
         hosts = table["host"].to_pylist()

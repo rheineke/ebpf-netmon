@@ -133,6 +133,8 @@ def check():
         rows = query(panel["targets"][0]["rawSql"])
         title = panel["title"]
         if panel["type"] == "timeseries":
+            # 0 is a time series, one line per series; 1, a table, is one line.
+            check_eq(f"{title}: format", panel["targets"][0]["format"], 0)
             # bytes_per_s over hour buckets, times 3600, is the bytes in range.
             total = sum(r["bytes_per_s"] for r in rows) * 3600
             want = (
