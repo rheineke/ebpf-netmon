@@ -171,6 +171,19 @@ is unmounted the sync and the converter skip their runs, and the next sync
 catches up. Each row carries the host name it was captured under, so
 renaming a Pi starts a new host in the table.
 
+### Maintenance
+
+Each load commits a snapshot, which keeps the table's past versions for
+time travel and rollback. Weekly, on Sunday at 03:30 UTC, the converter's
+installer also runs `to_iceberg.py --maintain`, which:
+
+- compacts each finished day into one Parquet file,
+- expires snapshots older than 28 days (`--keep-days`), so the metadata
+  that every query reads stays small, and
+- deletes files that no remaining snapshot uses and are over a day old.
+
+The raw files are kept, so the table can always be rebuilt from them.
+
 ### PostgreSQL catalog
 
 The catalog only records where the table's current metadata file is; the

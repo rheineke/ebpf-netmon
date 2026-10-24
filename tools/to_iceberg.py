@@ -1,6 +1,7 @@
 """Append netmon's raw hourly JSON-lines files to an Iceberg table.
 
   python3 tools/to_iceberg.py --raw DIR --warehouse DIR [--catalog URI]
+  python3 tools/to_iceberg.py --maintain --warehouse DIR [--catalog URI]
 
 Reads each RAW/.../YYYY-MM-DD/HH.jsonl from the last --days days whose UTC
 hour has ended, and loads it into netmon.traffic in WAREHOUSE, as Parquet
@@ -19,6 +20,10 @@ postgresql+psycopg2://netmon@/netmon?host=/var/run/postgresql for a local
 PostgreSQL (scripts/install_postgres.sh). A catalog without the table
 adopts the newest metadata in the warehouse, so changing the URI moves the
 table to the new catalog. The old catalog then refuses to run.
+
+--maintain, run weekly, compacts each finished day into one Parquet file,
+expires snapshots older than --keep-days (28), and deletes files no
+remaining snapshot uses. Time travel works back --keep-days.
 """
 
 import argparse
@@ -26,6 +31,7 @@ import datetime as dt
 import json
 import socket
 import sys
+import urllib.parse
 from pathlib import Path
 
 import pyarrow as pa
@@ -217,6 +223,81 @@ def convert(raw, warehouse, now=None, days=7, catalog_uri=None):
     return len(new_rows) - sum(counts[key] for key in replace)
 
 
+def day_filter(start):
+    return And(
+        GreaterThanOrEqual("ts", start.isoformat()),
+        LessThan("ts", (start + dt.timedelta(days=1)).isoformat()),
+    )
+
+
+def compact(table, before):
+    """Rewrites each day before `before` held in several files as one file."""
+    files = {}
+    for task in table.scan(row_filter=LessThan("ts", before.isoformat())).plan_files():
+        day = task.file.partition[0]  # days since 1970-01-01
+        files[day] = files.get(day, 0) + 1
+    days = sorted(day for day, n in files.items() if n > 1)
+    for day in days:  # one day at a time, to bound memory
+        start = dt.datetime(1970, 1, 1, tzinfo=dt.UTC) + dt.timedelta(days=day)
+        rows = table.scan(row_filter=day_filter(start)).to_arrow()
+        with table.transaction() as tx:
+            tx.delete(day_filter(start))
+            tx.append(rows.cast(ARROW_SCHEMA))
+    return len(days)
+
+
+def referenced_files(table):
+    """Every file the table's metadata and remaining snapshots use."""
+    uris = {table.metadata_location}
+    uris |= {entry.metadata_file for entry in table.metadata.metadata_log}
+    for snapshot in table.snapshots():
+        uris.add(snapshot.manifest_list)
+        for manifest in snapshot.manifests(table.io):
+            uris.add(manifest.manifest_path)
+            entries = manifest.fetch_manifest_entry(table.io, discard_deleted=False)
+            uris |= {entry.data_file.file_path for entry in entries}
+    return {Path(urllib.parse.urlparse(uri).path) for uri in uris}
+
+
+def delete_unreferenced(table, before):
+    """Deletes files in the table's folder that nothing uses, if older than
+    `before`, so a converter run in progress keeps its new files."""
+    root = Path(urllib.parse.urlparse(table.location()).path)
+    keep = referenced_files(table)
+    if not all(path.exists() for path in keep if path.suffix == ".parquet"):
+        sys.exit(f"{root}: the metadata names files that aren't there; not deleting")
+    deleted = 0
+    for path in root.rglob("*"):
+        if (
+            path.is_file()
+            and path not in keep
+            and path.stat().st_mtime < before.timestamp()
+        ):
+            path.unlink()
+            deleted += 1
+    return deleted
+
+
+def maintain(warehouse, now=None, keep_days=28, catalog_uri=None):
+    """Compacts, expires and cleans the table; returns what it did."""
+    now = now or dt.datetime.now(dt.UTC)
+    table = open_table(warehouse, catalog_uri)
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    days = compact(table, today)
+    snapshots = len(table.snapshots())
+    table.maintenance.expire_snapshots().older_than(
+        now - dt.timedelta(days=keep_days)
+    ).commit()
+    table = open_table(warehouse, catalog_uri)
+    expired = snapshots - len(table.snapshots())
+    deleted = delete_unreferenced(table, now - dt.timedelta(days=1))
+    return {
+        "days compacted": days,
+        "snapshots expired": expired,
+        "files deleted": deleted,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--raw", default="/var/lib/netmon/raw")
@@ -227,7 +308,24 @@ def main():
     parser.add_argument(
         "--days", type=int, default=7, help="look back this many days (default 7)"
     )
+    parser.add_argument(
+        "--maintain",
+        action="store_true",
+        help="compact, expire old snapshots and delete unused files; load nothing",
+    )
+    parser.add_argument(
+        "--keep-days",
+        type=int,
+        default=28,
+        help="with --maintain, keep snapshots this many days (default 28)",
+    )
     args = parser.parse_args()
+    if args.maintain:
+        done = maintain(
+            args.warehouse, keep_days=args.keep_days, catalog_uri=args.catalog
+        )
+        print(", ".join(f"{n} {what}" for what, n in done.items()))
+        return
     n = convert(args.raw, args.warehouse, days=args.days, catalog_uri=args.catalog)
     print(f"added {n} rows to {TABLE}")
 

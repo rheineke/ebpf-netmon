@@ -42,18 +42,20 @@ sudo UV_PROJECT_ENVIRONMENT=/opt/netmon/venv UV_PYTHON_DOWNLOADS=never \
   --python /usr/bin/python3
 sudo install -m 644 tools/to_iceberg.py /opt/netmon/to_iceberg.py
 
-echo "== Installing the hourly timer"
+echo "== Installing the hourly and weekly (maintenance) timers"
 printf 'WAREHOUSE=%s\nRAW=%s\nCATALOG=%s\n' "$warehouse" "$raw" "$catalog" \
   | sudo tee /etc/default/netmon-iceberg >/dev/null
-sudo install -m 644 systemd/netmon-iceberg.service systemd/netmon-iceberg.timer \
-  /etc/systemd/system/
-# If WAREHOUSE or RAW is on a mount (a NAS), skip runs while it is unmounted
-# rather than write a second warehouse under the empty mount point.
-sudo mkdir -p /etc/systemd/system/netmon-iceberg.service.d
-printf '[Unit]\nRequiresMountsFor=%s %s\n' "$warehouse" "$raw" \
-  | sudo tee /etc/systemd/system/netmon-iceberg.service.d/warehouse.conf >/dev/null
+for unit in netmon-iceberg netmon-iceberg-maintain; do
+  sudo install -m 644 "systemd/$unit.service" "systemd/$unit.timer" \
+    /etc/systemd/system/
+  # If WAREHOUSE or RAW is on a mount (a NAS), skip runs while it is
+  # unmounted rather than write a second warehouse under the mount point.
+  sudo mkdir -p "/etc/systemd/system/$unit.service.d"
+  printf '[Unit]\nRequiresMountsFor=%s %s\n' "$warehouse" "$raw" \
+    | sudo tee "/etc/systemd/system/$unit.service.d/warehouse.conf" >/dev/null
+done
 sudo systemctl daemon-reload
-sudo systemctl enable --now netmon-iceberg.timer
+sudo systemctl enable --now netmon-iceberg.timer netmon-iceberg-maintain.timer
 
 echo "== First run"
 sudo systemctl start netmon-iceberg.service

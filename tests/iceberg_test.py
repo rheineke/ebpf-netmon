@@ -152,6 +152,43 @@ def main():
             all("day=2026-10-22" in str(p) for p in files),
             True,
         )
+
+        # A day in another file, a stray file and a snapshot per load so far.
+        write_hour(raw, "pi-a", h10 - dt.timedelta(days=1), 2)
+        check("previous day loads", load(later), 2)
+        (warehouse / "netmon" / "traffic" / "metadata" / "stray.avro").touch()
+        before = to_iceberg.open_table(warehouse, uri).scan().to_arrow()
+        check(
+            "maintain now compacts 2026-10-22 only and keeps recent snapshots",
+            to_iceberg.maintain(warehouse, catalog_uri=uri),
+            {"days compacted": 1, "snapshots expired": 0, "files deleted": 0},
+        )
+        # A month on, everything is past --keep-days and the grace period.
+        month = dt.datetime.now(dt.UTC) + dt.timedelta(days=30)
+        done = to_iceberg.maintain(warehouse, month, catalog_uri=uri)
+        check("a month on, nothing to compact", done["days compacted"], 0)
+        table = to_iceberg.open_table(warehouse, uri)
+        after = table.scan().to_arrow()
+        check("same rows after compacting", after.num_rows, before.num_rows)
+        check(
+            "same totals after compacting",
+            [sum(after[c].to_pylist()) for c in to_iceberg.COUNTERS],
+            [sum(before[c].to_pylist()) for c in to_iceberg.COUNTERS],
+        )
+        check("one data file per day", len(list(table.scan().plan_files())), 2)
+        check("only the current snapshot is left", len(table.snapshots()), 1)
+        check("stray file deleted", any(warehouse.rglob("stray.avro")), False)
+        check(
+            "only the current files are left",
+            sorted(p.name for p in warehouse.rglob("*.parquet")),
+            sorted(Path(t.file.file_path).name for t in table.scan().plan_files()),
+        )
+        check(
+            "and nothing more next time",
+            to_iceberg.maintain(warehouse, month, catalog_uri=uri),
+            {"days compacted": 0, "snapshots expired": 0, "files deleted": 0},
+        )
+        check("still loads", load(later + dt.timedelta(hours=1)), 0)
     print("PASS")
 
 

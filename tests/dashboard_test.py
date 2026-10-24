@@ -4,6 +4,7 @@
   scripts/install_clickhouse.sh DIR/warehouse DIR/raw
   python3 tests/dashboard_test.py check DIR
   uv run tests/dashboard_test.py convert DIR   # then check again
+  uv run tests/dashboard_test.py maintain DIR  # and again
 
 load writes four hours of known traffic from two hosts, ending in the
 current hour, to DIR/raw, and converts the first three into DIR/warehouse.
@@ -11,7 +12,9 @@ check runs every panel of grafana/dashboards/netmon.json through
 clickhouse-client, as Grafana's user, with Grafana's macros filled in, and
 checks the totals, so the live view must add the last hour from the raw
 files. It also runs every alert rule's query, which needs the dev
-dependencies (uv sync). convert loads that hour too; the totals must not change.
+dependencies (uv sync). convert loads that hour too, and maintain compacts
+the table and expires its old snapshots, as a month later; the totals must
+not change.
 """
 
 import datetime as dt
@@ -36,6 +39,14 @@ def convert(test_dir, hours):
     now = START + dt.timedelta(hours=hours)
     n = to_iceberg.convert(test_dir / "raw", test_dir / "warehouse", now, days=2)
     print(f"loaded {n} rows")
+
+
+def maintain(test_dir):
+    sys.path.insert(0, str(ROOT / "tools"))
+    import to_iceberg
+
+    month = dt.datetime.now(dt.UTC) + dt.timedelta(days=30)
+    print(to_iceberg.maintain(test_dir / "warehouse", month))
 
 
 def load(test_dir):
@@ -164,7 +175,12 @@ def check_alerts():
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3 or sys.argv[1] not in ("load", "check", "convert"):
+    if len(sys.argv) != 3 or sys.argv[1] not in (
+        "load",
+        "check",
+        "convert",
+        "maintain",
+    ):
         sys.exit(__doc__)
     test_dir = Path(sys.argv[2])
     if sys.argv[1] == "load":
@@ -174,5 +190,7 @@ if __name__ == "__main__":
         convert(test_dir, HOURS - 1)  # the last hour stays raw
     elif sys.argv[1] == "convert":
         convert(test_dir, HOURS)
+    elif sys.argv[1] == "maintain":
+        maintain(test_dir)
     else:
         check()

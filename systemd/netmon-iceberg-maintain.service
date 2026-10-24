@@ -1,0 +1,15 @@
+# Compacts the Iceberg table, expires snapshots older than 28 days and
+# deletes files nothing uses. Installed with the converter by
+# scripts/install_converter.sh, and reads the same settings.
+[Unit]
+Description=netmon Iceberg compaction and snapshot expiry
+After=network-online.target remote-fs.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/default/netmon-iceberg
+ExecStart=/opt/netmon/venv/bin/python /opt/netmon/to_iceberg.py --maintain --warehouse ${WAREHOUSE} --catalog ${CATALOG}
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
