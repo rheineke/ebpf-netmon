@@ -10,6 +10,7 @@ import datetime as dt
 import fcntl
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -59,6 +60,12 @@ def readable(table):
     except FileNotFoundError:
         return False
     return True
+
+
+def mark_run(marker, run):
+    """Leaves a run marker as main() does, a minute ago."""
+    marker.write_text(json.dumps(run))
+    os.utime(marker, (time.time() - 60,) * 2)
 
 
 def refuses(f, *args):
@@ -135,17 +142,20 @@ def main():
         )
 
         # A run that stops partway can leave newer metadata files the
-        # catalog never took: cut off, or complete (its commit failed).
+        # catalog never took: cut off, without their manifest list, or
+        # complete (the catalog update failed).
         current = to_iceberg.newest_metadata(warehouse)
         version = int(current.name.split("-")[0])
         tie = current.with_name(f"{version:05d}-tie.metadata.json")
         tie.write_text(current.read_text())
         cut = current.with_name(f"{version + 1:05d}-cut.metadata.json")
         cut.write_text(current.read_text()[:100])
+        unlisted = current.with_name(f"{version + 1:05d}-unlisted.metadata.json")
+        unlisted.write_text(current.read_text().replace("/snap-", "/gone-"))
         odd = current.with_name("odd.metadata.json")
         odd.write_text("{}")
         check(
-            "same-version, cut-off or oddly named files don't stop runs",
+            "same-version, cut-off, unlisted or odd files don't stop runs",
             refuses(to_iceberg.open_table, warehouse, uri),
             False,
         )
@@ -157,23 +167,36 @@ def main():
             True,
         )
         marker = to_iceberg.run_marker(warehouse)
-        marker.write_text("another catalog")
+        here = socket.gethostname()
+        for name, run in (
+            (
+                "another machine's run marker",
+                {"host": "elsewhere", "start": str(current)},
+            ),
+            (
+                "the marker of a run from metadata this catalog lacks",
+                {"host": here, "start": "/x"},
+            ),
+        ):
+            mark_run(marker, run)
+            to_iceberg.recover(warehouse, uri)
+            check(
+                f"{name} is left alone",
+                (failed.exists(), marker.exists()),
+                (True, True),
+            )
+        early = current.with_name(f"{version + 3:05d}-early.metadata.json")
+        early.write_text(current.read_text())
+        mark_run(marker, {"host": here, "start": str(current)})
+        os.utime(early, (time.time() - 120,) * 2)
         to_iceberg.recover(warehouse, uri)
         check(
-            "another catalog's run marker is left alone",
-            (failed.exists(), marker.exists()),
-            (True, True),
+            "after this machine's run stopped, the newer files it wrote go",
+            [f.exists() for f in (tie, cut, unlisted, failed, early, odd, marker)],
+            [True, False, False, False, True, True, False],
         )
-        marker.write_text(uri)
-        to_iceberg.recover(warehouse, uri)
-        check(
-            "after this catalog's run stopped, its newer files are deleted",
-            (tie.exists(), cut.exists(), failed.exists(), odd.exists()),
-            (True, False, False, True),
-        )
-        check("and the marker", marker.exists(), False)
-        tie.unlink()
-        odd.unlink()
+        for path in (tie, early, odd):
+            path.unlink()
         check(
             "a warehouse path with a space is refused",
             refuses(to_iceberg.open_table, Path(tmp) / "a b"),
@@ -227,6 +250,11 @@ def main():
         check("previous day loads", load(later), 2)
         (warehouse / "netmon" / "traffic" / "metadata" / "stray.avro").touch()
         before = to_iceberg.open_table(warehouse, uri).scan().to_arrow()
+        check(
+            "today's day isn't compacted",
+            to_iceberg.maintain(warehouse, NOW, catalog_uri=uri)["days compacted"],
+            0,
+        )
         to_iceberg.COMPACT_MAX_ROWS = 5
         check(
             "days over COMPACT_MAX_ROWS aren't compacted",
@@ -304,20 +332,35 @@ def main():
         # last run, which stopped partway, and loads.
         current = to_iceberg.newest_metadata(warehouse)
         version = int(current.name.split("-")[0])
+        mark_run(marker, {"host": socket.gethostname(), "start": str(current)})
         failed = current.with_name(f"{version + 1:05d}-failed.metadata.json")
         failed.write_text(current.read_text())
-        marker.write_text(uri)
         lock = Path(tmp) / "lock"
         run = [sys.executable, str(TOOLS / "to_iceberg.py"), "--raw", str(raw)]
-        run += ["--warehouse", str(warehouse), "--catalog", uri, "--lock", str(lock)]
+        run += ["--warehouse", str(warehouse), "--lock", str(lock)]
         with open(lock, "w") as held:
             fcntl.flock(held, fcntl.LOCK_EX)
-            proc = subprocess.Popen(run, stdout=subprocess.DEVNULL)
-            time.sleep(3)
-            check("a run waits for the lock", proc.poll(), None)
+            proc = subprocess.Popen(
+                [*run, "--catalog", uri],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            check(
+                "a run waits for the lock",
+                proc.stderr.readline().strip(),
+                "waiting for another run to finish",
+            )
+            check("and does nothing meanwhile", marker.exists(), True)
         check("then runs", proc.wait(timeout=120), 0)
         check("having deleted the uncommitted file", failed.exists(), False)
         check("and leaves no run marker", marker.exists(), False)
+        stale = subprocess.run(run, capture_output=True)  # the SQLite catalog
+        check(
+            "a stale catalog's refused run leaves no marker",
+            (stale.returncode != 0, marker.exists()),
+            (True, False),
+        )
 
         table = to_iceberg.open_table(warehouse, uri)
         data = next(iter(table.scan().plan_files())).file.file_path

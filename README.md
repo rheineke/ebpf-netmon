@@ -185,7 +185,8 @@ installer also runs `to_iceberg.py --maintain`, which:
 
 The raw files are kept, so the table can always be rebuilt from them.
 Loads and maintenance take turns through a lock file, and a run that stops
-partway (a crash, a power cut) is cleaned up by the next one.
+partway (a crash, a power cut) is cleaned up by the next one on the same
+machine.
 
 ### PostgreSQL catalog
 

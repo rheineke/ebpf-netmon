@@ -26,8 +26,8 @@ expires snapshots older than --keep-days (28), and deletes files no
 remaining snapshot uses. Time travel works back --keep-days.
 
 Runs take turns through a lock file (--lock), and a run that stops partway
-leaves a marker in the warehouse so the next one deletes the metadata it
-wrote but never committed. Only main() does these; call convert() and
+leaves a marker in the warehouse so the next one on the same machine
+deletes the metadata it wrote but never committed. Only main() does these; call convert() and
 maintain() only while no other run can.
 """
 
@@ -139,27 +139,42 @@ def newest_metadata(warehouse):
 
 def run_marker(warehouse):
     """Present while a run of main() is loading or maintaining, so the next
-    run knows when one stopped partway, even across a reboot."""
+    run knows when one stopped partway, even across a reboot. It names the
+    machine and the metadata file the run started from."""
     return Path(warehouse).resolve() / ".netmon-iceberg-run"
 
 
 def recover(warehouse, catalog_uri=None):
-    """If the last run with this catalog stopped partway, deletes the
-    metadata files it wrote after its last commit: the catalog never took
-    them. Their rows load again from the raw files."""
+    """If the last run stopped partway, deletes the metadata files it wrote
+    after its last commit: the catalog never took them, and their rows load
+    again from the raw files. Only when that run was on this machine and
+    this catalog has moved on only from where it started, so another
+    machine's catalog or an older copy of this one is left to open_table()
+    to refuse."""
     marker = run_marker(warehouse)
-    if not marker.exists() or marker.read_text() != (catalog_uri or ""):
-        return  # none stopped, or another catalog's run did
+    if not marker.exists():
+        return
+    try:
+        run = json.loads(marker.read_text())
+    except ValueError:
+        run = {}
+    if run.get("host") != socket.gethostname() or "start" not in run:
+        return
     table = load_table(open_catalog(Path(warehouse).resolve(), catalog_uri))
-    if table:
-        files = metadata_files(warehouse)
-        current = files.get(local_path(table.metadata_location))
-        if current is None:
-            return  # its metadata is elsewhere; open_table() will say so
-        for path, version in files.items():
-            if version > current:
-                print(f"deleting uncommitted {path}")
-                path.unlink()
+    if table is None:
+        return
+    current = local_path(table.metadata_location)
+    history = {current} | {
+        local_path(entry.metadata_file) for entry in table.metadata.metadata_log
+    }
+    files = metadata_files(warehouse)
+    if local_path(run["start"]) not in history or current not in files:
+        return
+    started = marker.stat().st_mtime
+    for path, version in files.items():
+        if version > files[current] and path.stat().st_mtime >= started:
+            print(f"deleting uncommitted {path}")
+            path.unlink()
     marker.unlink()
 
 
@@ -429,10 +444,15 @@ def main():
     )
     args = parser.parse_args()
     lock = open(args.lock, "w")
-    fcntl.flock(lock, fcntl.LOCK_EX)  # waits for a run already going
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("waiting for another run to finish", file=sys.stderr, flush=True)
+        fcntl.flock(lock, fcntl.LOCK_EX)
     recover(args.warehouse, args.catalog)
-    open_table(args.warehouse, args.catalog)  # exits if the catalog is stale
-    run_marker(args.warehouse).write_text(args.catalog or "")
+    table = open_table(args.warehouse, args.catalog)  # exits if it's stale
+    run = {"host": socket.gethostname(), "start": table.metadata_location}
+    run_marker(args.warehouse).write_text(json.dumps(run))
     if args.maintain:
         done = maintain(
             args.warehouse, keep_days=args.keep_days, catalog_uri=args.catalog
