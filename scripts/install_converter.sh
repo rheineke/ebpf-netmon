@@ -7,9 +7,10 @@
 # WAREHOUSE is where the Iceberg table goes, e.g. an NFS mount on a NAS.
 # RAW holds the raw files, by default this machine's /var/lib/netmon/raw; to
 # load several hosts, point it at the folder scripts/install_sync.sh copies
-# them to. CATALOG is a SQLAlchemy URI for the catalog, by default a SQLite
-# file in WAREHOUSE (see scripts/install_postgres.sh). Run one converter per
-# warehouse. Re-run to upgrade or move it.
+# them to. CATALOG is a SQLAlchemy URI for the catalog (see
+# scripts/install_postgres.sh); left out, it stays as installed, and '' is a
+# SQLite file in WAREHOUSE. Run one converter per warehouse. Re-run to
+# upgrade or move it.
 set -eu
 
 if [ $# -lt 1 ] || [ $# -gt 3 ]; then
@@ -18,7 +19,11 @@ if [ $# -lt 1 ] || [ $# -gt 3 ]; then
 fi
 warehouse=$1
 raw=${2:-/var/lib/netmon/raw}
-catalog=${3:-}
+if [ $# -eq 3 ]; then
+  catalog=$3
+else
+  catalog=$(sed -n 's/^CATALOG=//p' /etc/default/netmon-iceberg 2>/dev/null || true)
+fi
 cd "$(dirname "$0")/.."
 
 uv_version=0.13.5
@@ -42,18 +47,20 @@ sudo UV_PROJECT_ENVIRONMENT=/opt/netmon/venv UV_PYTHON_DOWNLOADS=never \
   --python /usr/bin/python3
 sudo install -m 644 tools/to_iceberg.py /opt/netmon/to_iceberg.py
 
-echo "== Installing the hourly timer"
+echo "== Installing the hourly and weekly (maintenance) timers"
 printf 'WAREHOUSE=%s\nRAW=%s\nCATALOG=%s\n' "$warehouse" "$raw" "$catalog" \
   | sudo tee /etc/default/netmon-iceberg >/dev/null
-sudo install -m 644 systemd/netmon-iceberg.service systemd/netmon-iceberg.timer \
-  /etc/systemd/system/
-# If WAREHOUSE or RAW is on a mount (a NAS), skip runs while it is unmounted
-# rather than write a second warehouse under the empty mount point.
-sudo mkdir -p /etc/systemd/system/netmon-iceberg.service.d
-printf '[Unit]\nRequiresMountsFor=%s %s\n' "$warehouse" "$raw" \
-  | sudo tee /etc/systemd/system/netmon-iceberg.service.d/warehouse.conf >/dev/null
+for unit in netmon-iceberg netmon-iceberg-maintain; do
+  sudo install -m 644 "systemd/$unit.service" "systemd/$unit.timer" \
+    /etc/systemd/system/
+  # If WAREHOUSE or RAW is on a mount (a NAS), skip runs while it is
+  # unmounted rather than write a second warehouse under the mount point.
+  sudo mkdir -p "/etc/systemd/system/$unit.service.d"
+  printf '[Unit]\nRequiresMountsFor=%s %s\n' "$warehouse" "$raw" \
+    | sudo tee "/etc/systemd/system/$unit.service.d/warehouse.conf" >/dev/null
+done
 sudo systemctl daemon-reload
-sudo systemctl enable --now netmon-iceberg.timer
+sudo systemctl enable --now netmon-iceberg.timer netmon-iceberg-maintain.timer
 
 echo "== First run"
 sudo systemctl start netmon-iceberg.service

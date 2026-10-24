@@ -1,0 +1,10 @@
+# Weekly, well away from the converter's runs at five past each hour.
+[Unit]
+Description=Weekly netmon Iceberg maintenance
+
+[Timer]
+OnCalendar=Sun *-*-* 03:30:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

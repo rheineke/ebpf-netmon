@@ -46,6 +46,8 @@ jobs:
           .venv/bin/python tests/dashboard_test.py check /var/lib/netmon-test
           sudo .venv/bin/python tests/dashboard_test.py convert /var/lib/netmon-test
           .venv/bin/python tests/dashboard_test.py check /var/lib/netmon-test
+          sudo .venv/bin/python tests/dashboard_test.py maintain /var/lib/netmon-test
+          .venv/bin/python tests/dashboard_test.py check /var/lib/netmon-test
       - name: Sync
         run: tests/sync_test.sh
       - name: clang-tidy

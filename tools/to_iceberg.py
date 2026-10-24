@@ -1,6 +1,7 @@
 """Append netmon's raw hourly JSON-lines files to an Iceberg table.
 
   python3 tools/to_iceberg.py --raw DIR --warehouse DIR [--catalog URI]
+  python3 tools/to_iceberg.py --maintain --warehouse DIR [--catalog URI]
 
 Reads each RAW/.../YYYY-MM-DD/HH.jsonl from the last --days days whose UTC
 hour has ended, and loads it into netmon.traffic in WAREHOUSE, as Parquet
@@ -19,18 +20,33 @@ postgresql+psycopg2://netmon@/netmon?host=/var/run/postgresql for a local
 PostgreSQL (scripts/install_postgres.sh). A catalog without the table
 adopts the newest metadata in the warehouse, so changing the URI moves the
 table to the new catalog. The old catalog then refuses to run.
+
+--maintain, run weekly, compacts each finished day into one Parquet file,
+expires snapshots older than --keep-days (28), and deletes files no
+remaining snapshot uses. Time travel works back --keep-days.
+
+Runs take turns through a lock file (--lock), and a run that stops partway
+leaves a marker in the warehouse so the next one on the same machine
+deletes the metadata it wrote but never committed. Only main() does these;
+call convert() and maintain() only while no other run can.
 """
 
 import argparse
 import datetime as dt
+import fcntl
 import json
+import re
 import socket
 import sys
+import tempfile
+import time
+import urllib.parse
 from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.compute as pc
 from pyiceberg.catalog.sql import SqlCatalog
+from pyiceberg.exceptions import NoSuchTableError
 from pyiceberg.expressions import And, EqualTo, GreaterThanOrEqual, LessThan
 from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
@@ -77,12 +93,103 @@ ARROW_SCHEMA = pa.schema(
 )
 
 
-def newest_metadata(warehouse):
-    """The table's newest metadata file in the warehouse, or None."""
+LOCK = "/run/netmon-iceberg.lock"  # in /run, which only root can write
+COMPACT_MAX_ROWS = 1_000_000  # bigger days stay as they are, to bound memory
+# NNNNN-UUID.metadata.json, numbered from 00000 by each commit.
+METADATA_NAME = re.compile(r"(\d+)-.+\.metadata\.json")
+
+
+def local_path(uri):
+    """file:///a%20b/c or /a b/c -> Path('/a b/c'), resolved."""
+    return Path(urllib.parse.unquote(urllib.parse.urlparse(uri).path)).resolve()
+
+
+def metadata_files(warehouse):
+    """{path: version} of the table's metadata files in the warehouse."""
     metadata = Path(warehouse).resolve() / "netmon" / "traffic" / "metadata"
-    files = metadata.glob("*.metadata.json")
-    # NNNNN-UUID.metadata.json, numbered from 00000 by each commit.
-    return max(files, key=lambda p: (int(p.name.split("-")[0]), p.name), default=None)
+    files = {}
+    for path in metadata.glob("*.metadata.json"):
+        if match := METADATA_NAME.fullmatch(path.name):
+            files[path] = int(match[1])
+    return files
+
+
+def complete(path):
+    """Whether a metadata file parses and its current snapshot's manifest
+    list exists. A run that stops partway through a commit can leave one
+    that doesn't. Read errors are raised, not taken as incomplete."""
+    try:
+        metadata = json.loads(path.read_text())
+    except ValueError:
+        return False
+    current = metadata.get("current-snapshot-id")
+    if current in (None, -1):
+        return True  # a new table, without snapshots
+    for snapshot in metadata.get("snapshots", []):
+        if snapshot.get("snapshot-id") == current:
+            return local_path(snapshot["manifest-list"]).exists()
+    return False
+
+
+def newest_metadata(warehouse):
+    """The table's newest complete metadata file in the warehouse, or None."""
+    files = sorted(metadata_files(warehouse).items(), key=lambda f: (f[1], f[0]))
+    return next((path for path, _ in reversed(files) if complete(path)), None)
+
+
+def run_marker(warehouse):
+    """Present while a run of main() is loading or maintaining, so the next
+    run knows when one stopped partway, even across a reboot. It names the
+    machine and the metadata file the run started from."""
+    return Path(warehouse).resolve() / ".netmon-iceberg-run"
+
+
+def recover(warehouse, catalog_uri=None):
+    """If the last run stopped partway, deletes the metadata files it wrote
+    after its last commit: the catalog never took them, and their rows load
+    again from the raw files. Only when that run was on this machine and
+    this catalog has moved on only from where it started, so another
+    machine's catalog or an older copy of this one is left to open_table()
+    to refuse."""
+    marker = run_marker(warehouse)
+    if not marker.exists():
+        return
+    try:
+        run = json.loads(marker.read_text())
+    except ValueError:
+        run = {}
+    if run.get("host") != socket.gethostname() or "start" not in run:
+        return
+    table = load_table(open_catalog(Path(warehouse).resolve(), catalog_uri))
+    if table is None:
+        return
+    current = local_path(table.metadata_location)
+    history = {current} | {
+        local_path(entry.metadata_file) for entry in table.metadata.metadata_log
+    }
+    files = metadata_files(warehouse)
+    if local_path(run["start"]) not in history or current not in files:
+        return
+    started = marker.stat().st_mtime
+    for path, version in files.items():
+        if version > files[current] and path.stat().st_mtime >= started:
+            print(f"deleting uncommitted {path}")
+            path.unlink()
+    marker.unlink()
+
+
+def load_table(catalog):
+    """The catalog's table, or None if it has none. Exits if its metadata
+    file is gone, as when another catalog took the table over long ago."""
+    try:
+        return catalog.load_table(TABLE)
+    except NoSuchTableError:
+        return None
+    except FileNotFoundError as e:
+        sys.exit(
+            f"{e.filename or e}: this catalog's metadata is gone; another catalog"
+            f" has the table. Remove {TABLE} from this catalog to adopt it."
+        )
 
 
 def open_catalog(warehouse, catalog_uri=None):
@@ -97,20 +204,25 @@ def open_catalog(warehouse, catalog_uri=None):
 
 def open_table(warehouse, catalog_uri=None):
     warehouse = Path(warehouse).resolve()
+    if warehouse.as_uri() != f"file://{warehouse}":
+        # pyiceberg would write to a folder named with the escapes, e.g. a%20b.
+        sys.exit(f"{warehouse}: use a warehouse path without spaces or %")
     warehouse.mkdir(parents=True, exist_ok=True)
     catalog = open_catalog(warehouse, catalog_uri)
     # Not create_table_if_not_exists: it writes a metadata file even when the
     # table exists.
-    metadata = newest_metadata(warehouse)
-    if catalog.table_exists(TABLE):
-        table = catalog.load_table(TABLE)
-        if metadata and table.metadata_location != metadata.as_uri():
+    if table := load_table(catalog):
+        files = metadata_files(warehouse)
+        metadata = newest_metadata(warehouse)
+        current = files.get(local_path(table.metadata_location), -1)
+        if metadata and files[metadata] > current:
             sys.exit(
-                f"{table.metadata_location} is not the newest metadata,"
-                f" {metadata}: another catalog has committed since. Remove"
-                f" {TABLE} from this catalog to adopt it."
+                f"{metadata} is newer than {table.metadata_location}, which"
+                f" this catalog has: another catalog has committed since."
+                f" Remove {TABLE} from this catalog to adopt it."
             )
         return table
+    metadata = newest_metadata(warehouse)
     if metadata:
         print(f"adopting {metadata}")
         return catalog.register_table(TABLE, metadata.as_uri())
@@ -217,6 +329,93 @@ def convert(raw, warehouse, now=None, days=7, catalog_uri=None):
     return len(new_rows) - sum(counts[key] for key in replace)
 
 
+def day_filter(start):
+    return And(
+        GreaterThanOrEqual("ts", start.isoformat()),
+        LessThan("ts", (start + dt.timedelta(days=1)).isoformat()),
+    )
+
+
+def compact(table, before):
+    """Rewrites each day before `before` held in several files as one file."""
+    files, rows = {}, {}
+    for task in table.scan(row_filter=LessThan("ts", before.isoformat())).plan_files():
+        day = task.file.partition[0]  # days since 1970-01-01
+        files[day] = files.get(day, 0) + 1
+        rows[day] = rows.get(day, 0) + task.file.record_count
+    days = sorted(
+        day for day, n in files.items() if n > 1 and rows[day] <= COMPACT_MAX_ROWS
+    )
+    for day in days:  # one day at a time, to bound memory
+        start = dt.datetime(1970, 1, 1, tzinfo=dt.UTC) + dt.timedelta(days=day)
+        rows = table.scan(row_filter=day_filter(start)).to_arrow()
+        with table.transaction() as tx:
+            tx.delete(day_filter(start))
+            tx.append(rows.cast(ARROW_SCHEMA))
+    return len(days)
+
+
+def referenced_files(table):
+    """Every file the table's metadata and remaining snapshots use."""
+    uris = {table.metadata_location}
+    uris |= {entry.metadata_file for entry in table.metadata.metadata_log}
+    manifests = {}  # shared by snapshots, so read each once
+    for snapshot in table.snapshots():
+        uris.add(snapshot.manifest_list)
+        for manifest in snapshot.manifests(table.io):
+            manifests[manifest.manifest_path] = manifest
+    for path, manifest in manifests.items():
+        uris.add(path)
+        entries = manifest.fetch_manifest_entry(table.io, discard_deleted=False)
+        uris |= {entry.data_file.file_path for entry in entries}
+    return {local_path(uri) for uri in uris}
+
+
+def delete_unreferenced(table, before):
+    """Deletes files in the table's folder that nothing uses, if older than
+    `before`, so a converter run in progress keeps its new files."""
+    root = local_path(table.location())
+    try:
+        keep = referenced_files(table)
+    except FileNotFoundError as e:
+        sys.exit(f"{root}: not deleting, the metadata names missing {e.filename or e}")
+    if missing := [path for path in keep if not path.exists()]:
+        sys.exit(f"{root}: not deleting, the metadata names missing {missing[0]}")
+    # Compare file times with the clock of the machine storing them (a NAS).
+    with tempfile.NamedTemporaryFile(dir=root) as probe:
+        skew = Path(probe.name).stat().st_mtime - time.time()
+    deleted = 0
+    for path in root.rglob("*"):
+        if (
+            path.is_file()
+            and path not in keep
+            and path.stat().st_mtime < before.timestamp() + skew
+        ):
+            path.unlink()
+            deleted += 1
+    return deleted
+
+
+def maintain(warehouse, now=None, keep_days=28, catalog_uri=None):
+    """Compacts, expires and cleans the table; returns what it did."""
+    now = now or dt.datetime.now(dt.UTC)
+    table = open_table(warehouse, catalog_uri)
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    days = compact(table, today)
+    snapshots = len(table.snapshots())
+    table.maintenance.expire_snapshots().older_than(
+        now - dt.timedelta(days=keep_days)
+    ).commit()
+    table = open_table(warehouse, catalog_uri)
+    expired = snapshots - len(table.snapshots())
+    deleted = delete_unreferenced(table, now - dt.timedelta(days=1))
+    return {
+        "days compacted": days,
+        "snapshots expired": expired,
+        "files deleted": deleted,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--raw", default="/var/lib/netmon/raw")
@@ -227,9 +426,42 @@ def main():
     parser.add_argument(
         "--days", type=int, default=7, help="look back this many days (default 7)"
     )
+    parser.add_argument(
+        "--maintain",
+        action="store_true",
+        help="compact, expire old snapshots and delete unused files; load nothing",
+    )
+    parser.add_argument(
+        "--keep-days",
+        type=int,
+        default=28,
+        help="with --maintain, keep snapshots this many days (default 28)",
+    )
+    parser.add_argument(
+        "--lock",
+        default=LOCK,
+        help=f"lock file, so that loads and maintenance take turns (default {LOCK})",
+    )
     args = parser.parse_args()
-    n = convert(args.raw, args.warehouse, days=args.days, catalog_uri=args.catalog)
-    print(f"added {n} rows to {TABLE}")
+    lock = open(args.lock, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("waiting for another run to finish", file=sys.stderr, flush=True)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+    recover(args.warehouse, args.catalog)
+    table = open_table(args.warehouse, args.catalog)  # exits if it's stale
+    run = {"host": socket.gethostname(), "start": table.metadata_location}
+    run_marker(args.warehouse).write_text(json.dumps(run))
+    if args.maintain:
+        done = maintain(
+            args.warehouse, keep_days=args.keep_days, catalog_uri=args.catalog
+        )
+        print(", ".join(f"{n} {what}" for what, n in done.items()))
+    else:
+        n = convert(args.raw, args.warehouse, days=args.days, catalog_uri=args.catalog)
+        print(f"added {n} rows to {TABLE}")
+    run_marker(args.warehouse).unlink()
 
 
 if __name__ == "__main__":
