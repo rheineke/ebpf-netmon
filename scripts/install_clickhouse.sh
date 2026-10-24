@@ -1,8 +1,11 @@
 #!/bin/bash
-# Installs ClickHouse with a netmon.traffic view over the Iceberg table that
-# the converter writes (scripts/install_converter.sh).
+# Installs ClickHouse with views over the Iceberg table that the converter
+# writes (scripts/install_converter.sh) and over recent raw files.
 #
-#   scripts/install_clickhouse.sh WAREHOUSE
+#   scripts/install_clickhouse.sh WAREHOUSE [RAW]
+#
+# RAW defaults to /var/lib/netmon/raw. ClickHouse may read only under the
+# deepest folder holding both, so keep them together (e.g. on one share).
 #
 # ClickHouse releases need ARMv8.2 (Pi 5) and come from its apt repo. On
 # ARMv8.0 (Pi 4) they die with SIGILL, so this installs the nightly ARMv8.0
@@ -10,11 +13,18 @@
 # move the warehouse.
 set -eu
 
-if [ $# -ne 1 ]; then
-  sed -n '2,10s/^# \{0,1\}//p' "$0" >&2
+if [ $# -lt 1 ] || [ $# -gt 2 ]; then
+  sed -n '2,13s/^# \{0,1\}//p' "$0" >&2
   exit 2
 fi
 warehouse=$(realpath "$1")
+raw=$(realpath "${2:-/var/lib/netmon/raw}")
+files=$(python3 -c 'import os, sys; print(os.path.commonpath(sys.argv[1:]))' \
+  "$warehouse" "$raw")
+if [ "$files" = / ]; then
+  echo "WAREHOUSE and RAW share no folder below /" >&2
+  exit 1
+fi
 cd "$(dirname "$0")/.."
 
 if [ "$(uname -m)" != aarch64 ]; then
@@ -34,11 +44,15 @@ if grep -qw asimddp /proc/cpuinfo && grep -qw atomics /proc/cpuinfo; then
 else
   url=https://builds.clickhouse.com/master/aarch64v80compat/clickhouse
   echo "== Downloading the nightly ARMv8.0 build, $url"
-  tmp=$(mktemp -d)
+  # /var/tmp, not /tmp: a Pi's /tmp is in RAM, and the binary unpacks to
+  # about 800 MB.
+  tmp=$(mktemp -d -p /var/tmp)
   trap 'rm -rf "$tmp"' EXIT
   curl -fsSL -o "$tmp/clickhouse" "$url"
   chmod +x "$tmp/clickhouse"
   echo "sha512 $(sha512sum "$tmp/clickhouse" | cut -d' ' -f1)"
+  # Unpack and run it before stopping the running server.
+  "$tmp/clickhouse" local -q 'SELECT version()'
   sudo systemctl stop clickhouse-server 2>/dev/null || true
   (cd "$tmp" && sudo ./clickhouse install --noninteractive >/dev/null)
   sudo install -m 644 systemd/clickhouse-server.service /etc/systemd/system/
@@ -49,9 +63,9 @@ echo "== Configuring"
 sudo install -m 644 clickhouse/config.d/netmon.xml /etc/clickhouse-server/config.d/
 sudo install -m 644 clickhouse/users.d/grafana.xml /etc/clickhouse-server/users.d/
 cat <<XML | sudo tee /etc/clickhouse-server/config.d/netmon-warehouse.xml >/dev/null
-<!-- Written by install_clickhouse.sh: icebergLocal() reads only here. -->
+<!-- Written by install_clickhouse.sh: icebergLocal() and file() read only here. -->
 <clickhouse>
-    <user_files_path>$warehouse/</user_files_path>
+    <user_files_path>$files/</user_files_path>
 </clickhouse>
 XML
 
@@ -63,12 +77,7 @@ for _ in $(seq 30); do
   clickhouse-client -q 'SELECT 1' >/dev/null 2>&1 && break
   sleep 2
 done
-# netmon.traffic reads the Iceberg table, so each query sees its latest
-# snapshot.
-clickhouse-client --multiquery <<SQL
-CREATE DATABASE IF NOT EXISTS netmon;
-CREATE OR REPLACE VIEW netmon.traffic AS
-SELECT * FROM icebergLocal('$warehouse/netmon/traffic');
-SQL
+sed -e "s|@WAREHOUSE@|$warehouse|g" -e "s|@RAW@|$raw|g" clickhouse/views.sql \
+  | clickhouse-client --multiquery
 clickhouse-client --user grafana -q \
-  'SELECT host, count() AS rows, max(ts) AS latest FROM netmon.traffic GROUP BY host'
+  'SELECT host, count() AS rows, max(ts) AS latest FROM netmon.traffic_live GROUP BY host'

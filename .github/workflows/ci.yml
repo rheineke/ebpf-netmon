@@ -36,8 +36,11 @@ jobs:
         run: |
           uv sync --locked
           sudo .venv/bin/python tests/dashboard_test.py load /var/lib/netmon-test
-          scripts/install_clickhouse.sh /var/lib/netmon-test
-          python3 tests/dashboard_test.py check
+          scripts/install_clickhouse.sh /var/lib/netmon-test/warehouse \
+            /var/lib/netmon-test/raw
+          python3 tests/dashboard_test.py check /var/lib/netmon-test
+          sudo .venv/bin/python tests/dashboard_test.py convert /var/lib/netmon-test
+          python3 tests/dashboard_test.py check /var/lib/netmon-test
       - name: Sync
         run: tests/sync_test.sh
       - name: clang-tidy
