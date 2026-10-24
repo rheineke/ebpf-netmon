@@ -23,9 +23,10 @@ SELECT ts, host, interval_s, pid, uid, comm, tcp_tx, tcp_rx, udp_tx, udp_rx,
 FROM netmon.traffic
 UNION ALL
 WITH
-    -- Split by /, not matched by regex: some versions report ** matches
-    -- with a doubled slash.
-    splitByChar('/', substring(_path, length('@RAW@') + 1)) AS parts,
+    -- Empty parts dropped: some versions report ** matches with doubled
+    -- slashes (DAY//HH.jsonl).
+    arrayFilter(p -> p != '', splitByChar('/', substring(_path, length('@RAW@') + 1)))
+        AS parts,
     parts[-3] AS folder,  -- '' when RAW has no host folders
     parseDateTimeOrNull(
         concat(parts[-2], ' ', parts[-1]), '%Y-%m-%d %H.jsonl', 'UTC'
