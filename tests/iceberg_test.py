@@ -224,15 +224,17 @@ def main():
         # Synology's #recycle, and its first lines in an old folder.
         write_hour(raw, "pi-f", h10, 5)
         path = raw / "pi-f" / h10.strftime("%Y-%m-%d") / h10.strftime("%H.jsonl")
-        for folder in ("pi-f.bak", "#recycle/pi-f", "pi-f-old"):
+        hidden = ("#recycle/pi-f", "@eaDir/pi-f", ".snapshot/pi-f")
+        for folder in ("pi-f.bak", "pi-f-old", *hidden):
             copy = raw / folder / path.relative_to(raw / "pi-f")
             copy.parent.mkdir(parents=True)
             lines = path.read_text().splitlines(keepends=True)
             copy.write_text("".join(lines[:3] if folder == "pi-f-old" else lines))
-        # #recycle's also has a row the real file doesn't.
-        row = json.loads(lines[0]) | {"pid": 999}
-        with open(raw / "#recycle" / path.relative_to(raw), "a") as f:
-            f.write(json.dumps(row) + "\n")
+        # The folders to skip also have a row the real file doesn't.
+        for folder in hidden:
+            row = json.loads(lines[0]) | {"pid": 999}
+            with open(raw / folder / path.relative_to(raw / "pi-f"), "a") as f:
+                f.write(json.dumps(row) + "\n")
         check("rows in copies of an hour load once", load(later), 5)
         check("and stay so", load(later), 0)
 
@@ -242,7 +244,16 @@ def main():
         path.write_text("null\n" + path.read_text())
         (path.parent / "24.jsonl").write_text("x\n")
         (path.parent / "-1.jsonl").write_text("x\n")
-        check("odd files and lines are skipped", load(later), 2)
+        good = json.loads(path.read_text().splitlines()[1])
+        with open(path, "ab") as f:
+            for bad in ({"pid": "x"}, {"comm": None}, {"interval_s": 2**40}):
+                f.write(json.dumps(good | bad).encode() + b"\n")
+            del good["scale"]
+            f.write(json.dumps(good).encode() + b"\n")
+            # A process name the kernel cut mid-character loads.
+            cut = json.dumps(good | {"pid": 7, "comm": "calfX", "scale": 1})
+            f.write(cut.encode().replace(b"calfX", b"calf\xc3") + b"\n")
+        check("odd files and lines are skipped", load(later), 3)
 
         table = to_iceberg.open_table(warehouse, uri).scan().to_arrow()
         hosts = table["host"].to_pylist()

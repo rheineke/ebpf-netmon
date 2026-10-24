@@ -35,6 +35,7 @@ import argparse
 import datetime as dt
 import fcntl
 import json
+import os
 import re
 import socket
 import sys
@@ -151,7 +152,18 @@ def mark_run(marker, warehouse, table):
     warehouse = Path(warehouse).resolve()
     run = {"warehouse": str(warehouse), "start": table.metadata_location}
     run["started"] = storage_time(local_path(table.metadata_location).parent)
-    Path(marker).write_text(json.dumps(run))
+    # Whole and on disk before the run writes anything, even if power fails.
+    temp = Path(f"{marker}.tmp")
+    with open(temp, "w") as f:
+        f.write(json.dumps(run))
+        f.flush()
+        os.fsync(f.fileno())
+    temp.replace(marker)
+    folder = os.open(temp.parent, os.O_RDONLY)
+    try:
+        os.fsync(folder)
+    finally:
+        os.close(folder)
 
 
 def recover(warehouse, catalog_uri, marker):
@@ -248,7 +260,8 @@ def hour_of(path):
 
 def first_host(path):
     """The host of a raw file, from its first parseable line."""
-    with open(path) as f:
+    # The kernel cuts process names at 15 bytes, sometimes mid-character.
+    with open(path, errors="replace") as f:
         for line in f:
             try:
                 row = json.loads(line)
@@ -259,17 +272,35 @@ def first_host(path):
     return None
 
 
+def check_types(row):
+    """Raises TypeError unless row's fields fit ARROW_SCHEMA."""
+    for field in ARROW_SCHEMA:
+        value = row[field.name]  # KeyError if missing
+        if field.name == "ts" or pa.types.is_integer(field.type):
+            bits = 32 if field.type == pa.int32() else 64
+            ok = type(value) is int and -(2 ** (bits - 1)) <= value < 2 ** (bits - 1)
+        elif pa.types.is_floating(field.type):
+            ok = type(value) in (int, float)
+        else:
+            ok = isinstance(value, str)
+        if not ok:
+            raise TypeError(f"{field.name}: {value!r}")
+
+
 def read_rows(path):
     """Parses a raw file, skipping lines cut off by a crash mid-write."""
     rows, bad = [], 0
-    with open(path) as f:
+    with open(path, errors="replace") as f:
         for line in f:
             try:
                 row = json.loads(line)
-                row["ts"] = dt.datetime.fromtimestamp(row["ts"], dt.UTC)
+                if not isinstance(row, dict):
+                    raise TypeError(f"not an object: {row!r}")
                 row.setdefault("host", socket.gethostname())  # before -o had it
                 for name in COUNTERS:
                     row.setdefault(name, 0)  # before NFS counters existed
+                check_types(row)
+                row["ts"] = dt.datetime.fromtimestamp(row["ts"], dt.UTC)
                 rows.append(row)
             except (ValueError, KeyError, TypeError, OverflowError, OSError):
                 bad += 1

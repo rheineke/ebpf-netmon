@@ -9,7 +9,9 @@
             <max_execution_time>60</max_execution_time>
             <constraints>
                 <max_memory_usage><const/></max_memory_usage>
-                <max_execution_time><const/></max_execution_time>
+                <!-- Grafana's plugin sends its query timeout plus 5 s:
+                     64 for panels, about 34 for alerts. -->
+                <max_execution_time><min>1</min><max>65</max></max_execution_time>
             </constraints>
         </grafana>
     </profiles>

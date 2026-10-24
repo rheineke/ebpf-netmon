@@ -10,5 +10,6 @@ datasources:
       protocol: native
       username: grafana
       defaultDatabase: netmon
-      # Must match max_execution_time in clickhouse/users.d/grafana.xml.
+      # The plugin asks for this plus 5 s, which clickhouse/users.d/grafana.xml
+      # allows up to 65.
       queryTimeout: "60"
