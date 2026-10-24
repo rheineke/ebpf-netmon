@@ -46,6 +46,14 @@ def write_hour(raw, host, start, rows, extra=""):
         f.write(extra)
 
 
+def refuses(f, *args):
+    try:
+        f(*args)
+    except SystemExit:
+        return True
+    return False
+
+
 def check(name, got, want):
     if got != want:
         sys.exit(f"FAIL: {name}: got {got}, want {want}")
@@ -104,12 +112,40 @@ def main():
         # rest arrived, along with a late hour.
         write_hour(raw, "pi-c", h10, 3)
         check("partial hour loads", load(later), 3)
-        refused = False
-        try:
-            to_iceberg.open_table(warehouse)  # the SQLite catalog, now stale
-        except SystemExit:
-            refused = True
-        check("the old catalog refuses to run", refused, True)
+        # The SQLite catalog, now stale.
+        check(
+            "the old catalog refuses to run",
+            refuses(to_iceberg.open_table, warehouse),
+            True,
+        )
+
+        # A lost commit leaves a second file of the current version, and a
+        # run that stops partway, a newer cut-off one.
+        current = to_iceberg.newest_metadata(warehouse)
+        version = int(current.name.split("-")[0])
+        lost = current.with_name(f"{version:05d}-lost.metadata.json")
+        lost.write_text(current.read_text())
+        cut = current.with_name(f"{version + 1:05d}-cut.metadata.json")
+        cut.write_text(current.read_text()[:100])
+        odd = current.with_name("odd.metadata.json")
+        odd.write_text("{}")
+        check(
+            "newest skips cut-off metadata",
+            to_iceberg.newest_metadata(warehouse) != cut,
+            True,
+        )
+        to_iceberg.open_table(warehouse, uri)
+        check(
+            "uncommitted metadata deleted, odd names left",
+            (lost.exists(), cut.exists(), odd.exists()),
+            (False, False, True),
+        )
+        odd.unlink()
+        check(
+            "a warehouse path with a space is refused",
+            refuses(to_iceberg.open_table, Path(tmp) / "a b"),
+            True,
+        )
         write_hour(raw, "pi-c", h10, 8)
         write_hour(raw, "pi-c", h10 - dt.timedelta(hours=1), 2)
         check(
@@ -158,6 +194,13 @@ def main():
         check("previous day loads", load(later), 2)
         (warehouse / "netmon" / "traffic" / "metadata" / "stray.avro").touch()
         before = to_iceberg.open_table(warehouse, uri).scan().to_arrow()
+        to_iceberg.COMPACT_MAX_ROWS = 5
+        check(
+            "days over COMPACT_MAX_ROWS aren't compacted",
+            to_iceberg.maintain(warehouse, catalog_uri=uri)["days compacted"],
+            0,
+        )
+        to_iceberg.COMPACT_MAX_ROWS = 1_000_000
         check(
             "maintain now compacts 2026-10-22 only and keeps recent snapshots",
             to_iceberg.maintain(warehouse, catalog_uri=uri),

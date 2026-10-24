@@ -7,9 +7,10 @@
 # WAREHOUSE is where the Iceberg table goes, e.g. an NFS mount on a NAS.
 # RAW holds the raw files, by default this machine's /var/lib/netmon/raw; to
 # load several hosts, point it at the folder scripts/install_sync.sh copies
-# them to. CATALOG is a SQLAlchemy URI for the catalog, by default a SQLite
-# file in WAREHOUSE (see scripts/install_postgres.sh). Run one converter per
-# warehouse. Re-run to upgrade or move it.
+# them to. CATALOG is a SQLAlchemy URI for the catalog (see
+# scripts/install_postgres.sh); left out, it stays as installed, and '' is a
+# SQLite file in WAREHOUSE. Run one converter per warehouse. Re-run to
+# upgrade or move it.
 set -eu
 
 if [ $# -lt 1 ] || [ $# -gt 3 ]; then
@@ -18,7 +19,11 @@ if [ $# -lt 1 ] || [ $# -gt 3 ]; then
 fi
 warehouse=$1
 raw=${2:-/var/lib/netmon/raw}
-catalog=${3:-}
+if [ $# -eq 3 ]; then
+  catalog=$3
+else
+  catalog=$(sed -n 's/^CATALOG=//p' /etc/default/netmon-iceberg 2>/dev/null || true)
+fi
 cd "$(dirname "$0")/.."
 
 uv_version=0.13.5

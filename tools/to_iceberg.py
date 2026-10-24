@@ -23,14 +23,20 @@ table to the new catalog. The old catalog then refuses to run.
 
 --maintain, run weekly, compacts each finished day into one Parquet file,
 expires snapshots older than --keep-days (28), and deletes files no
-remaining snapshot uses. Time travel works back --keep-days.
+remaining snapshot uses. Time travel works back --keep-days. Runs take
+turns through a lock file (--lock), and each deletes metadata files that a
+stopped or failed run left uncommitted.
 """
 
 import argparse
 import datetime as dt
+import fcntl
 import json
+import re
 import socket
 import sys
+import tempfile
+import time
 import urllib.parse
 from pathlib import Path
 
@@ -83,12 +89,65 @@ ARROW_SCHEMA = pa.schema(
 )
 
 
-def newest_metadata(warehouse):
-    """The table's newest metadata file in the warehouse, or None."""
+LOCK = "/run/lock/netmon-iceberg.lock"
+COMPACT_MAX_ROWS = 1_000_000  # bigger days stay as they are, to bound memory
+# NNNNN-UUID.metadata.json, numbered from 00000 by each commit.
+METADATA_NAME = re.compile(r"(\d+)-.+\.metadata\.json")
+
+
+def local_path(uri):
+    """file:///a%20b/c or /a b/c -> Path('/a b/c'), resolved."""
+    return Path(urllib.parse.unquote(urllib.parse.urlparse(uri).path)).resolve()
+
+
+def metadata_files(warehouse):
+    """{path: version} of the table's metadata files in the warehouse."""
     metadata = Path(warehouse).resolve() / "netmon" / "traffic" / "metadata"
-    files = metadata.glob("*.metadata.json")
-    # NNNNN-UUID.metadata.json, numbered from 00000 by each commit.
-    return max(files, key=lambda p: (int(p.name.split("-")[0]), p.name), default=None)
+    files = {}
+    for path in metadata.glob("*.metadata.json"):
+        if match := METADATA_NAME.fullmatch(path.name):
+            files[path] = int(match[1])
+    return files
+
+
+def complete(path):
+    """Whether a metadata file parses and its current snapshot's manifest
+    list exists. A run that stops partway through a commit, or loses a
+    commit, can leave one that doesn't."""
+    try:
+        metadata = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return False
+    current = metadata.get("current-snapshot-id")
+    if current in (None, -1):
+        return True  # a new table, without snapshots
+    for snapshot in metadata.get("snapshots", []):
+        if snapshot.get("snapshot-id") == current:
+            return local_path(snapshot["manifest-list"]).exists()
+    return False
+
+
+def newest_metadata(warehouse):
+    """The table's newest complete metadata file in the warehouse, or None."""
+    files = sorted(metadata_files(warehouse).items(), key=lambda f: (f[1], f[0]))
+    return next((path for path, _ in reversed(files) if complete(path)), None)
+
+
+def drop_uncommitted_metadata(table, warehouse):
+    """Deletes metadata files the catalog never committed: those not in the
+    table's history up to its current version, and incomplete ones. Runs
+    hold LOCK, so none is still being written."""
+    current = local_path(table.metadata_location)
+    history = {current} | {
+        local_path(entry.metadata_file) for entry in table.metadata.metadata_log
+    }
+    files = metadata_files(warehouse)
+    if current not in files:
+        return  # the catalog names a file elsewhere: leave it all alone
+    for path, version in files.items():
+        if path not in history and (version <= files[current] or not complete(path)):
+            print(f"deleting uncommitted {path}")
+            path.unlink()
 
 
 def open_catalog(warehouse, catalog_uri=None):
@@ -103,20 +162,26 @@ def open_catalog(warehouse, catalog_uri=None):
 
 def open_table(warehouse, catalog_uri=None):
     warehouse = Path(warehouse).resolve()
+    if warehouse.as_uri() != f"file://{warehouse}":
+        # pyiceberg would write to a folder named with the escapes, e.g. a%20b.
+        sys.exit(f"{warehouse}: use a warehouse path without spaces or %")
     warehouse.mkdir(parents=True, exist_ok=True)
     catalog = open_catalog(warehouse, catalog_uri)
     # Not create_table_if_not_exists: it writes a metadata file even when the
     # table exists.
-    metadata = newest_metadata(warehouse)
     if catalog.table_exists(TABLE):
         table = catalog.load_table(TABLE)
-        if metadata and table.metadata_location != metadata.as_uri():
+        drop_uncommitted_metadata(table, warehouse)
+        metadata = newest_metadata(warehouse)
+        if metadata and metadata != local_path(table.metadata_location):
             sys.exit(
-                f"{table.metadata_location} is not the newest metadata,"
-                f" {metadata}: another catalog has committed since. Remove"
-                f" {TABLE} from this catalog to adopt it."
+                f"{metadata} is newer than {table.metadata_location}, which"
+                f" this catalog has: another catalog has committed since, or a"
+                f" run stopped before committing it. Remove {TABLE} from this"
+                f" catalog to adopt it."
             )
         return table
+    metadata = newest_metadata(warehouse)
     if metadata:
         print(f"adopting {metadata}")
         return catalog.register_table(TABLE, metadata.as_uri())
@@ -232,11 +297,14 @@ def day_filter(start):
 
 def compact(table, before):
     """Rewrites each day before `before` held in several files as one file."""
-    files = {}
+    files, rows = {}, {}
     for task in table.scan(row_filter=LessThan("ts", before.isoformat())).plan_files():
         day = task.file.partition[0]  # days since 1970-01-01
         files[day] = files.get(day, 0) + 1
-    days = sorted(day for day, n in files.items() if n > 1)
+        rows[day] = rows.get(day, 0) + task.file.record_count
+    days = sorted(
+        day for day, n in files.items() if n > 1 and rows[day] <= COMPACT_MAX_ROWS
+    )
     for day in days:  # one day at a time, to bound memory
         start = dt.datetime(1970, 1, 1, tzinfo=dt.UTC) + dt.timedelta(days=day)
         rows = table.scan(row_filter=day_filter(start)).to_arrow()
@@ -250,28 +318,34 @@ def referenced_files(table):
     """Every file the table's metadata and remaining snapshots use."""
     uris = {table.metadata_location}
     uris |= {entry.metadata_file for entry in table.metadata.metadata_log}
+    manifests = {}  # shared by snapshots, so read each once
     for snapshot in table.snapshots():
         uris.add(snapshot.manifest_list)
         for manifest in snapshot.manifests(table.io):
-            uris.add(manifest.manifest_path)
-            entries = manifest.fetch_manifest_entry(table.io, discard_deleted=False)
-            uris |= {entry.data_file.file_path for entry in entries}
-    return {Path(urllib.parse.urlparse(uri).path) for uri in uris}
+            manifests[manifest.manifest_path] = manifest
+    for path, manifest in manifests.items():
+        uris.add(path)
+        entries = manifest.fetch_manifest_entry(table.io, discard_deleted=False)
+        uris |= {entry.data_file.file_path for entry in entries}
+    return {local_path(uri) for uri in uris}
 
 
 def delete_unreferenced(table, before):
     """Deletes files in the table's folder that nothing uses, if older than
     `before`, so a converter run in progress keeps its new files."""
-    root = Path(urllib.parse.urlparse(table.location()).path)
+    root = local_path(table.location())
     keep = referenced_files(table)
-    if not all(path.exists() for path in keep if path.suffix == ".parquet"):
-        sys.exit(f"{root}: the metadata names files that aren't there; not deleting")
+    if missing := [path for path in keep if not path.exists()]:
+        sys.exit(f"{root}: not deleting, the metadata names missing {missing[0]}")
+    # Compare file times with the clock of the machine storing them (a NAS).
+    with tempfile.NamedTemporaryFile(dir=root) as probe:
+        skew = Path(probe.name).stat().st_mtime - time.time()
     deleted = 0
     for path in root.rglob("*"):
         if (
             path.is_file()
             and path not in keep
-            and path.stat().st_mtime < before.timestamp()
+            and path.stat().st_mtime < before.timestamp() + skew
         ):
             path.unlink()
             deleted += 1
@@ -319,7 +393,14 @@ def main():
         default=28,
         help="with --maintain, keep snapshots this many days (default 28)",
     )
+    parser.add_argument(
+        "--lock",
+        default=LOCK,
+        help=f"lock file, so that loads and maintenance take turns (default {LOCK})",
+    )
     args = parser.parse_args()
+    lock = open(args.lock, "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)  # waits for a run already going
     if args.maintain:
         done = maintain(
             args.warehouse, keep_days=args.keep_days, catalog_uri=args.catalog
