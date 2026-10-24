@@ -27,8 +27,8 @@ remaining snapshot uses. Time travel works back --keep-days.
 
 Runs take turns through a lock file (--lock), and a run that stops partway
 leaves a marker in the warehouse so the next one on the same machine
-deletes the metadata it wrote but never committed. Only main() does these; call convert() and
-maintain() only while no other run can.
+deletes the metadata it wrote but never committed. Only main() does these;
+call convert() and maintain() only while no other run can.
 """
 
 import argparse
