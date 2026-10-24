@@ -8,7 +8,7 @@ groups:
     folder: netmon
     interval: 1m
     rules:
-      # Hosts seen in the last day with no rows for 5 minutes: netmon, the
+      # Hosts seen in the last 7 days with no rows for 5 minutes: netmon, the
       # sync or the NAS has stopped.
       - uid: netmon-host-silent
         title: Host stopped reporting
@@ -21,7 +21,7 @@ groups:
         data:
           - refId: A
             datasourceUid: netmon-clickhouse
-            relativeTimeRange: {from: 86400, to: 0}
+            relativeTimeRange: {from: 604800, to: 0}
             model:
               refId: A
               editorType: sql
@@ -30,7 +30,7 @@ groups:
               rawSql: |-
                 SELECT host, dateDiff('second', max(ts), now()) AS seconds_silent
                 FROM netmon.traffic_live
-                WHERE ts >= now() - INTERVAL 1 DAY
+                WHERE ts >= now() - INTERVAL 7 DAY
                 GROUP BY host
           - refId: C
             datasourceUid: __expr__
@@ -41,8 +41,8 @@ groups:
               conditions:
                 - evaluator: {type: gt, params: [300]}
 
-      # One process sending or receiving over 10 MB/s, averaged over the last
-      # 5 minutes.
+      # One process sending or receiving over 10 MB/s, averaged over 5
+      # minutes ending a minute ago, as the last minute may not be synced yet.
       - uid: netmon-high-traffic
         title: Process moving over 10 MB/s
         condition: C
@@ -65,7 +65,7 @@ groups:
                   greatest(sum((tcp_tx + udp_tx) * scale),
                     sum((tcp_rx + udp_rx) * scale)) / 300 AS bytes_per_s
                 FROM netmon.traffic_live
-                WHERE ts >= now() - INTERVAL 5 MINUTE
+                WHERE ts >= now() - INTERVAL 6 MINUTE AND ts < now() - INTERVAL 1 MINUTE
                 GROUP BY host, comm
           - refId: C
             datasourceUid: __expr__
@@ -98,6 +98,7 @@ groups:
               rawSql: |-
                 SELECT dateDiff('second', max(ts), now()) AS seconds_behind
                 FROM netmon.traffic
+                WHERE ts >= now() - INTERVAL 7 DAY  -- none: 1970, so it fires
           - refId: C
             datasourceUid: __expr__
             model:

@@ -36,5 +36,9 @@ if ! sudo test -f "$dest/2026-01-01/01.jsonl"; then
   exit 1
 fi
 echo "ok  : never deletes"
-systemctl is-active --quiet netmon-sync.timer && echo "ok  : timer active"
+if ! systemctl is-active --quiet netmon-sync.timer; then
+  echo "FAIL: the timer isn't active" >&2
+  exit 1
+fi
+echo "ok  : timer active"
 echo PASS

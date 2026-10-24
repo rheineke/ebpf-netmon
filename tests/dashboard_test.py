@@ -65,6 +65,16 @@ def load(test_dir):
                     row |= {"interval_s": 10, "pid": 100 + i % 2, "uid": i % 2}
                     row |= {"comm": f"proc{i % 2}", "scale": SCALE}
                     f.write(json.dumps(row | COUNTERS) + "\n")
+    # Copies of pi-a's last hour, still only in raw files: a backup, which
+    # must count once, and folders to skip, each with a row of its own.
+    path = test_dir / "raw" / "pi-a" / f"{hour:%Y-%m-%d}" / f"{hour:%H}.jsonl"
+    for folder in ("pi-a.bak", "#recycle/pi-a", "@eaDir/pi-a", ".snapshot/pi-a"):
+        copy = test_dir / "raw" / folder / path.relative_to(path.parents[1])
+        copy.parent.mkdir(parents=True, exist_ok=True)
+        text = path.read_text()
+        if folder != "pi-a.bak":
+            text += json.dumps(json.loads(text.splitlines()[0]) | {"pid": 999}) + "\n"
+        copy.write_text(text)
 
 
 def fill_macros(sql):
@@ -123,6 +133,8 @@ def check():
         rows = query(panel["targets"][0]["rawSql"])
         title = panel["title"]
         if panel["type"] == "timeseries":
+            # 0 is a time series, one line per series; 1, a table, is one line.
+            check_eq(f"{title}: format", panel["targets"][0]["format"], 0)
             # bytes_per_s over hour buckets, times 3600, is the bytes in range.
             total = sum(r["bytes_per_s"] for r in rows) * 3600
             want = (
@@ -147,7 +159,34 @@ def check():
             check_eq(f"{title}: rows", len(rows), 4)  # 2 hosts x 2 comms
             check_eq(f"{title}: pids", {r["pids"] for r in rows}, {1})
     check_alerts()
+    check_locked_down()
     print("PASS")
+
+
+def check_locked_down():
+    """Grafana's user can't reach files, URLs or its limits but by the views,
+    and can set the time limits Grafana's plugin asks for."""
+    denied, limited = "ACCESS_DENIED", "SETTING_CONSTRAINT_VIOLATION"
+    for sql, error in (
+        ("SELECT count() FROM file('**/*.jsonl', 'LineAsString')", denied),
+        ("INSERT INTO FUNCTION file('grafana.txt', 'LineAsString') SELECT 'x'", denied),
+        ("SELECT * FROM url('http://127.0.0.1:8123/', 'LineAsString')", denied),
+        ("DROP VIEW netmon.traffic_live", denied),
+        ("SELECT 1 SETTINGS max_memory_usage = 0", limited),
+        ("SELECT 1 SETTINGS max_execution_time = 0", limited),
+        ("SELECT 1 SETTINGS max_execution_time = 600", limited),
+    ):
+        out = subprocess.run(
+            ["clickhouse-client", "--user", "grafana", "-q", sql],
+            capture_output=True,
+            text=True,
+        )
+        check_eq(f"refused: {sql}", f"({error})" in out.stderr, True)
+    # The plugin sends its query timeout plus 5 s: 64 for panels, 34 for alerts.
+    for seconds in (64, 34):
+        sql = "SELECT count() AS n FROM netmon.traffic_live"
+        sql += f" SETTINGS max_execution_time = {seconds}"
+        check_eq(f"max_execution_time {seconds}", query(sql)[0]["n"], HOURS * ROWS * 2)
 
 
 def check_alerts():

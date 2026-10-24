@@ -10,7 +10,6 @@ import datetime as dt
 import fcntl
 import json
 import os
-import socket
 import subprocess
 import sys
 import tempfile
@@ -62,10 +61,17 @@ def readable(table):
     return True
 
 
-def mark_run(marker, run):
-    """Leaves a run marker as main() does, a minute ago."""
-    marker.write_text(json.dumps(run))
-    os.utime(marker, (time.time() - 60,) * 2)
+def mark_run(marker, warehouse, start):
+    """Leaves a run marker as main() does, as of a minute ago."""
+    run = {"warehouse": str(Path(warehouse).resolve()), "start": str(start)}
+    marker.write_text(json.dumps(run | {"started": time.time() - 60}))
+
+
+# Runs main() with convert() failing after the run marker is written.
+STOPS = (
+    "import sys, to_iceberg; sys.argv[0] = 'to_iceberg';"
+    " to_iceberg.convert = lambda *args, **kwargs: sys.exit(3); to_iceberg.main()"
+)
 
 
 def refuses(f, *args):
@@ -166,20 +172,13 @@ def main():
             refuses(to_iceberg.open_table, warehouse, uri),
             True,
         )
-        marker = to_iceberg.run_marker(warehouse)
-        here = socket.gethostname()
-        for name, run in (
-            (
-                "another machine's run marker",
-                {"host": "elsewhere", "start": str(current)},
-            ),
-            (
-                "the marker of a run from metadata this catalog lacks",
-                {"host": here, "start": "/x"},
-            ),
+        marker = Path(tmp) / "run.json"
+        for name, other, start in (
+            ("another warehouse's run marker", Path(tmp) / "other", current),
+            ("the marker of a run from metadata this catalog lacks", warehouse, "/x"),
         ):
-            mark_run(marker, run)
-            to_iceberg.recover(warehouse, uri)
+            mark_run(marker, other, start)
+            to_iceberg.recover(warehouse, uri, marker)
             check(
                 f"{name} is left alone",
                 (failed.exists(), marker.exists()),
@@ -187,11 +186,11 @@ def main():
             )
         early = current.with_name(f"{version + 3:05d}-early.metadata.json")
         early.write_text(current.read_text())
-        mark_run(marker, {"host": here, "start": str(current)})
+        mark_run(marker, warehouse, current)
         os.utime(early, (time.time() - 120,) * 2)
-        to_iceberg.recover(warehouse, uri)
+        to_iceberg.recover(warehouse, uri, marker)
         check(
-            "after this machine's run stopped, the newer files it wrote go",
+            "after a run stopped, the newer files it wrote go",
             [f.exists() for f in (tie, cut, unlisted, failed, early, odd, marker)],
             [True, False, False, False, True, True, False],
         )
@@ -220,6 +219,48 @@ def main():
                 f.write(json.dumps(row | {"ts": row["ts"] + 1800}) + "\n")
         check("renamed mid-hour loads", load(later), 8)
         check("and stays loaded", load(later), 0)
+
+        # Copies of pi-f's 10:00 file: whole in a backup folder and in
+        # Synology's #recycle, and its first lines in an old folder.
+        write_hour(raw, "pi-f", h10, 5)
+        path = raw / "pi-f" / h10.strftime("%Y-%m-%d") / h10.strftime("%H.jsonl")
+        hidden = ("#recycle/pi-f", "@eaDir/pi-f", ".snapshot/pi-f")
+        for folder in ("pi-f.bak", "pi-f-old", *hidden):
+            copy = raw / folder / path.relative_to(raw / "pi-f")
+            copy.parent.mkdir(parents=True)
+            lines = path.read_text().splitlines(keepends=True)
+            copy.write_text("".join(lines[:3] if folder == "pi-f-old" else lines))
+        # The folders to skip also have a row the real file doesn't.
+        for folder in hidden:
+            row = json.loads(lines[0]) | {"pid": 999}
+            with open(raw / folder / path.relative_to(raw / "pi-f"), "a") as f:
+                f.write(json.dumps(row) + "\n")
+        check("rows in copies of an hour load once", load(later), 5)
+        check("and stay so", load(later), 0)
+
+        # Odd raw files and lines are skipped.
+        write_hour(raw, "pi-g", h10, 2, extra="null\n[1]\n5\n")
+        path = raw / "pi-g" / h10.strftime("%Y-%m-%d") / h10.strftime("%H.jsonl")
+        path.write_text("null\n" + path.read_text())
+        (path.parent / "24.jsonl").write_text("x\n")
+        (path.parent / "-1.jsonl").write_text("x\n")
+        good = json.loads(path.read_text().splitlines()[1])
+        with open(path, "ab") as f:
+            for bad in (
+                {"pid": "x"},
+                {"comm": None},
+                {"interval_s": 2**40},
+                {"scale": 2**63},
+                {"ts": good["ts"] + 7200},  # outside the file's hour
+            ):
+                f.write(json.dumps(good | bad).encode() + b"\n")
+            del good["scale"]
+            f.write(json.dumps(good).encode() + b"\n")
+            # A process name the kernel cut mid-character loads.
+            cut = json.dumps(good | {"pid": 7, "comm": "calfX", "scale": 1})
+            f.write(cut.encode().replace(b"calfX", b"calf\xc3") + b"\n")
+        check("odd files and lines are skipped", load(later), 3)
+        check("and stay skipped", load(later), 0)
 
         table = to_iceberg.open_table(warehouse, uri).scan().to_arrow()
         hosts = table["host"].to_pylist()
@@ -332,16 +373,17 @@ def main():
         # last run, which stopped partway, and loads.
         current = to_iceberg.newest_metadata(warehouse)
         version = int(current.name.split("-")[0])
-        mark_run(marker, {"host": socket.gethostname(), "start": str(current)})
+        mark_run(marker, warehouse, current)
         failed = current.with_name(f"{version + 1:05d}-failed.metadata.json")
         failed.write_text(current.read_text())
         lock = Path(tmp) / "lock"
-        run = [sys.executable, str(TOOLS / "to_iceberg.py"), "--raw", str(raw)]
-        run += ["--warehouse", str(warehouse), "--lock", str(lock)]
+        run = ["--raw", str(raw), "--warehouse", str(warehouse)]
+        run += ["--lock", str(lock), "--marker", str(marker)]
+        main = [sys.executable, str(TOOLS / "to_iceberg.py"), *run]
         with open(lock, "w") as held:
             fcntl.flock(held, fcntl.LOCK_EX)
             proc = subprocess.Popen(
-                [*run, "--catalog", uri],
+                [*main, "--catalog", uri],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -351,11 +393,38 @@ def main():
                 proc.stderr.readline().strip(),
                 "waiting for another run to finish",
             )
-            check("and does nothing meanwhile", marker.exists(), True)
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                pass
+            check(
+                "and does nothing meanwhile",
+                (proc.poll(), failed.exists(), marker.exists()),
+                (None, True, True),
+            )
         check("then runs", proc.wait(timeout=120), 0)
         check("having deleted the uncommitted file", failed.exists(), False)
         check("and leaves no run marker", marker.exists(), False)
-        stale = subprocess.run(run, capture_output=True)  # the SQLite catalog
+
+        env = os.environ | {"PYTHONPATH": str(TOOLS)}
+        stopped = subprocess.run(
+            [sys.executable, "-c", STOPS, *run, "--catalog", uri],
+            env=env,
+            capture_output=True,
+        )
+        check(
+            "a run that stops partway leaves its marker",
+            (stopped.returncode, marker.exists()),
+            (3, True),
+        )
+        current = to_iceberg.newest_metadata(warehouse)
+        failed.write_text(current.read_text())  # as if its commit failed
+        check(
+            "the next run cleans up after it",
+            (subprocess.run([*main, "--catalog", uri]).returncode, failed.exists()),
+            (0, False),
+        )
+        stale = subprocess.run(main, capture_output=True)  # the SQLite catalog
         check(
             "a stale catalog's refused run leaves no marker",
             (stale.returncode != 0, marker.exists()),

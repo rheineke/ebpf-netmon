@@ -1,10 +1,18 @@
-<!-- A read-only user for Grafana. The server listens on 127.0.0.1 only. -->
+<!-- Grafana's user may only read the netmon views. The views read the raw
+     files and the Iceberg table as netmon_views, which can't log in. The
+     server listens on 127.0.0.1 only. -->
 <clickhouse>
     <profiles>
         <grafana>
             <readonly>2</readonly>
             <max_memory_usage>1000000000</max_memory_usage>
             <max_execution_time>60</max_execution_time>
+            <constraints>
+                <max_memory_usage><const/></max_memory_usage>
+                <!-- Grafana's plugin sends its query timeout plus 5 s:
+                     64 for panels, about 34 for alerts. -->
+                <max_execution_time><min>1</min><max>65</max></max_execution_time>
+            </constraints>
         </grafana>
     </profiles>
     <users>
@@ -16,6 +24,20 @@
             </networks>
             <profile>grafana</profile>
             <quota>default</quota>
+            <grants>
+                <query>GRANT SELECT ON netmon.*</query>
+            </grants>
         </grafana>
+        <!-- The definer of the views; no networks, so no logins. -->
+        <netmon_views>
+            <no_password/>
+            <networks></networks>
+            <profile>default</profile>
+            <quota>default</quota>
+            <grants>
+                <query>GRANT SELECT ON netmon.*</query>
+                <query>GRANT FILE, CREATE TEMPORARY TABLE ON *.*</query>
+            </grants>
+        </netmon_views>
     </users>
 </clickhouse>
