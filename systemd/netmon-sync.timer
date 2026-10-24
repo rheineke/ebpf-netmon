@@ -1,0 +1,10 @@
+# Every minute, so the converter and live queries see recent rows.
+[Unit]
+Description=Copy netmon raw files every minute
+
+[Timer]
+OnCalendar=minutely
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

@@ -144,13 +144,32 @@ more.
 
 `tools/to_iceberg.py` appends each finished hour of raw files to the
 Iceberg table `netmon.traffic`, stored as Parquet and partitioned by day,
-with a SQLite catalog in the warehouse directory. An hour that is already
-in the table is skipped, so reruns are safe. To run it at five past every
-hour:
+with a SQLite catalog in the warehouse directory. A file is loaded again
+only when it has more rows than the table holds for its hour, so reruns are
+safe and an hour copied before it was complete is filled in later. To run
+it at five past every hour:
 
 ```sh
-scripts/install_converter.sh WAREHOUSE
+scripts/install_converter.sh WAREHOUSE [RAW]
 ```
+
+RAW defaults to this machine's `/var/lib/netmon/raw`.
+
+### Several Pis
+
+Run one converter, and have every Pi copy its raw files to shared storage,
+such as an NFS share on a NAS mounted at the same path on each:
+
+```sh
+scripts/install_sync.sh /mnt/nas/netmon/raw     # on every Pi
+scripts/install_converter.sh /mnt/nas/netmon/warehouse /mnt/nas/netmon/raw
+```
+
+The sync rsyncs `/var/lib/netmon/raw` to `RAW/$(hostname)/` every minute,
+and never deletes there. Local capture does not depend on the NAS: while it
+is unmounted the sync and the converter skip their runs, and the next sync
+catches up. Each row carries the host name it was captured under, so
+renaming a Pi starts a new host in the table.
 
 `uv run tests/iceberg_test.py` tests it. The Python dependencies are in
 `pyproject.toml`, pinned in `uv.lock`.

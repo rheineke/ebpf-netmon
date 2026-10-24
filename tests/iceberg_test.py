@@ -73,6 +73,42 @@ def main():
         check("hosts", sorted(set(table["host"].to_pylist())), ["pi-a", "pi-b"])
         check("nfs_write total", sum(table["nfs_write"].to_pylist()), 6 * 19)
         check("ts is UTC", str(table.schema.field("ts").type), "timestamp[us, tz=UTC]")
+
+        # A NAS copy of pi-c's 10:00 file stopped partway through, then the
+        # rest arrived, along with a late hour.
+        write_hour(raw, "pi-c", h10, 3)
+        check("partial hour loads", to_iceberg.convert(raw, warehouse, later), 3)
+        write_hour(raw, "pi-c", h10, 8)
+        write_hour(raw, "pi-c", h10 - dt.timedelta(hours=1), 2)
+        check(
+            "completed hour replaced, late hour added",
+            to_iceberg.convert(raw, warehouse, later),
+            5 + 2,
+        )
+        check("then nothing", to_iceberg.convert(raw, warehouse, later), 0)
+
+        # pi-d was renamed pi-e partway through its 10:00 hour.
+        write_hour(raw, "pi-d", h10, 4)
+        path = raw / "pi-d" / h10.strftime("%Y-%m-%d") / h10.strftime("%H.jsonl")
+        with open(path, "a") as f:
+            for line in path.read_text().splitlines():
+                row = json.loads(line) | {"host": "pi-e"}
+                f.write(json.dumps(row | {"ts": row["ts"] + 1800}) + "\n")
+        check("renamed mid-hour loads", to_iceberg.convert(raw, warehouse, later), 8)
+        check("and stays loaded", to_iceberg.convert(raw, warehouse, later), 0)
+
+        table = to_iceberg.open_table(warehouse).scan().to_arrow()
+        hosts = table["host"].to_pylist()
+        check("pi-d and pi-e rows", (hosts.count("pi-d"), hosts.count("pi-e")), (4, 4))
+        check("pi-c rows, no duplicates", hosts.count("pi-c"), 8 + 2)
+        keys = [
+            (h, t, p)
+            for h, t, p in zip(
+                hosts, table["ts"].to_pylist(), table["pid"].to_pylist(), strict=True
+            )
+        ]
+        check("rows unique", len(set(keys)), len(keys))
+        check("pi-a and pi-b untouched", hosts.count("pi-a") + hosts.count("pi-b"), 19)
         files = list(warehouse.rglob("*.parquet"))
         check(
             "parquet partitioned by day",

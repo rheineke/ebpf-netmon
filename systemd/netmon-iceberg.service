@@ -1,5 +1,5 @@
-# Appends finished hours of /var/lib/netmon/raw to the Iceberg table.
-# Install with scripts/install_converter.sh, which writes WAREHOUSE to
+# Loads finished hours of raw files into the Iceberg table. Install with
+# scripts/install_converter.sh, which writes WAREHOUSE and RAW to
 # /etc/default/netmon-iceberg.
 [Unit]
 Description=netmon raw JSON lines to Iceberg
@@ -9,7 +9,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 EnvironmentFile=/etc/default/netmon-iceberg
-ExecStart=/opt/netmon/venv/bin/python /opt/netmon/to_iceberg.py --warehouse ${WAREHOUSE}
+ExecStart=/opt/netmon/venv/bin/python /opt/netmon/to_iceberg.py --warehouse ${WAREHOUSE} --raw ${RAW}
 NoNewPrivileges=yes
 ProtectHome=yes
 PrivateTmp=yes

@@ -38,6 +38,8 @@ jobs:
           sudo .venv/bin/python tests/dashboard_test.py load /var/lib/netmon-test
           scripts/install_clickhouse.sh /var/lib/netmon-test
           python3 tests/dashboard_test.py check
+      - name: Sync
+        run: tests/sync_test.sh
       - name: clang-tidy
         run: docker build --target lint .
       - name: ASan and UBSan
