@@ -36,6 +36,8 @@
             <quota>default</quota>
             <grants>
                 <query>GRANT SELECT ON netmon.*</query>
+                <!-- The REST catalog's tables (install_rest_catalog.sh). -->
+                <query>GRANT SELECT ON netmon_lake.*</query>
                 <query>GRANT FILE, CREATE TEMPORARY TABLE ON *.*</query>
             </grants>
         </netmon_views>

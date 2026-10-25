@@ -48,6 +48,24 @@ jobs:
           .venv/bin/python tests/dashboard_test.py check /var/lib/netmon-test
           sudo .venv/bin/python tests/dashboard_test.py maintain /var/lib/netmon-test
           .venv/bin/python tests/dashboard_test.py check /var/lib/netmon-test
+      - name: Dashboard queries, REST catalog
+        env:
+          NETMON_TEST_CATALOG: postgresql+psycopg2://netmon@/netmon?host=/var/run/postgresql
+        run: |
+          scripts/install_postgres.sh root  # the converter's user
+          test=/var/lib/netmon-rest
+          as_root() {
+            sudo --preserve-env=NETMON_TEST_CATALOG .venv/bin/python \
+              tests/dashboard_test.py "$1" $test
+          }
+          as_root load
+          scripts/install_rest_catalog.sh $test/warehouse
+          scripts/install_clickhouse.sh $test/warehouse $test/raw
+          .venv/bin/python tests/dashboard_test.py check $test
+          for step in convert maintain stray; do
+            as_root $step
+            .venv/bin/python tests/dashboard_test.py check $test
+          done
       - name: Sync
         run: tests/sync_test.sh
       - name: clang-tidy

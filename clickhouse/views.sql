@@ -1,12 +1,15 @@
--- install_clickhouse.sh replaces @WAREHOUSE@ and @RAW@ with absolute paths.
+-- install_clickhouse.sh replaces @RAW@ with an absolute path, and @TRAFFIC@
+-- with the Iceberg table: icebergLocal() over the warehouse folder, or the
+-- REST catalog's netmon_lake.`netmon.traffic`.
 -- The views read files as netmon_views (users.d/grafana.xml), so their
 -- readers need SELECT on netmon.* only.
 CREATE DATABASE IF NOT EXISTS netmon;
 
--- Hours the converter has loaded: the Iceberg table, at its latest snapshot.
+-- Hours the converter has loaded: the Iceberg table, at its current
+-- snapshot.
 CREATE OR REPLACE VIEW netmon.traffic
 DEFINER = netmon_views SQL SECURITY DEFINER AS
-SELECT * FROM icebergLocal('@WAREHOUSE@/netmon/traffic');
+SELECT * FROM @TRAFFIC@;
 
 -- The Iceberg table plus rows still only in raw files (the current hour and
 -- any the converter has not loaded yet), for dashboards that need recent
