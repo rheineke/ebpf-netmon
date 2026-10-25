@@ -6,6 +6,9 @@
 #
 # RAW defaults to /var/lib/netmon/raw. ClickHouse may read only under the
 # deepest folder holding both, so keep them together (e.g. on one share).
+# With scripts/install_rest_catalog.sh installed, ClickHouse reads the table
+# through that catalog; otherwise it reads the newest metadata file in
+# WAREHOUSE.
 #
 # ClickHouse releases need ARMv8.2 (Pi 5) and come from its apt repo. On
 # ARMv8.0 (Pi 4) they die with SIGILL, so this installs the nightly ARMv8.0
@@ -14,7 +17,7 @@
 set -eu
 
 if [ $# -lt 1 ] || [ $# -gt 2 ]; then
-  sed -n '2,13s/^# \{0,1\}//p' "$0" >&2
+  sed -n '2,16s/^# \{0,1\}//p' "$0" >&2
   exit 2
 fi
 warehouse=$(realpath "$1")
@@ -77,7 +80,26 @@ for _ in $(seq 30); do
   clickhouse-client -q 'SELECT 1' >/dev/null 2>&1 && break
   sleep 2
 done
-sed -e "s|@WAREHOUSE@|$warehouse|g" -e "s|@RAW@|$raw|g" clickhouse/views.sql \
+rest=/etc/default/netmon-iceberg-rest
+clickhouse-client -q 'DROP DATABASE IF EXISTS netmon_lake'
+if [ -f $rest ]; then
+  served=$(sudo sed -n 's/^WAREHOUSE=//p' $rest)
+  if [ "$served" != "$warehouse" ]; then
+    echo "the REST catalog serves $served, not $warehouse" >&2
+    exit 1
+  fi
+  echo "== Reading the table through the REST catalog"
+  # Only S3 needs credentials, but ClickHouse asks for them unless the engine
+  # has a second argument; for local files that is the format.
+  clickhouse-client --allow_database_iceberg=1 -q "
+    CREATE DATABASE netmon_lake
+    ENGINE = DataLakeCatalog('http://127.0.0.1:8181/v1', 'auto')
+    SETTINGS catalog_type = 'rest', warehouse = 'netmon'"
+  traffic="netmon_lake.\`netmon.traffic\`"
+else
+  traffic="icebergLocal('$warehouse/netmon/traffic')"
+fi
+sed -e "s|@TRAFFIC@|$traffic|g" -e "s|@RAW@|$raw|g" clickhouse/views.sql \
   | clickhouse-client --multiquery
 clickhouse-client --user grafana -q \
   'SELECT host, count() AS rows, max(ts) AS latest FROM netmon.traffic_live GROUP BY host'

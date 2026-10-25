@@ -212,6 +212,27 @@ date; to move back, remove `netmon.traffic` from it (for SQLite, move
 `pyproject.toml`, pinned in `uv.lock`.
 On a Pi 4, 1 MB of raw JSON became 108 KB of Parquet.
 
+### REST catalog
+
+ClickHouse can read the table through the catalog too, instead of taking
+the newest metadata file in the warehouse, which could be a stray one, say
+from a crashed or second writer. On the machine with ClickHouse and the
+PostgreSQL catalog:
+
+```sh
+scripts/install_rest_catalog.sh WAREHOUSE
+scripts/install_clickhouse.sh WAREHOUSE RAW
+```
+
+The first serves the catalog over the Iceberg REST protocol, on port 8181
+to this machine only, with Apache Iceberg's own server (from its
+`apache/iceberg-rest-fixture` image, checked by hash) and Debian's Java.
+It logs in to PostgreSQL as `netmon_rest`, which may only read, and can't
+write files. It uses about 200 MB of memory, and live queries take about
+0.2 s longer. To read the folder again, `systemctl disable --now
+netmon-iceberg-rest`, remove `/etc/default/netmon-iceberg-rest` and re-run
+`install_clickhouse.sh`.
+
 ## ClickHouse and Grafana
 
 On the machine that holds the warehouse:

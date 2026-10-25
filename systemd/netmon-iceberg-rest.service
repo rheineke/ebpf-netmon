@@ -1,0 +1,35 @@
+# Serves the PostgreSQL Iceberg catalog over the Iceberg REST protocol, for
+# ClickHouse. Install with scripts/install_rest_catalog.sh, which writes
+# WAREHOUSE, CATALOG_WAREHOUSE (its file:// URI) and netmon_rest's password
+# to /etc/default/netmon-iceberg-rest.
+[Unit]
+Description=netmon Iceberg REST catalog, read-only
+After=network-online.target remote-fs.target postgresql.service
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/default/netmon-iceberg-rest
+# The server reads CATALOG_* as catalog properties: CATALOG_JDBC_USER is
+# jdbc.user, CATALOG_REST_PORT rest.port.
+Environment=CATALOG_CATALOG_NAME=netmon
+Environment=CATALOG_URI=jdbc:postgresql://127.0.0.1:5432/netmon
+Environment=CATALOG_JDBC_USER=netmon_rest
+Environment=CATALOG_REST_PORT=8181
+ExecStart=/usr/bin/java -Xmx256m -cp /opt/netmon/iceberg-rest/iceberg-rest-adapter.jar:/usr/share/java/postgresql.jar org.apache.iceberg.rest.RESTCatalogServer
+Restart=on-failure
+RestartSec=10
+# It listens on every address and accepts writes, so: local traffic only,
+# and no file it can write (PostgreSQL refuses netmon_rest's writes too).
+IPAddressDeny=any
+IPAddressAllow=localhost
+# A named user: Hadoop's file access fails for a nameless DynamicUser where
+# nsswitch.conf lacks systemd.
+User=netmon-rest
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target
