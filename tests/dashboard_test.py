@@ -249,7 +249,8 @@ def check_alerts():
     import yaml
 
     path = ROOT / "grafana/provisioning/alerting/netmon-rules.yaml"
-    for rule in yaml.safe_load(path.read_text())["groups"][0]["rules"]:
+    groups = yaml.safe_load(path.read_text())["groups"]
+    for rule in (rule for group in groups for rule in group["rules"]):
         query_step, threshold = rule["data"]
         rows = query(query_step["model"]["rawSql"])
         title = rule["title"]
@@ -257,6 +258,11 @@ def check_alerts():
             check_eq(
                 f"{title}: hosts", sorted(r["host"] for r in rows), ["pi-a", "pi-b"]
             )
+            # Pending 8m at 2m a check: it fires on the 5th failed check.
+            group = next(g for g in groups if rule in g["rules"])
+            minutes = int(rule["for"].removesuffix("m"))
+            every = int(group["interval"].removesuffix("m"))
+            check_eq(f"{title}: checks before it fires", minutes // every + 1, 5)
         if rule["uid"] == "netmon-converter-behind":
             check_eq(f"{title}: rows", len(rows), 1)
         for row in rows:
