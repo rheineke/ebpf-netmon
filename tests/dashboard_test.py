@@ -7,7 +7,8 @@
   uv run tests/dashboard_test.py maintain DIR  # and again
 
 load writes four hours of known traffic from two hosts, ending in the
-current hour, to DIR/raw, and converts the first three into DIR/warehouse.
+current hour, to DIR/raw, converts the first three into DIR/warehouse,
+and then spoils one of them, which the live view must not open.
 check runs every panel of grafana/dashboards/netmon.json through
 clickhouse-client, as Grafana's user, with Grafana's macros filled in, and
 checks the totals, so the live view must add the last hour from the raw
@@ -75,6 +76,18 @@ def load(test_dir):
         if folder != "pi-a.bak":
             text += json.dumps(json.loads(text.splitlines()[0]) | {"pid": 999}) + "\n"
         copy.write_text(text)
+    # A file the converter ignores, which the live view must ignore too.
+    odd = path.parent / "notes.jsonl"
+    row = json.loads(path.read_text().splitlines()[0]) | {"pid": 998}
+    odd.write_text(json.dumps(row) + "\n")
+
+
+def spoil_converted(test_dir):
+    """Appends garbage to an hour already in Iceberg. The live view must skip
+    that file without opening it: over 100 bad lines would fail its query."""
+    path = test_dir / "raw" / "pi-a" / f"{START:%Y-%m-%d}" / f"{START:%H}.jsonl"
+    with open(path, "a") as f:
+        f.write("not json\n" * 200)
 
 
 def fill_macros(sql):
@@ -227,6 +240,7 @@ if __name__ == "__main__":
     START = dt.datetime.fromisoformat((test_dir / "start").read_text())
     if sys.argv[1] == "load":
         convert(test_dir, HOURS - 1)  # the last hour stays raw
+        spoil_converted(test_dir)
     elif sys.argv[1] == "convert":
         convert(test_dir, HOURS)
     elif sys.argv[1] == "maintain":
