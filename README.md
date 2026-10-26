@@ -263,11 +263,12 @@ admin/admin.
 ### Alerts
 
 `install_grafana.sh` also installs three alert rules, evaluated every
-minute, in `grafana/provisioning/alerting/netmon-rules.yaml`:
+minute ("Host stopped reporting" every 2), in
+`grafana/provisioning/alerting/netmon-rules.yaml`:
 
 | Rule | Fires when |
 |---|---|
-| Host stopped reporting | a host seen in the last 7 days has had no rows for 5 minutes |
+| Host stopped reporting | a host seen in the last 7 days has had no rows for 2 minutes at 5 checks in a row (about 10 minutes) |
 | Process moving over 10 MB/s | one process averages over 10 MB/s sent or received for 5 minutes |
 | Iceberg converter behind | the newest row in Iceberg is over 2 hours old |
 

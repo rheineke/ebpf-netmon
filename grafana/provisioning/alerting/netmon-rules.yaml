@@ -1,6 +1,7 @@
-# Alert rules over the netmon views, evaluated every minute. Each rule's
-# threshold is in its C step. Installed by scripts/install_grafana.sh; where
-# alerts go is set by scripts/configure_alert_email.sh.
+# Alert rules over the netmon views, evaluated every minute, or every 2
+# minutes for netmon-hosts. Each rule's threshold is in its C step.
+# Installed by scripts/install_grafana.sh; where alerts go is set by
+# scripts/configure_alert_email.sh.
 apiVersion: 1
 groups:
   - orgId: 1
@@ -8,39 +9,6 @@ groups:
     folder: netmon
     interval: 1m
     rules:
-      # Hosts seen in the last 7 days with no rows for 5 minutes: netmon, the
-      # sync or the NAS has stopped.
-      - uid: netmon-host-silent
-        title: Host stopped reporting
-        condition: C
-        for: 0s
-        noDataState: OK
-        execErrState: Error
-        annotations:
-          summary: "{{ $labels.host }} has sent no netmon rows for over 5 minutes"
-        data:
-          - refId: A
-            datasourceUid: netmon-clickhouse
-            relativeTimeRange: {from: 604800, to: 0}
-            model:
-              refId: A
-              editorType: sql
-              format: 1
-              queryType: table
-              rawSql: |-
-                SELECT host, dateDiff('second', max(ts), now()) AS seconds_silent
-                FROM netmon.traffic_live
-                WHERE ts >= now() - INTERVAL 7 DAY
-                GROUP BY host
-          - refId: C
-            datasourceUid: __expr__
-            model:
-              refId: C
-              type: threshold
-              expression: A
-              conditions:
-                - evaluator: {type: gt, params: [300]}
-
       # One process sending or receiving over 10 MB/s, averaged over 5
       # minutes ending a minute ago, as the last minute may not be synced yet.
       - uid: netmon-high-traffic
@@ -107,3 +75,41 @@ groups:
               expression: A
               conditions:
                 - evaluator: {type: gt, params: [7200]}
+  - orgId: 1
+    name: netmon-hosts
+    folder: netmon
+    interval: 2m
+    rules:
+      # Hosts seen in the last 7 days with no rows for 2 minutes at 5 checks
+      # in a row, so about 10 minutes: netmon, the sync or the NAS has
+      # stopped. It fires on the 5th check, 8 minutes after the 1st.
+      - uid: netmon-host-silent
+        title: Host stopped reporting
+        condition: C
+        for: 8m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "{{ $labels.host }} has sent no netmon rows for about 10 minutes"
+        data:
+          - refId: A
+            datasourceUid: netmon-clickhouse
+            relativeTimeRange: {from: 604800, to: 0}
+            model:
+              refId: A
+              editorType: sql
+              format: 1
+              queryType: table
+              rawSql: |-
+                SELECT host, dateDiff('second', max(ts), now()) AS seconds_silent
+                FROM netmon.traffic_live
+                WHERE ts >= now() - INTERVAL 7 DAY
+                GROUP BY host
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [120]}
