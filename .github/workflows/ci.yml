@@ -90,7 +90,8 @@ jobs:
           added=$(sudo journalctl -u netmon-iceberg.service -o cat \
             | sed -n '/^added /{s/^added \([0-9]*\) rows.*/\1/p;q;}')
           [ "${added:-0}" -gt 0 ] || fail "the netmon run loaded nothing"
-          echo $(($(cat $test/iceberg_rows) + added)) | sudo tee $test/iceberg_rows
+          rows=$(($(cat $test/iceberg_rows) + added))  # before tee empties the file
+          echo "$rows" | sudo tee $test/iceberg_rows
           .venv/bin/python tests/dashboard_test.py check $test
           sudo systemctl start netmon-iceberg-maintain.service
           .venv/bin/python tests/dashboard_test.py check $test

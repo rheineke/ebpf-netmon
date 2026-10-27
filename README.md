@@ -190,11 +190,11 @@ scripts/install_sync.sh /mnt/nas/netmon/raw
 The installers pause their timers, let a run in progress finish, and hand
 the folders to `netmon` while root still can: on local disk, or before the
 NAS squashes root. They stop if `netmon` doesn't then own everything in
-them, and the timers stay off, even across a reboot, until a re-run gets
-past that. To move an existing setup with a PostgreSQL catalog, first
-re-run `scripts/install_postgres.sh`, so that only `netmon` can log in to
-it. Then re-run the other installers, check the jobs run, and turn on root
-squash.
+them. The timers stay off, even across a reboot, until an installer gets
+to its end, where it starts them again. To move an existing setup with a
+PostgreSQL catalog, first re-run `scripts/install_postgres.sh`, so that
+only `netmon` can log in to it. Then re-run the other installers, check
+the jobs run, and turn on root squash.
 
 ### Maintenance
 
