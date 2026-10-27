@@ -178,17 +178,22 @@ create (`scripts/add_netmon_user.sh`). It only needs to read
 `/var/lib/netmon/raw` and write the shared folders, so neither job holds
 root on the NAS. Have the NAS map root to a guest (root squash, e.g.
 Synology's "Map root to guest"), and give `netmon` the uid of a NAS user
-that owns the share and has no admin rights:
+that owns the share and has no admin rights. Every installer that creates
+`netmon` takes it (the sync, the converter and PostgreSQL), and stops if
+`netmon` already has another uid, so set it for each:
 
 ```sh
-NETMON_UID=1234 scripts/install_sync.sh /mnt/nas/netmon/raw
+export NETMON_UID=1234
+scripts/install_sync.sh /mnt/nas/netmon/raw
 ```
 
-The installers hand the folders to `netmon` while root still can: on local
-disk, or before the NAS squashes root. To move an existing setup, re-run
-the installers (and `scripts/install_postgres.sh` for a PostgreSQL
-catalog, so `netmon` can log in to it), check the jobs run, then turn on
-root squash.
+The installers pause their timers, let a run in progress finish, and hand
+the folders to `netmon` while root still can: on local disk, or before the
+NAS squashes root. They stop if `netmon` doesn't then own everything in
+them, and the paused timers stay off until a re-run succeeds. To move an
+existing setup, re-run the installers (and `scripts/install_postgres.sh`
+for a PostgreSQL catalog, so that only `netmon` can log in to it), check
+the jobs run, then turn on root squash.
 
 ### Maintenance
 

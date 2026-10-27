@@ -15,18 +15,15 @@ fi
 dest=$(realpath "$1")/$(hostname)
 cd "$(dirname "$0")/.."
 
-# The sync runs as netmon, which must be able to write DEST. Root
-# can hand it over on local disk or a share without root squash; on a
-# root-squashed share, the NAS user with netmon's uid must own it already
-# (README.md).
-scripts/add_netmon_user.sh
-sudo install -d -o netmon -g users "$dest" 2>/dev/null \
-  || sudo -u netmon mkdir -p "$dest"
-sudo chown -R netmon:users "$dest" 2>/dev/null || true
-if ! sudo -u netmon test -w "$dest"; then
-  echo "netmon (uid $(id -u netmon)) can't write $dest; see README.md" >&2
-  exit 1
-fi
+# The sync runs as netmon, which must own DEST (README.md). Pause it, and
+# let a copy in progress finish, so nothing writes there as root during the
+# handover; the timer starts again below.
+sudo systemctl stop netmon-sync.timer 2>/dev/null || true
+while systemctl show -p ActiveState --value netmon-sync.service \
+  | grep -qxE 'activating|deactivating'; do
+  sleep 1
+done
+scripts/add_netmon_user.sh "$dest"
 
 sudo apt-get install -y --no-install-recommends rsync
 echo "DEST=$dest" | sudo tee /etc/default/netmon-sync >/dev/null

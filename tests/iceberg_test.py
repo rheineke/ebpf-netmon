@@ -89,7 +89,7 @@ def check(name, got, want):
 
 
 def unit_settings(name):
-    """The [Service] settings of systemd/NAME.service, as {key: [values]}."""
+    """The settings of systemd/NAME.service, as {key: [values]}."""
     settings = {}
     path = TOOLS.parent / "systemd" / f"{name}.service"
     for line in path.read_text().splitlines():
