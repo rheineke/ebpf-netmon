@@ -94,8 +94,9 @@ ARROW_SCHEMA = pa.schema(
 )
 
 
-LOCK = "/run/netmon-iceberg.lock"  # in /run, which only root can write
-MARKER = "/var/lib/netmon/iceberg-run.json"  # local, and kept across reboots
+# The services own these directories (RuntimeDirectory and StateDirectory).
+LOCK = "/run/netmon-iceberg/lock"  # only its user (or root) can write there
+MARKER = "/var/lib/netmon-iceberg/iceberg-run.json"  # local, kept across reboots
 COMPACT_MAX_ROWS = 1_000_000  # bigger days stay as they are, to bound memory
 # NNNNN-UUID.metadata.json, numbered from 00000 by each commit.
 METADATA_NAME = re.compile(r"(\d+)-.+\.metadata\.json")
@@ -506,6 +507,7 @@ def main():
         help=f"where a run notes it is going, on local disk (default {MARKER})",
     )
     args = parser.parse_args()
+    Path(args.lock).parent.mkdir(parents=True, exist_ok=True)
     lock = open(args.lock, "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)

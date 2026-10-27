@@ -171,6 +171,31 @@ is unmounted the sync and the converter skip their runs, and the next sync
 catches up. Each row carries the host name it was captured under, so
 renaming a Pi starts a new host in the table.
 
+### Running without root
+
+The sync and the converter run as the user `netmon`, which the installers
+create (`scripts/add_netmon_user.sh`). It only needs to read
+`/var/lib/netmon/raw` and write the shared folders, so neither job holds
+root on the NAS. Have the NAS map root to a guest (root squash, e.g.
+Synology's "Map root to guest"), and give `netmon` the uid of a NAS user
+that owns the share and has no admin rights. Every installer that creates
+`netmon` takes it (the sync, the converter and PostgreSQL), and stops if
+`netmon` already has another uid, so set it for each:
+
+```sh
+export NETMON_UID=1234
+scripts/install_sync.sh /mnt/nas/netmon/raw
+```
+
+The installers pause their timers, let a run in progress finish, and hand
+the folders to `netmon` while root still can: on local disk, or before the
+NAS squashes root. They stop if `netmon` doesn't then own everything in
+them. The timers stay off, even across a reboot, until an installer gets
+to its end, where it starts them again. To move an existing setup with a
+PostgreSQL catalog, first re-run `scripts/install_postgres.sh`, so that
+only `netmon` can log in to it. Then re-run the other installers, check
+the jobs run, and turn on root squash.
+
 ### Maintenance
 
 Each load commits a snapshot, which keeps the table's past versions for

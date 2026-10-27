@@ -10,11 +10,12 @@
 # them to. CATALOG is a SQLAlchemy URI for the catalog (see
 # scripts/install_postgres.sh), and '' is a SQLite file in WAREHOUSE. Left
 # out, RAW and CATALOG stay as installed. Run one converter per warehouse.
-# Re-run to upgrade or move it.
+# Re-run to upgrade or move it. NETMON_PYTHON is the Python 3.13 or later
+# to use, by default /usr/bin/python3.
 set -eu
 
 if [ $# -lt 1 ] || [ $# -gt 3 ]; then
-  sed -n '2,13s/^# \{0,1\}//p' "$0" >&2
+  sed -n '2,14s/^# \{0,1\}//p' "$0" >&2
   exit 2
 fi
 installed() { sed -n "s/^$1=//p" /etc/default/netmon-iceberg 2>/dev/null || true; }
@@ -31,10 +32,40 @@ else
   catalog=$(installed CATALOG)
 fi
 echo "== RAW=$raw CATALOG=${catalog:-(SQLite in WAREHOUSE)}"
+
+# The converter runs as netmon, which must own WAREHOUSE (README.md). Pause
+# loads and maintenance, even across a reboot, and let a run in progress
+# finish, so nothing writes there as root during the handover; the timers
+# start again below.
+units="netmon-iceberg netmon-iceberg-maintain"
+for unit in $units; do
+  sudo systemctl disable --now "$unit.timer" 2>/dev/null || true
+done
+for unit in $units; do
+  while systemctl show -p ActiveState --value "$unit.service" \
+    | grep -qxE 'activating|deactivating'; do
+    echo "waiting for $unit.service to finish"
+    sleep 10
+  done
+done
+"$(dirname "$0")/add_netmon_user.sh" "$warehouse"
+if ! sudo -u netmon test -r "$raw" -a -x "$raw"; then
+  echo "netmon (uid $(id -u netmon)) can't read $raw" >&2
+  exit 1
+fi
+# Earlier versions ran as root, with the lock in /run and the run marker in
+# /var/lib/netmon.
+sudo rm -f /run/netmon-iceberg.lock
+old_marker=/var/lib/netmon/iceberg-run.json
+if sudo test -f $old_marker; then
+  sudo install -d -o netmon -g users /var/lib/netmon-iceberg
+  sudo install -o netmon -g users -m 644 $old_marker /var/lib/netmon-iceberg/
+  sudo rm $old_marker
+fi
 cd "$(dirname "$0")/.."
 
 uv_version=0.13.5
-if ! uv --version 2>/dev/null | grep -q "^uv $uv_version"; then
+if ! /usr/local/bin/uv --version 2>/dev/null | grep -q "^uv $uv_version"; then
   echo "== Installing uv $uv_version to /usr/local/bin"
   tarball=uv-$(uname -m)-unknown-linux-gnu.tar.gz
   tmp=$(mktemp -d)
@@ -48,10 +79,11 @@ if ! uv --version 2>/dev/null | grep -q "^uv $uv_version"; then
 fi
 
 echo "== Installing Python packages from uv.lock in /opt/netmon/venv"
-# The system Python, so apt keeps it patched.
+# The system Python, so apt keeps it patched. Compiled now, as netmon can't
+# write the bytecode later.
 sudo UV_PROJECT_ENVIRONMENT=/opt/netmon/venv UV_PYTHON_DOWNLOADS=never \
   /usr/local/bin/uv sync --locked --no-dev --no-install-project \
-  --python /usr/bin/python3
+  --compile-bytecode --python "${NETMON_PYTHON:-/usr/bin/python3}"
 sudo install -m 644 tools/to_iceberg.py /opt/netmon/to_iceberg.py
 
 echo "== Installing the hourly and weekly (maintenance) timers"

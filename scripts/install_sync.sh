@@ -15,6 +15,17 @@ fi
 dest=$(realpath "$1")/$(hostname)
 cd "$(dirname "$0")/.."
 
+# The sync runs as netmon, which must own DEST (README.md). Pause it, even
+# across a reboot, and let a copy in progress finish, so nothing writes
+# there as root during the handover; the timer starts again below.
+sudo systemctl disable --now netmon-sync.timer 2>/dev/null || true
+while systemctl show -p ActiveState --value netmon-sync.service \
+  | grep -qxE 'activating|deactivating'; do
+  echo "waiting for netmon-sync.service to finish"
+  sleep 2
+done
+scripts/add_netmon_user.sh "$dest"
+
 sudo apt-get install -y --no-install-recommends rsync
 echo "DEST=$dest" | sudo tee /etc/default/netmon-sync >/dev/null
 sudo install -m 644 systemd/netmon-sync.service systemd/netmon-sync.timer \

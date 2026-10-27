@@ -6,7 +6,8 @@
 #
 # Creates the role and database netmon, reachable only over the local Unix
 # socket and with no password: peer authentication lets OS_USER (default
-# root, which the converter runs as) log in as netmon. Then point the
+# netmon, which the converter runs as), and no other user, log in as netmon.
+# Re-running with another OS_USER replaces the earlier one. Then point the
 # converter at it; the first run adopts the table already in the warehouse:
 #
 #   scripts/install_converter.sh WAREHOUSE RAW \
@@ -14,10 +15,14 @@
 set -eu
 
 if [ $# -gt 1 ]; then
-  sed -n '2,13s/^# \{0,1\}//p' "$0" >&2
+  sed -n '2,14s/^# \{0,1\}//p' "$0" >&2
   exit 2
 fi
-os_user=${1:-root}
+os_user=${1:-netmon}
+cd "$(dirname "$0")/.."
+if [ "$os_user" = netmon ]; then
+  scripts/add_netmon_user.sh
+fi
 
 echo "== Installing PostgreSQL"
 sudo apt-get update -qq
@@ -27,9 +32,10 @@ version=$(pg_lsclusters -h | awk '$2 == "main" { print $1; exit }')
 conf=/etc/postgresql/$version/main
 
 echo "== Letting $os_user log in as netmon over the Unix socket"
-ident="netmon $os_user netmon"
-sudo grep -qxF "$ident" "$conf/pg_ident.conf" \
-  || echo "$ident" | sudo tee -a "$conf/pg_ident.conf" >/dev/null
+# Only OS_USER: drop the map's other lines, such as root's from before the
+# converter ran as netmon.
+sudo sed -i '/^netmon[[:space:]]/d' "$conf/pg_ident.conf"
+echo "netmon $os_user netmon" | sudo tee -a "$conf/pg_ident.conf" >/dev/null
 # The first matching line wins, so it goes above Debian's defaults.
 hba="local netmon netmon peer map=netmon"
 sudo grep -qxF "$hba" "$conf/pg_hba.conf" \
