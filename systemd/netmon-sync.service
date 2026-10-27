@@ -1,7 +1,8 @@
 # Copies /var/lib/netmon/raw to DEST, e.g. a NAS folder for this host, where
 # a converter loads it. Install with scripts/install_sync.sh, which writes
 # DEST to /etc/default/netmon-sync. rsync renames each file into place once
-# it is whole, and never deletes from DEST.
+# it is whole, and never deletes from DEST. Runs as netmon
+# (scripts/add_netmon_user.sh), so DEST must be writable by that user.
 [Unit]
 Description=Copy netmon raw files to shared storage
 After=network-online.target remote-fs.target
@@ -9,6 +10,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+User=netmon
 EnvironmentFile=/etc/default/netmon-sync
 ExecStart=/usr/bin/rsync -rt --mkpath --chmod=D755,F644 /var/lib/netmon/raw/ ${DEST}/
 NoNewPrivileges=yes

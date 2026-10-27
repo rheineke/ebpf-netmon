@@ -6,7 +6,7 @@
 #
 # Creates the role and database netmon, reachable only over the local Unix
 # socket and with no password: peer authentication lets OS_USER (default
-# root, which the converter runs as) log in as netmon. Then point the
+# netmon, which the converter runs as) log in as netmon. Then point the
 # converter at it; the first run adopts the table already in the warehouse:
 #
 #   scripts/install_converter.sh WAREHOUSE RAW \
@@ -17,7 +17,11 @@ if [ $# -gt 1 ]; then
   sed -n '2,13s/^# \{0,1\}//p' "$0" >&2
   exit 2
 fi
-os_user=${1:-root}
+os_user=${1:-netmon}
+cd "$(dirname "$0")/.."
+if [ "$os_user" = netmon ]; then
+  scripts/add_netmon_user.sh
+fi
 
 echo "== Installing PostgreSQL"
 sudo apt-get update -qq

@@ -31,6 +31,30 @@ else
   catalog=$(installed CATALOG)
 fi
 echo "== RAW=$raw CATALOG=${catalog:-(SQLite in WAREHOUSE)}"
+
+# The converter runs as netmon, which must be able to write WAREHOUSE. Root
+# can hand it over on local disk or a share without root squash; on a
+# root-squashed share, the NAS user with netmon's uid must own it already
+# (README.md).
+"$(dirname "$0")/add_netmon_user.sh"
+sudo install -d -o netmon -g users "$warehouse" 2>/dev/null \
+  || sudo -u netmon mkdir -p "$warehouse"
+sudo chown -R netmon:users "$warehouse" 2>/dev/null || true
+if ! sudo -u netmon test -w "$warehouse"; then
+  echo "netmon (uid $(id -u netmon)) can't write $warehouse; see README.md" >&2
+  exit 1
+fi
+if ! sudo -u netmon test -r "$raw" -a -x "$raw"; then
+  echo "netmon (uid $(id -u netmon)) can't read $raw" >&2
+  exit 1
+fi
+# Earlier versions ran as root and kept the run marker in /var/lib/netmon.
+old_marker=/var/lib/netmon/iceberg-run.json
+if sudo test -f $old_marker; then
+  sudo install -d -o netmon -g users /var/lib/netmon-iceberg
+  sudo install -o netmon -g users -m 644 $old_marker /var/lib/netmon-iceberg/
+  sudo rm $old_marker
+fi
 cd "$(dirname "$0")/.."
 
 uv_version=0.13.5
