@@ -8,8 +8,9 @@
   uv run tests/dashboard_test.py stray DIR     # REST catalog only; again
 
 load writes four hours of known traffic from two hosts, ending in the
-current hour, to DIR/raw, converts the first three into DIR/warehouse,
-and then spoils one of them, which the live view must not open.
+last finished hour, to DIR/raw, converts the first three into
+DIR/warehouse, and then spoils one of them, which the live view must not
+open. The converter's own next run would load the fourth.
 check runs every panel of grafana/dashboards/netmon.json through
 clickhouse-client, as Grafana's user, with Grafana's macros filled in, and
 checks the totals, so the live view must add the last hour from the raw
@@ -74,7 +75,7 @@ def load(test_dir):
         except NoSuchTableError:
             pass
     this_hour = dt.datetime.now(dt.UTC).replace(minute=0, second=0, microsecond=0)
-    start = this_hour - dt.timedelta(hours=HOURS - 1)
+    start = this_hour - dt.timedelta(hours=HOURS)
     test_dir.mkdir(parents=True, exist_ok=True)
     (test_dir / "start").write_text(start.isoformat())
     for host in ("pi-a", "pi-b"):

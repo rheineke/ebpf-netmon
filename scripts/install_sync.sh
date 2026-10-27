@@ -15,13 +15,14 @@ fi
 dest=$(realpath "$1")/$(hostname)
 cd "$(dirname "$0")/.."
 
-# The sync runs as netmon, which must own DEST (README.md). Pause it, and
-# let a copy in progress finish, so nothing writes there as root during the
-# handover; the timer starts again below.
-sudo systemctl stop netmon-sync.timer 2>/dev/null || true
+# The sync runs as netmon, which must own DEST (README.md). Pause it, even
+# across a reboot, and let a copy in progress finish, so nothing writes
+# there as root during the handover; the timer starts again below.
+sudo systemctl disable --now netmon-sync.timer 2>/dev/null || true
 while systemctl show -p ActiveState --value netmon-sync.service \
   | grep -qxE 'activating|deactivating'; do
-  sleep 1
+  echo "waiting for netmon-sync.service to finish"
+  sleep 2
 done
 scripts/add_netmon_user.sh "$dest"
 

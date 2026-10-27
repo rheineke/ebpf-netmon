@@ -70,8 +70,9 @@ if NETMON_UID=4321 scripts/install_sync.sh "$share" >/dev/null 2>&1; then
   exit 1
 fi
 sudo chattr -i "$dest/stuck"
-if systemctl is-active --quiet netmon-sync.timer; then
-  echo "FAIL: the timer runs on after a failed handover" >&2
+if systemctl is-active --quiet netmon-sync.timer \
+  || systemctl is-enabled --quiet netmon-sync.timer; then
+  echo "FAIL: the timer runs on, or would at boot, after a failed handover" >&2
   exit 1
 fi
 echo "ok  : stops for a file netmon doesn't own"

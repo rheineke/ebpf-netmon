@@ -62,13 +62,12 @@ jobs:
           scripts/install_rest_catalog.sh $test/warehouse
           scripts/install_clickhouse.sh $test/warehouse $test/raw
           .venv/bin/python tests/dashboard_test.py check $test
-          for step in convert maintain stray; do
-            as_root $step
-            .venv/bin/python tests/dashboard_test.py check $test
-          done
+          # The next step loads the last hour, as netmon.
+          as_root maintain
+          .venv/bin/python tests/dashboard_test.py check $test
       # The installer and units as a Pi runs them, on the REST step's
-      # warehouse and catalog, which root wrote: the handover, and loads and
-      # maintenance as netmon.
+      # warehouse and catalog, which root wrote: the handover, then a load
+      # (the last hour) and maintenance as netmon.
       - name: Converter as netmon
         env:
           NETMON_TEST_CATALOG: postgresql+psycopg2://netmon@/netmon?host=/var/run/postgresql
@@ -87,14 +86,24 @@ jobs:
           sudo test ! -e /var/lib/netmon/iceberg-run.json || fail "old marker left"
           [ "$(systemctl show -p User --value netmon-iceberg.service)" = netmon ] \
             || fail "the converter doesn't run as netmon"
+          # The installer's run, the first; the timer's may follow.
+          added=$(sudo journalctl -u netmon-iceberg.service -o cat \
+            | sed -n '/^added /{s/^added \([0-9]*\) rows.*/\1/p;q;}')
+          [ "${added:-0}" -gt 0 ] || fail "the netmon run loaded nothing"
+          echo $(($(cat $test/iceberg_rows) + added)) | sudo tee $test/iceberg_rows
           .venv/bin/python tests/dashboard_test.py check $test
           sudo systemctl start netmon-iceberg-maintain.service
           .venv/bin/python tests/dashboard_test.py check $test
           [ -z "$(sudo find $test/warehouse ! -user netmon)" ] \
             || fail "files in the warehouse not owned by netmon"
-          ! sudo psql -U netmon -d netmon -c 'SELECT 1' 2>/dev/null \
-            || fail "root can still log in to the catalog"
-          echo PASS
+          out=$(sudo psql -U netmon -d netmon -c 'SELECT 1' 2>&1 || true)
+          case $out in
+            *"Peer authentication failed"*) ;;
+            *) fail "root can still log in to the catalog: $out" ;;
+          esac
+          # Last, as the converter refuses a newer stray metadata file.
+          sudo .venv/bin/python tests/dashboard_test.py stray $test
+          .venv/bin/python tests/dashboard_test.py check $test
       - name: Sync
         run: tests/sync_test.sh
       - name: clang-tidy

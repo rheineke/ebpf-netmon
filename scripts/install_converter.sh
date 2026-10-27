@@ -34,11 +34,12 @@ fi
 echo "== RAW=$raw CATALOG=${catalog:-(SQLite in WAREHOUSE)}"
 
 # The converter runs as netmon, which must own WAREHOUSE (README.md). Pause
-# loads and maintenance, and let a run in progress finish, so nothing writes
-# there as root during the handover; the timers start again below.
+# loads and maintenance, even across a reboot, and let a run in progress
+# finish, so nothing writes there as root during the handover; the timers
+# start again below.
 units="netmon-iceberg netmon-iceberg-maintain"
 for unit in $units; do
-  sudo systemctl stop "$unit.timer" 2>/dev/null || true
+  sudo systemctl disable --now "$unit.timer" 2>/dev/null || true
 done
 for unit in $units; do
   while systemctl show -p ActiveState --value "$unit.service" \
