@@ -293,7 +293,7 @@ minute ("Host stopped reporting" every 2), in
 
 | Rule | Fires when |
 |---|---|
-| Host stopped reporting | a host seen in the last 7 days has had no rows for 2 minutes at 5 checks in a row (about 10 minutes) |
+| Host stopped reporting | a host seen in the last day has had no rows for 2 minutes at 5 checks in a row (about 10 minutes) |
 | Process moving over 10 MB/s | one process averages over 10 MB/s sent or received for 5 minutes |
 | Iceberg converter behind | the newest row in Iceberg is over 2 hours old |
 
@@ -306,7 +306,7 @@ scripts/configure_alert_email.sh
 It asks for the address and an SMTP login (for Gmail, an app password)
 and stores them in `/etc/grafana/netmon-alerts.env`, readable only by root
 and Grafana. Renaming a host makes its old name fire "Host stopped
-reporting" until 7 days after its last row, when the alert resolves; so
+reporting" until a day after its last row, when the alert resolves; so
 does a host that stays down that long.
 
 ClickHouse releases need ARMv8.2 (Pi 5) and die with "Illegal instruction"

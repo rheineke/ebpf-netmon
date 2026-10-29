@@ -80,9 +80,10 @@ groups:
     folder: netmon
     interval: 2m
     rules:
-      # Hosts seen in the last 7 days with no rows for 2 minutes at 5 checks
-      # in a row, so about 10 minutes: netmon, the sync or the NAS has
-      # stopped. It fires on the 5th check, 8 minutes after the 1st.
+      # Hosts seen in the last day with no rows for 2 minutes at 5 checks in
+      # a row, so about 10 minutes: netmon, the sync or the NAS has stopped.
+      # It fires on the 5th check, 8 minutes after the 1st. A host gone for
+      # a day (e.g. renamed) drops out, so its alert resolves.
       - uid: netmon-host-silent
         title: Host stopped reporting
         condition: C
@@ -94,7 +95,7 @@ groups:
         data:
           - refId: A
             datasourceUid: netmon-clickhouse
-            relativeTimeRange: {from: 604800, to: 0}
+            relativeTimeRange: {from: 86400, to: 0}
             model:
               refId: A
               editorType: sql
@@ -103,7 +104,7 @@ groups:
               rawSql: |-
                 SELECT host, dateDiff('second', max(ts), now()) AS seconds_silent
                 FROM netmon.traffic_live
-                WHERE ts >= now() - INTERVAL 7 DAY
+                WHERE ts >= now() - INTERVAL 1 DAY
                 GROUP BY host
           - refId: C
             datasourceUid: __expr__
