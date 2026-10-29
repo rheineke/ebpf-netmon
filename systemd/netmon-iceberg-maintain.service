@@ -8,6 +8,13 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+# Not root (scripts/add_netmon_user.sh). The lock in /run and the run marker
+# in /var/lib live in directories systemd makes for this user; the lock's
+# outlives each run, since loads and maintenance share it.
+User=netmon
+RuntimeDirectory=netmon-iceberg
+RuntimeDirectoryPreserve=yes
+StateDirectory=netmon-iceberg
 EnvironmentFile=/etc/default/netmon-iceberg
 ExecStart=/opt/netmon/venv/bin/python /opt/netmon/to_iceberg.py --maintain --warehouse ${WAREHOUSE} --catalog ${CATALOG}
 NoNewPrivileges=yes

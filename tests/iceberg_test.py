@@ -88,7 +88,43 @@ def check(name, got, want):
     print(f"ok  : {name}")
 
 
+def unit_settings(name):
+    """The settings of systemd/NAME.service, as {key: [values]}."""
+    settings = {}
+    path = TOOLS.parent / "systemd" / f"{name}.service"
+    for line in path.read_text().splitlines():
+        key, sep, value = line.partition("=")
+        if sep and not line.startswith("#"):
+            settings.setdefault(key, []).append(value)
+    return settings
+
+
+def check_units():
+    """The services run as netmon, in the directories the converter expects."""
+    for name in ("netmon-sync", "netmon-iceberg", "netmon-iceberg-maintain"):
+        check(f"{name} runs as netmon", unit_settings(name)["User"], ["netmon"])
+    for name in ("netmon-iceberg", "netmon-iceberg-maintain"):
+        unit = unit_settings(name)
+        check(
+            f"{name} owns the lock's directory, and keeps it between runs",
+            (unit["RuntimeDirectory"], unit["RuntimeDirectoryPreserve"]),
+            ([Path(to_iceberg.LOCK).parent.name], ["yes"]),
+        )
+        check(
+            f"{name} owns the run marker's directory",
+            unit["StateDirectory"],
+            [Path(to_iceberg.MARKER).parent.name],
+        )
+    check("the lock is in /run", Path(to_iceberg.LOCK).parent.parent, Path("/run"))
+    check(
+        "the run marker is in /var/lib",
+        Path(to_iceberg.MARKER).parent.parent,
+        Path("/var/lib"),
+    )
+
+
 def main():
+    check_units()
     with tempfile.TemporaryDirectory() as tmp:
         raw, warehouse = Path(tmp) / "raw", Path(tmp) / "warehouse"
         h10 = NOW.replace(hour=10, minute=0)
@@ -407,8 +443,10 @@ def main():
         check("and leaves no run marker", marker.exists(), False)
 
         env = os.environ | {"PYTHONPATH": str(TOOLS)}
+        new_lock = Path(tmp) / "run" / "lock"  # a directory not made yet
         stopped = subprocess.run(
-            [sys.executable, "-c", STOPS, *run, "--catalog", uri],
+            [sys.executable, "-c", STOPS, *run, "--catalog", uri]
+            + ["--lock", str(new_lock)],
             env=env,
             capture_output=True,
         )
@@ -417,6 +455,7 @@ def main():
             (stopped.returncode, marker.exists()),
             (3, True),
         )
+        check("a run makes its lock's directory", new_lock.exists(), True)
         current = to_iceberg.newest_metadata(warehouse)
         failed.write_text(current.read_text())  # as if its commit failed
         check(
