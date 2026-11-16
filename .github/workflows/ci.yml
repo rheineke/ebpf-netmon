@@ -156,7 +156,7 @@ jobs:
       # matches a normal Pi login.
       - name: Build script
         run: |
-          docker run --rm --privileged -v "$PWD":/repo debian:trixie sh -c '
+          docker run --rm --privileged --pid=host -v "$PWD":/repo debian:trixie sh -c '
             apt-get update -qq && apt-get install -y -qq sudo >/dev/null &&
             useradd -m pi && echo "pi ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/pi &&
             cp -r /repo /home/pi/ebpf-netmon && chown -R pi /home/pi/ebpf-netmon &&

@@ -232,8 +232,6 @@ def check_counts(rows, results):
         if not ok:
             print(f"      moved {expect}")
             failed.append(name)
-    if not any(row["pid"] == pid for row in rows for pid, _ in results.values()):
-        print("netmon has no rows for these pids; run with --pid=host")
     return failed
 
 
@@ -275,7 +273,15 @@ def mount_tracefs():
         subprocess.run(["mount", "-t", "tracefs", "nodev", tracing], check=True)
 
 
+def check_pid_namespace():
+    """netmon reports pids as the host sees them, so must this test."""
+    proc_pid_init_ino = 0xEFFFFFFC
+    if os.stat("/proc/self/ns/pid").st_ino != proc_pid_init_ino:
+        sys.exit("FAIL: in a pid namespace of its own; use docker run --pid=host")
+
+
 def main():
+    check_pid_namespace()
     mount_tracefs()
     netmon = subprocess.Popen(
         ["netmon", "-j", "-n", "0", "-i", "1"], stdout=subprocess.PIPE, text=True
