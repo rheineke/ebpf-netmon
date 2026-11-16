@@ -2,6 +2,9 @@
 // offsets into the sock tracepoints' records.
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -85,8 +88,31 @@ void test_check_format()
 	check(check_format(missing, kExpected).find("no field flags") !=
 		      std::string::npos,
 	      "a missing field is reported");
-	check(tracefs_missing(kNoTracefs) && !tracefs_missing(problem),
-	      "tells a missing tracefs from a different layout");
+}
+
+void test_check_tracepoint()
+{
+	char tmpl[] = "/tmp/tracefs_test.XXXXXX";
+	const char *made = mkdtemp(tmpl);
+	if (!made) {
+		check(false, "mkdtemp");
+		return;
+	}
+	std::filesystem::path root(made);
+	std::filesystem::create_directories(root /
+					    "events/sock/sock_recv_length");
+	std::ofstream(root / "events/sock/sock_recv_length/format") << kFormat;
+
+	check(check_tracepoint(root, "sock", "sock_recv_length", kExpected)
+		      .empty(),
+	      "reads the format file under the tracefs root");
+	check(check_tracepoint("", "sock", "sock_recv_length", kExpected)
+			      .find("not mounted") != std::string::npos,
+	      "says when tracefs isn't mounted");
+	check(check_tracepoint(root, "sock", "sock_send_length", kExpected)
+			      .find("needs Linux 6.3") != std::string::npos,
+	      "says when the kernel lacks the tracepoint");
+	std::filesystem::remove_all(root);
 }
 
 }  // namespace
@@ -95,6 +121,7 @@ int main()
 {
 	test_parse_line();
 	test_check_format();
+	test_check_tracepoint();
 	if (failures)
 		std::printf("%d failed\n", failures);
 	return failures ? 1 : 0;

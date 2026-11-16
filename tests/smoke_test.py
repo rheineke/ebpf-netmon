@@ -4,16 +4,18 @@ Needs root, a kernel that allows kprobes and tracepoints, and the host's
 pids, as netmon reports them: docker run --privileged --pid=host.
 
 Each scenario runs in a process of its own and returns the bytes it moved,
-and netmon's rows for that pid must match them exactly. The scenarios are
-the ways a probe can miscount: reads that sleep part way (MSG_WAITALL),
-peeks, an IPv6 socket sending to an IPv4 address, and many threads blocked
-in the kernel while others move data.
+and netmon's TCP and UDP counts for that pid must match them exactly. The
+scenarios are the ways a probe can miscount: reads that sleep part way
+(MSG_WAITALL), peeks, an IPv6 socket sending to an IPv4 address, splice(),
+MPTCP, and many threads blocked in the kernel while others move data.
+netmon mounts tracefs itself in a container, so this test doesn't.
 """
 
 import ctypes
 import glob
 import json
 import os
+import platform
 import socket
 import subprocess
 import sys
@@ -21,8 +23,10 @@ import tempfile
 import threading
 import time
 
-COUNTERS = ("tcp_tx", "tcp_rx", "udp_tx", "udp_rx", "nfs_read", "nfs_write")
-PARKED = 12  # more blocked threads than a kretprobe tracks on 4 cores (10)
+# Not the NFS counters: tests/nfs_test.py checks those, and a clone on NFS
+# reads this script over NFS.
+COUNTERS = ("tcp_tx", "tcp_rx", "udp_tx", "udp_rx")
+PARKED = 12  # threads blocked in the kernel at once
 ODD_NAME = 'q"b\\\x01z'  # a process name with every byte JSON must escape
 SCENARIOS = {}
 
@@ -153,7 +157,8 @@ def udp_v4_mapped():
 @scenario
 def busy_neighbour():
     """Another process holds PARKED threads blocked in TCP sends and as many
-    in UDP receives; this one's traffic must still count."""
+    in UDP receives; this one's traffic must still count. Kretprobes on
+    tcp_sendmsg and udp_recvmsg, as netmon once used, lose it all."""
     parker = subprocess.Popen(
         [sys.executable, __file__, "park"], stdout=subprocess.PIPE, text=True
     )
@@ -171,6 +176,63 @@ def busy_neighbour():
         parker.kill()
         parker.wait()
     return {"tcp_tx": 1 << 20, "tcp_rx": got, "udp_tx": 100_000, "udp_rx": 100_000}
+
+
+def kretprobe_slots():
+    """How many calls a kretprobe tracks at once: max(10, 2 * CPUs)."""
+    with open("/sys/devices/system/cpu/possible") as f:
+        last = f.read().strip().split(",")[-1].split("-")[-1]
+    return max(10, 2 * (int(last) + 1))
+
+
+@scenario
+def crowded_splice():
+    """More threads blocked in splice() from TCP than its kretprobe tracks:
+    netmon must log the calls it missed (checked in main())."""
+    keep = []
+    for _ in range(kretprobe_slots() + 2):
+        client, conn = tcp_pair()  # nothing is sent, so splice() waits
+        r, w = os.pipe()
+        keep.append((client, conn, r, w))
+        threading.Thread(
+            target=os.splice, args=(conn.fileno(), w, 1000), daemon=True
+        ).start()
+    time.sleep(1.5)  # a report while they wait
+    return {}
+
+
+@scenario
+def thread_name():
+    """A thread that renamed itself moves the bytes; the row has the
+    process's name, from /proc while the process lives."""
+
+    def named_sender():
+        ctypes.CDLL(None).prctl(15, b"worker", 0, 0, 0)  # PR_SET_NAME
+        rx, tx, to = udp_pair()
+        tx.sendto(b"y" * 1000, to)
+        rx.recv(2000)
+
+    worker = threading.Thread(target=named_sender)
+    worker.start()
+    worker.join()
+    time.sleep(1.5)  # a report while this process still lives
+    return {"udp_tx": 1000, "udp_rx": 1000, "comm": "python3"}
+
+
+@scenario
+def mptcp():
+    """MPTCP at both ends: the kernel drives the TCP subflows itself."""
+    try:
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_MPTCP)
+    except OSError:
+        return {"skip": "MPTCP is off in this kernel"}
+    server.bind(("127.0.0.1", 0))
+    server.listen()
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_MPTCP)
+    client.connect(server.getsockname())
+    conn, _ = server.accept()
+    got = send_and_drain(client, conn, 1 << 20)
+    return {"tcp_tx": 1 << 20, "tcp_rx": got}
 
 
 def park():
@@ -224,6 +286,9 @@ def check_counts(rows, results):
                 comms.add(row["comm"])
                 for k in COUNTERS:
                     got[k] += row[k]
+        if "skip" in want:
+            print(f"skip: {name}: {want['skip']}")
+            continue
         expect = {k: want.get(k, 0) for k in COUNTERS}
         ok = got == expect
         if "comm" in want:
@@ -266,11 +331,15 @@ def check_files(out_dir, stdout_rows, pids):
     print(f"ok  : -o wrote {len(rows)} rows to {len(paths)} file(s)")
 
 
-def mount_tracefs():
-    """Containers don't mount tracefs, where the tracepoints are found."""
-    tracing = "/sys/kernel/tracing"
-    if not os.path.exists(f"{tracing}/events"):
-        subprocess.run(["mount", "-t", "tracefs", "nodev", tracing], check=True)
+def check_missed_logged(err):
+    """The kernel reports kretprobe misses from 6.7 on."""
+    version = tuple(int(x) for x in platform.release().split(".")[:2])
+    if version < (6, 7):
+        print("skip: missed calls aren't reported before Linux 6.7")
+    elif "kretprobe/tcp_splice_read missed" not in err:
+        sys.exit(f"FAIL: netmon didn't log the splice() calls it missed:\n{err}")
+    else:
+        print("ok  : logged the splice() calls it missed")
 
 
 def check_pid_namespace():
@@ -282,14 +351,19 @@ def check_pid_namespace():
 
 def main():
     check_pid_namespace()
-    mount_tracefs()
     netmon = subprocess.Popen(
-        ["netmon", "-j", "-n", "0", "-i", "1"], stdout=subprocess.PIPE, text=True
+        ["netmon", "-j", "-n", "0", "-i", "1"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
     )
-    # A second instance keeps one row per report via priority sampling, and a
-    # third writes hourly files, as the service does.
+    # A second instance keeps one row per report via priority sampling. It
+    # stops by itself: a stop's last report can share a second with the one
+    # before. A third writes hourly files, as the service does.
     sampled = subprocess.Popen(
-        ["netmon", "-j", "-k", "1", "-i", "1"], stdout=subprocess.PIPE, text=True
+        ["netmon", "-j", "-k", "1", "-i", "1", "-c", "4"],
+        stdout=subprocess.PIPE,
+        text=True,
     )
     out_dir = tempfile.mkdtemp()
     to_files = subprocess.Popen(["netmon", "-i", "1", "-w", "5", "-o", out_dir])
@@ -297,9 +371,9 @@ def main():
 
     results = {name: run_scenario(name) for name in SCENARIOS}
     time.sleep(2.5)  # a report after the last byte
-    for p in (netmon, sampled, to_files):
+    for p in (netmon, to_files):
         p.terminate()
-    out, _ = netmon.communicate(timeout=30)
+    out, err = netmon.communicate(timeout=30)
     sampled_out, _ = sampled.communicate(timeout=30)
     for p in (netmon, sampled, to_files):
         if p.wait(timeout=30) != 0:
@@ -307,8 +381,12 @@ def main():
 
     rows = [json.loads(line) for line in out.splitlines()]
     failed = check_counts(rows, results)
+    check_missed_logged(err)
     check_sampled(sampled_out)
-    check_files(out_dir, rows, [pid for pid, _ in results.values()])
+    moved = [
+        pid for pid, want in results.values() if any(want.get(k) for k in COUNTERS)
+    ]
+    check_files(out_dir, rows, moved)
     if failed:
         sys.exit(f"FAIL: wrong counts for {failed}")
     print("PASS")

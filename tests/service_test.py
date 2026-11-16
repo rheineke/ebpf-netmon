@@ -50,12 +50,17 @@ def move_traffic():
     for _ in range(DATAGRAMS):
         tx.sendto(b"y" * 1000, rx.getsockname())
         rx.recv(2000)
-    return {"tcp_tx": TCP_BYTES, "tcp_rx": got, "udp_tx": DATAGRAMS * 1000}
+    return {
+        "tcp_tx": TCP_BYTES,
+        "tcp_rx": got,
+        "udp_tx": DATAGRAMS * 1000,
+        "udp_rx": DATAGRAMS * 1000,
+    }
 
 
 def counted():
     """This process's totals in the service's files, and their hosts."""
-    got = {"tcp_tx": 0, "tcp_rx": 0, "udp_tx": 0}
+    got = {"tcp_tx": 0, "tcp_rx": 0, "udp_tx": 0, "udp_rx": 0}
     hosts = set()
     for path in glob.glob(os.path.join(RAW, "*", "*.jsonl")):
         for line in open(path):
@@ -81,7 +86,9 @@ def main():
     print("ok  : running, with only cap_bpf and cap_perfmon")
 
     want = move_traffic()
-    deadline = time.monotonic() + 60  # reports every 10 s; -w may hold one
+    # Reports come every 10 s, but the unit's -w 300 holds them while the
+    # clock is unsynchronized.
+    deadline = time.monotonic() + 330
     while (got := counted())[0] != want and time.monotonic() < deadline:
         time.sleep(2)
     got, hosts = counted()

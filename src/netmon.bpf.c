@@ -21,6 +21,7 @@ char LICENSE[] SEC("license") = "Dual MIT/GPL";
 #define IPPROTO_TCP 6
 #define IPPROTO_UDP 17
 #define IPPROTO_UDPLITE 136
+#define IPPROTO_MPTCP 262
 #define MSG_PEEK 0x2
 #define MSG_ERRQUEUE 0x2000
 
@@ -66,7 +67,11 @@ static __always_inline int account_sock(const struct netmon_sock_msg_length *m,
 {
 	if (m->family != AF_INET && m->family != AF_INET6)
 		return 0;
-	if (m->protocol == IPPROTO_TCP)
+	/*
+	 * An MPTCP socket's subflows are TCP sockets the kernel drives
+	 * itself, without sock_sendmsg(), so its bytes count once, here.
+	 */
+	if (m->protocol == IPPROTO_TCP || m->protocol == IPPROTO_MPTCP)
 		return account(tcp, m->ret);
 	if (m->protocol == IPPROTO_UDP || m->protocol == IPPROTO_UDPLITE)
 		return account(udp, m->ret);
@@ -108,10 +113,11 @@ int BPF_KRETPROBE(tcp_splice_read_ret, long ret)
 }
 
 /*
- * NFS reads and writes go over the wire from kernel threads (nfsiod,
- * rpciod), so the socket counts above cannot see which process asked for
- * them. These run in the calling process and return the file bytes it read
- * or wrote, including reads served from the page cache.
+ * The NFS client's wire bytes don't tell which process asked for them:
+ * replies arrive in kernel threads, and a synchronous call (stat, open)
+ * sends from the calling process along with any other requests queued
+ * behind it. These run in the calling process and return the file bytes it
+ * read or wrote, including reads served from the page cache.
  */
 SEC("kretprobe/nfs_file_read")
 int BPF_KRETPROBE(nfs_file_read_ret, long ret)

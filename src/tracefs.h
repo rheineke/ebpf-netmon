@@ -3,6 +3,8 @@
 // so netmon refuses to attach one whose fields have moved.
 #pragma once
 
+#include <sys/stat.h>
+
 #include <fstream>
 #include <istream>
 #include <stdexcept>
@@ -77,29 +79,33 @@ inline std::string check_format(std::istream &format,
 	return problems;
 }
 
-inline const std::string kNoTracefs =
-	" no format file in tracefs (is it mounted?)";
-
-// True if the check failed only because tracefs wasn't there to read, as
-// in a container that doesn't mount it.
-inline bool tracefs_missing(const std::string &problem)
-{
-	return problem == kNoTracefs;
-}
-
-// Reads category/event's format file from tracefs, wherever it is mounted.
-inline std::string
-check_tracepoint(const std::string &category, const std::string &event,
-		 const std::vector<TracepointField> &expected)
+// Where tracefs is mounted, as libbpf looks for it, or "" if nowhere.
+inline std::string tracefs_root()
 {
 	for (const char *root :
 	     {"/sys/kernel/tracing", "/sys/kernel/debug/tracing"}) {
-		std::string path = root;
-		path.append("/events/").append(category).append("/");
-		path.append(event).append("/format");
-		std::ifstream format(path);
-		if (format)
-			return check_format(format, expected);
+		struct stat st{};
+		if (stat((std::string(root) + "/events").c_str(), &st) == 0)
+			return root;
 	}
-	return kNoTracefs;
+	return "";
+}
+
+// Returns "" if the tracepoint category:event under tracefs root has the
+// expected layout, else why not.
+inline std::string
+check_tracepoint(const std::string &root, const std::string &category,
+		 const std::string &event,
+		 const std::vector<TracepointField> &expected)
+{
+	if (root.empty())
+		return " tracefs is not mounted at /sys/kernel/tracing";
+	std::string path = root;
+	path.append("/events/").append(category).append("/");
+	path.append(event).append("/format");
+	std::ifstream format(path);
+	if (!format)
+		return " this kernel has no " + category + ":" + event +
+		       " tracepoint (it needs Linux 6.3 or later)";
+	return check_format(format, expected);
 }

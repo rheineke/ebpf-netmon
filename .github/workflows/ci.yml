@@ -59,6 +59,11 @@ jobs:
               tests/dashboard_test.py "$1" $test
           }
           as_root load
+          sudo mkdir -p "/srv/a warehouse"
+          if scripts/install_rest_catalog.sh "/srv/a warehouse" 2>/dev/null; then
+            echo "FAIL: took a WAREHOUSE with a space" >&2
+            exit 1
+          fi
           scripts/install_rest_catalog.sh $test/warehouse
           scripts/install_clickhouse.sh $test/warehouse $test/raw
           .venv/bin/python tests/dashboard_test.py check $test
@@ -152,6 +157,18 @@ jobs:
           docker run --rm --privileged --pid=host -v /mnt/nfstest:/mnt/nfstest \
             --entrypoint python3 ebpf-netmon:test \
             tests/nfs_test.py /mnt/nfstest/sample.bin /mnt/nfstest
+          # The service started before the mount loaded the nfs module, so
+          # its NFS probes failed then; it retries them every minute.
+          logged() { sudo journalctl -u netmon.service -o cat | grep -q "$1"; }
+          if logged 'could not attach kretprobe/nfs_file_read'; then
+            for _ in $(seq 45); do
+              logged 'attached kretprobe/nfs_file_read' && break
+              sleep 2
+            done
+            logged 'attached kretprobe/nfs_file_read' \
+              || { echo "FAIL: the service never attached its NFS probes"; exit 1; }
+            echo "ok  : the service attached its NFS probes on a retry"
+          fi
       # The same script a Pi runs, as a non-root user with sudo, so PATH
       # matches a normal Pi login.
       - name: Build script

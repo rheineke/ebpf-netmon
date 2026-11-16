@@ -2,12 +2,13 @@
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <getopt.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/timex.h>
 #include <unistd.h>
 
 #include <algorithm>
-#include <array>
+#include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstdarg>
@@ -19,13 +20,13 @@
 #include <fstream>
 #include <random>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include "capture.h"
 #include "netmon.h"
 #include "netmon.skel.h"
 #include "priority_sample.h"
+#include "report.h"
 #include "tracefs.h"
 
 namespace {
@@ -43,21 +44,6 @@ struct Options {
 	int wait_clock_s = 0;  // hold reports until the clock is set
 	bool json = false;
 	std::string out_dir;  // hourly JSON-lines files instead of stdout
-};
-
-struct Row {
-	unsigned int pid;
-	unsigned int uid;
-	std::string comm;
-	std::array<unsigned long long, NETMON_NR_COUNTERS> delta;
-	double scale = 1.0;  // estimate = delta * scale, after sampling
-	unsigned long long total() const
-	{
-		unsigned long long sum = 0;
-		for (auto b : delta)
-			sum += b;
-		return sum;
-	}
 };
 
 void usage(const char *prog)
@@ -147,45 +133,20 @@ std::string human(unsigned long long bytes)
 	return buf;
 }
 
-// Reads the map and returns the bytes moved since the previous call.
-std::vector<Row> collect(int map_fd,
-			 std::unordered_map<unsigned int, netmon_traffic> &prev,
-			 bool use_proc)
+// The bytes each process moved since the previous call, read from the map.
+std::vector<Row> collect_map(int map_fd, Totals &prev, bool use_proc)
 {
-	std::unordered_map<unsigned int, netmon_traffic> cur;
-	std::vector<Row> rows;
-	unsigned int key, next;
-	unsigned int *keyp = nullptr;
-	netmon_traffic value;
-
-	while (bpf_map_get_next_key(map_fd, keyp, &next) == 0) {
-		key = next;
-		keyp = &key;
-		if (bpf_map_lookup_elem(map_fd, &key, &value) != 0)
-			continue;  // evicted between the two calls
-		cur[key] = value;
-
-		Row row{key, value.uid, {}, {}};
-		auto it = prev.find(key);
-		for (int i = 0; i < NETMON_NR_COUNTERS; ++i) {
-			unsigned long long before =
-				it == prev.end() ? 0 : it->second.bytes[i];
-			// Smaller than before: the LRU evicted and re-created it.
-			row.delta[i] = value.bytes[i] >= before
-					       ? value.bytes[i] - before
-					       : value.bytes[i];
-		}
-		if (row.total() == 0)
-			continue;
-		row.comm = process_name(key, value.comm, use_proc);
-		rows.push_back(std::move(row));
-	}
-	prev = std::move(cur);
-
-	std::sort(rows.begin(), rows.end(), [](const Row &a, const Row &b) {
-		return a.total() > b.total();
-	});
-	return rows;
+	return collect(
+		[map_fd](const unsigned int *key, unsigned int *next) {
+			return bpf_map_get_next_key(map_fd, key, next) == 0;
+		},
+		[map_fd](unsigned int key, netmon_traffic &value) {
+			return bpf_map_lookup_elem(map_fd, &key, &value) == 0;
+		},
+		[use_proc](unsigned int pid, const char *bpf_comm) {
+			return process_name(pid, bpf_comm, use_proc);
+		},
+		prev);
 }
 
 // Keeps opts.sample rows, weighted by total bytes, and sets each row's scale.
@@ -294,9 +255,24 @@ const std::vector<TracepointField> kSockMsgLength = {
 	{"flags", offsetof(netmon_sock_msg_length, flags), 4},
 };
 
-// Attaches each BPF program on its own, so a kernel missing one function
-// still runs the rest, and retries the missing ones: NFS functions appear
-// only once the nfs module loads, at the first mount.
+// The sock tracepoints need tracefs, which a container's own /sys lacks.
+// Without CAP_SYS_ADMIN, as under systemd (which mounts it), this fails
+// harmlessly.
+void mount_tracefs()
+{
+	if (tracefs_root().empty())
+		mount("nodev", "/sys/kernel/tracing", "tracefs", 0, nullptr);
+}
+
+bool is_tracepoint(bpf_program *prog)
+{
+	return bpf_program__type(prog) == BPF_PROG_TYPE_TRACEPOINT;
+}
+
+// The sock tracepoints are required: without them there is nothing to
+// count but NFS. The kprobes are optional: each is attached on its own, so a
+// kernel missing one function still runs the rest, and retried, since NFS
+// functions appear only once the nfs module loads, at the first mount.
 class Probes {
 public:
 	explicit Probes(netmon_bpf *skel)
@@ -304,7 +280,6 @@ public:
 		bpf_program *prog;
 		bpf_object__for_each_program(prog, skel->obj)
 			probes_.push_back({prog});
-		attach_missing(false);
 	}
 	Probes(const Probes &) = delete;
 	Probes &operator=(const Probes &) = delete;
@@ -314,38 +289,68 @@ public:
 			bpf_link__destroy(p.link);
 	}
 
-	size_t attached() const
+	// Attaches the tracepoints; false, saying why, if one can't attach.
+	bool attach_required()
 	{
-		return std::count_if(probes_.begin(), probes_.end(),
-				     [](const Probe &p) { return p.link; });
+		mount_tracefs();
+		const std::string root = tracefs_root();
+		for (Probe &p : probes_) {
+			if (!is_tracepoint(p.prog))
+				continue;
+			// "tracepoint/sock/sock_send_length"
+			std::string name = bpf_program__section_name(p.prog);
+			auto event = name.rfind('/');
+			auto category = name.rfind('/', event - 1);
+			std::string problem =
+				check_tracepoint(root,
+						 name.substr(category + 1,
+							     event - category -
+								     1),
+						 name.substr(event + 1),
+						 kSockMsgLength);
+			if (problem.empty()) {
+				p.link = bpf_program__attach(p.prog);
+				if (!p.link)
+					problem = std::string(" ") +
+						  std::strerror(errno);
+			}
+			if (!problem.empty()) {
+				std::fprintf(stderr,
+					     "netmon: can't count TCP and UDP: "
+					     "%s:%s\n",
+					     name.c_str(), problem.c_str());
+				return false;
+			}
+		}
+		return true;
 	}
 
-	// Says so the first time a probe fails, and when a retry succeeds.
-	void attach_missing(bool retry)
+	// Attaches the kprobes it can. Says why for those it can't the first
+	// time, and when a retry succeeds.
+	void attach_optional(bool retry)
 	{
 		libbpf_print_fn_t old_print = nullptr;
 		if (retry)  // libbpf would repeat its warnings every minute
 			old_print = libbpf_set_print(quiet_print);
 		for (Probe &p : probes_) {
-			if (p.link || p.give_up)
+			if (p.link || is_tracepoint(p.prog))
 				continue;
 			const char *name = bpf_program__section_name(p.prog);
-			std::string problem = check(name, p.give_up);
-			if (problem.empty()) {
-				p.link = bpf_program__attach(p.prog);
-				if (!p.link)
-					problem = " the kernel refused";
-			}
+			p.link = bpf_program__attach(p.prog);
+			int err = errno;
 			if (p.link && retry)
 				std::fprintf(stderr, "netmon: attached %s\n",
 					     name);
 			else if (!p.link && !retry)
 				std::fprintf(
 					stderr,
-					"netmon: could not attach %s:%s%s\n",
-					name, problem.c_str(),
-					p.give_up ? ""
-						  : "; retrying every minute");
+					"netmon: could not attach %s: %s; "
+					"retrying every minute\n",
+					name,
+					err == ENOENT
+						? "no such function in this "
+						  "kernel yet"
+						: std::strerror(err));
 		}
 		if (retry)
 			libbpf_set_print(old_print);
@@ -384,27 +389,8 @@ private:
 	struct Probe {
 		bpf_program *prog;
 		bpf_link *link = nullptr;
-		bool give_up = false;  // a tracepoint built for another layout
 		unsigned long long missed = 0;
 	};
-
-	// For a tracepoint, checks the kernel's record layout matches the
-	// one the program was built for. Returns "" if it may attach; sets
-	// permanent if it never will.
-	static std::string check(const std::string &section, bool &permanent)
-	{
-		const std::string prefix = "tracepoint/";
-		if (section.rfind(prefix, 0) != 0)
-			return "";
-		std::string rest = section.substr(prefix.size());
-		auto slash = rest.find('/');
-		std::string problem = check_tracepoint(rest.substr(0, slash),
-						       rest.substr(slash + 1),
-						       kSockMsgLength);
-		// Without tracefs, wait for it; a different layout won't change.
-		permanent = !problem.empty() && !tracefs_missing(problem);
-		return problem;
-	}
 
 	std::vector<Probe> probes_;
 };
@@ -412,51 +398,50 @@ private:
 int run(netmon_bpf *skel, const Options &opts)
 {
 	Probes probes(skel);
-	if (probes.attached() == 0)
+	if (!probes.attach_required())
 		return 1;
+	probes.attach_optional(false);
 
 	std::signal(SIGINT, on_signal);
 	std::signal(SIGTERM, on_signal);
 
 	int map_fd = bpf_map__fd(skel->maps.traffic);
 	const bool use_proc = in_initial_pid_namespace();
-	std::unordered_map<unsigned int, netmon_traffic> prev;
-	collect(map_fd, prev, use_proc);  // report only traffic from now on
+	Totals prev;
+	collect_map(map_fd, prev, use_proc);  // report only traffic from now on
 	std::mt19937_64 rng(std::random_device{}());
 	const std::string host = host_name();
 	HourlyFiles files(opts.out_dir);
 
 	using Clock = std::chrono::steady_clock;
 	const auto started = Clock::now();
-	auto last_retry = started;
-	bool holding = opts.wait_clock_s > 0 && !clock_synced();
-	if (holding)
-		std::fprintf(stderr,
-			     "netmon: holding reports until the clock is "
-			     "synchronized, at most %d s\n",
-			     opts.wait_clock_s);
+	auto last_retry = started, last_report = started;
+	ClockHold clock_hold{std::chrono::seconds(opts.wait_clock_s)};
+	bool said_holding = false;
 	int reports = 0;
-	int intervals = 0;  // since the last report
 	while (!g_stop && (!opts.count || reports < opts.count)) {
 		for (int s = 0; s < opts.interval_s && !g_stop; ++s)
 			sleep(1);
-		++intervals;
 		if (Clock::now() - last_retry >= std::chrono::minutes(1)) {
-			probes.attach_missing(true);
+			probes.attach_optional(true);
 			last_retry = Clock::now();
 		}
 		probes.report_missed();
-		if (holding) {
-			auto limit = std::chrono::seconds(opts.wait_clock_s);
-			if (!g_stop && !clock_synced() &&
-			    Clock::now() - started < limit)
-				continue;  // the map keeps counting
-			holding = false;
+		if (clock_hold.hold(Clock::now() - started, g_stop,
+				    clock_synced)) {
+			if (!said_holding)
+				std::fprintf(stderr,
+					     "netmon: holding reports until "
+					     "the clock is synchronized, at "
+					     "most %d s\n",
+					     opts.wait_clock_s);
+			said_holding = true;
+			continue;  // the map keeps counting
 		}
 		++reports;
-		int interval_s = intervals * opts.interval_s;
-		intervals = 0;
-		auto rows = collect(map_fd, prev, use_proc);
+		auto rows = collect_map(map_fd, prev, use_proc);
+		int interval_s = interval_seconds(Clock::now() - last_report);
+		last_report = Clock::now();
 		if (opts.sample)
 			rows = sample_rows(std::move(rows), opts.sample, rng);
 		if (!opts.json) {

@@ -24,15 +24,20 @@ the clock is synchronized.
   tracepoints (kernel 6.3+). They fire once per `sock_sendmsg()` and
   `sock_recvmsg()`, which every send and receive goes through, with the
   bytes moved. Peeks are skipped, since the read that follows counts.
-  `splice()` from a TCP socket skips them, so a kretprobe on
-  `tcp_splice_read` counts it.
+  MPTCP counts as TCP. `splice()` from a TCP socket skips them, so a
+  kretprobe on `tcp_splice_read` counts it.
 - **NFS**: kretprobes on `nfs_file_read`, `nfs_file_splice_read` and
   `nfs_file_write` (see NFS traffic below).
 
 It reads only the tracepoints' records and the functions' return values,
 never kernel structs. So it needs no CO-RE and no kernel BTF, which Raspberry
 Pi kernels don't ship. At startup it checks the tracepoints' record layout
-against tracefs, and it won't attach one built for another layout.
+against tracefs. Without the tracepoints, or with another layout, it exits
+saying why rather than run without TCP and UDP. In a container it mounts
+tracefs itself, which needs `--privileged`.
+
+Traffic over loopback (`127.0.0.1`, say Grafana querying ClickHouse on the
+same Pi) counts as both sent and received, as each end is a process here.
 
 The tracepoints replace kprobes on `tcp_sendmsg`, `tcp_cleanup_rbuf` and
 `udp(v6)_sendmsg`/`recvmsg`, which overcounted: a `MSG_WAITALL` read was
@@ -136,9 +141,12 @@ counts for the server process match the bytes that actually arrived.
 
 ### NFS traffic
 
-The NFS client sends and receives in kernel threads (`kworker/...-nfsiod`,
-`-xprtiod`, `-rpciod`), so the wire bytes show up as their `tcp_rx`/`tcp_tx`.
-`NFS_RD` and `NFS_WR` charge the file bytes to the process that read or wrote
+The NFS client's wire bytes don't say which process asked for them. Replies
+arrive in kernel threads (`kworker/...-xprtiod`), so they show up as those
+threads' `tcp_rx`. Requests mostly leave from kernel threads too, but a
+synchronous call (a `stat()`, an `open()`) is sent by the calling process,
+along with any requests queued behind it, so a process's `tcp_tx` can
+include some NFS request bytes. `NFS_RD` and `NFS_WR` charge the file bytes to the process that read or wrote
 them, through `read()`, `sendfile()`/`splice()` or `write()`. They count
 file bytes, not wire bytes: reads served from the page cache count too, and
 memory-mapped access does not.
@@ -157,7 +165,8 @@ the Synology NAS (read-only) and a loopback export (read and write).
 
 `netmon -o DIR` appends each report as JSON lines to
 `DIR/YYYY-MM-DD/HH.jsonl`, one file per UTC hour, so a file is complete
-once its hour has passed. Each row is one process in one interval:
+once its hour has passed. Each row is one process in one interval of
+`interval_s` seconds, ending at `ts`:
 
 ```json
 {"ts":1792666261,"host":"raspberrypi","interval_s":10,"pid":4309,"uid":0,"comm":"nfsd","tcp_tx":84,"tcp_rx":120,"udp_tx":0,"udp_rx":0,"nfs_read":0,"nfs_write":0,"scale":1}
