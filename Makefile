@@ -21,22 +21,23 @@ $(BUILD)/netmon.skel.h: $(BUILD)/netmon.bpf.o
 	$(BPFTOOL) gen skeleton $< > $@.tmp && mv $@.tmp $@
 
 # libbpf is linked statically so the binary only needs libelf and zlib.
-$(BUILD)/netmon: src/netmon.cpp src/netmon.h src/priority_sample.h \
-		$(BUILD)/netmon.skel.h
-	$(CXX) -std=c++20 $(CXXFLAGS) -I$(BUILD) -Isrc $< -o $@ \
-		-Wl,-Bstatic -lbpf -Wl,-Bdynamic -lelf -lz
+# (Debian's static libelf can't be linked: it lacks libeu.)
+LDLIBS ?= -Wl,-Bstatic -lbpf -Wl,-Bdynamic -lelf -lz
+HEADERS := $(wildcard src/*.h)
+$(BUILD)/netmon: src/netmon.cpp $(HEADERS) $(BUILD)/netmon.skel.h
+	$(CXX) -std=c++20 $(CXXFLAGS) -I$(BUILD) -Isrc $< -o $@ $(LDLIBS)
 
 # Unit tests for the user-space code; no BPF or root needed.
-$(BUILD)/priority_sample_test: tests/priority_sample_test.cpp \
-		src/priority_sample.h | $(BUILD)
+UNIT_TESTS := $(patsubst tests/%.cpp,$(BUILD)/%,$(wildcard tests/*_test.cpp))
+$(BUILD)/%_test: tests/%_test.cpp $(HEADERS) | $(BUILD)
 	$(CXX) -std=c++20 $(CXXFLAGS) -Isrc $< -o $@
 
-test: $(BUILD)/priority_sample_test
-	$<
+test: $(UNIT_TESTS)
+	set -e; for t in $^; do $$t; done
 
 # Lints the C++; the BPF C is checked by clang -Wall -Werror above.
 tidy: $(BUILD)/netmon.skel.h
-	clang-tidy --quiet --header-filter="src/.*" --exclude-header-filter="build/.*" src/netmon.cpp tests/priority_sample_test.cpp -- \
+	clang-tidy --quiet --header-filter="src/.*" --exclude-header-filter="build/.*" src/netmon.cpp tests/*_test.cpp -- \
 		-std=c++20 -I$(BUILD) -Isrc
 
 # The same build with ASan and UBSan in build/asan; any report is fatal.

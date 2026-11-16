@@ -13,6 +13,13 @@ if [ $# -ne 1 ]; then
   exit 2
 fi
 dest=$(realpath "$1")/$(hostname)
+# RequiresMountsFor= below splits on spaces and expands %.
+case "$dest" in
+  *[[:space:]%]*)
+    echo "RAW_ROOT can't contain spaces or %" >&2
+    exit 2
+    ;;
+esac
 cd "$(dirname "$0")/.."
 
 # The sync runs as netmon, which must own DEST (README.md). Pause it, even

@@ -38,8 +38,13 @@ fi
 if grep -qw asimddp /proc/cpuinfo && grep -qw atomics /proc/cpuinfo; then
   echo "== Installing the LTS release from packages.clickhouse.com"
   key=/usr/share/keyrings/clickhouse-keyring.gpg
-  curl -fsSL https://packages.clickhouse.com/rpm/lts/repodata/repomd.xml.key \
-    | sudo gpg --batch --yes --dearmor -o "$key"
+  # Download, then convert: piped, a failed download would still replace
+  # the key with an empty one.
+  tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' EXIT
+  curl -fsSL -o "$tmp/clickhouse.key" \
+    https://packages.clickhouse.com/rpm/lts/repodata/repomd.xml.key
+  sudo gpg --batch --yes --dearmor -o "$key" "$tmp/clickhouse.key"
   echo "deb [signed-by=$key arch=arm64] https://packages.clickhouse.com/deb lts main" \
     | sudo tee /etc/apt/sources.list.d/clickhouse.list >/dev/null
   sudo apt-get update -qq

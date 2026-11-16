@@ -45,6 +45,12 @@ if NETMON_UID=4322 scripts/add_netmon_user.sh 2>/dev/null; then
   exit 1
 fi
 echo "ok  : stops for another NETMON_UID"
+sudo mkdir -p "/srv/netmon sync"
+if scripts/install_sync.sh "/srv/netmon sync" 2>/dev/null; then
+  echo "FAIL: took a RAW_ROOT with a space, which systemd would split" >&2
+  exit 1
+fi
+echo "ok  : stops for a RAW_ROOT with a space"
 
 echo '{"ts":2}' | sudo tee -a "$raw/2026-01-01/00.jsonl" >/dev/null
 echo '{"ts":3}' | sudo tee "$raw/2026-01-01/01.jsonl" >/dev/null

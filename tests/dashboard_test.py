@@ -14,8 +14,9 @@ open. The converter's own next run would load the fourth.
 check runs every panel of grafana/dashboards/netmon.json through
 clickhouse-client, as Grafana's user, with Grafana's macros filled in, and
 checks the totals, so the live view must add the last hour from the raw
-files. It also runs every alert rule's query, which needs the dev
-dependencies (uv sync). convert loads that hour too, and maintain compacts
+files. It also runs every alert rule's query, and the high-traffic rule's
+over rows made for its window too, which needs the dev dependencies (uv
+sync). convert loads that hour too, and maintain compacts
 the table and expires its old snapshots, as a month later; the totals must
 not change. stray adds a copy of the table's first metadata file, numbered
 after the rest, which only a catalog read ignores.
@@ -244,6 +245,31 @@ def check_locked_down():
         check_eq(f"max_execution_time {seconds}", query(sql)[0]["n"], HOURS * ROWS * 2)
 
 
+def check_high_traffic(title, sql, limit):
+    """The fixture has no rows in this rule's window, the last few minutes,
+    so run its query over rows made for it: a subquery in the view's place.
+    """
+    rows = [  # seconds ago, comm, bytes sent, bytes received
+        (180, "big", 2_000_000_000, 0),
+        (120, "big", 1_100_000_000, 5),  # 3.1 GB in 5 minutes: over 10 MB/s
+        (180, "small", 1_000_000, 2_000_000),  # 2 MB in: 6.7 kB/s
+        (30, "late", 9_000_000_000, 0),  # in the last minute, maybe not synced
+        (420, "early", 9_000_000_000, 0),  # before the window
+    ]
+    fake = " UNION ALL ".join(
+        f"SELECT now() - {ago} AS ts, 'pi-a' AS host, '{comm}' AS comm,"
+        f" toInt64({tx}) AS tcp_tx, toInt64({rx}) AS tcp_rx,"
+        " toInt64(0) AS udp_tx, toInt64(0) AS udp_rx, 1.0 AS scale"
+        for ago, comm, tx, rx in rows
+    )
+    view = "netmon.traffic_live"
+    check_eq(f"{title}: reads {view} once", sql.count(view), 1)
+    rates = {r["comm"]: r["bytes_per_s"] for r in query(sql.replace(view, f"({fake})"))}
+    check_eq(f"{title}: programs in its window", sorted(rates), ["big", "small"])
+    check_eq(f"{title}: rate", round(rates["big"]), round(3_100_000_000 / 300))
+    check_eq(f"{title}: fires", rates["big"] > limit >= rates["small"], True)
+
+
 def check_alerts():
     """Each alert query must give Grafana one number per row, labelled by
     its string columns, or the rule cannot evaluate."""
@@ -266,6 +292,9 @@ def check_alerts():
             check_eq(f"{title}: checks before it fires", minutes // every + 1, 5)
         if rule["uid"] == "netmon-converter-behind":
             check_eq(f"{title}: rows", len(rows), 1)
+        if rule["uid"] == "netmon-high-traffic":
+            limit = threshold["model"]["conditions"][0]["evaluator"]["params"][0]
+            check_high_traffic(title, query_step["model"]["rawSql"], limit)
         for row in rows:
             kinds = sorted(type(v).__name__ for v in row.values())
             numbers = [k for k in kinds if k in ("int", "float")]

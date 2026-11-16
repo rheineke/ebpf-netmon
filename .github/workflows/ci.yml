@@ -106,20 +106,40 @@ jobs:
           # Last, as the converter refuses a newer stray metadata file.
           sudo .venv/bin/python tests/dashboard_test.py stray $test
           .venv/bin/python tests/dashboard_test.py check $test
+          # systemd can't take a mount path with a space.
+          if scripts/install_converter.sh "/srv/a warehouse" 2>/dev/null; then
+            fail "took a WAREHOUSE with a space"
+          fi
+      # Grafana and its ClickHouse plugin, on the REST step's data.
+      - name: Grafana
+        run: |
+          scripts/install_grafana.sh
+          .venv/bin/python tests/grafana_test.py
       - name: Sync
         run: tests/sync_test.sh
       - name: clang-tidy
         run: docker build --target lint .
+      # --pid=host: netmon reports host pids, and the tests look for their own.
       - name: ASan and UBSan
         run: |
           docker build --target sanitize -t ebpf-netmon:sanitize .
-          docker run --rm --privileged ebpf-netmon:sanitize
+          docker run --rm --privileged --pid=host ebpf-netmon:sanitize
       - name: Build
         run: docker build --target test -t ebpf-netmon:test .
       - name: Smoke test
-        run: docker run --rm --privileged ebpf-netmon:test
-      # A loopback NFS export on the runner. --pid=host because netmon
-      # reports host pids, and the test looks for its own.
+        run: docker run --rm --privileged --pid=host ebpf-netmon:test
+      # The service as a Pi runs it, sandboxed, on the runner's own systemd
+      # and kernel, with the binary from the image.
+      - name: Service
+        run: |
+          sudo apt-get install -y -qq libelf1t64 zlib1g
+          id=$(docker create ebpf-netmon:test)
+          mkdir -p build
+          docker cp "$id:/usr/local/bin/netmon" build/netmon
+          docker rm "$id"
+          scripts/install_service.sh
+          python3 tests/service_test.py
+      # A loopback NFS export on the runner.
       - name: NFS test
         run: |
           sudo apt-get install -y -qq nfs-kernel-server

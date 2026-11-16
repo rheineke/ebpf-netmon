@@ -19,13 +19,21 @@ if [ $# -lt 1 ] || [ $# -gt 3 ]; then
   exit 2
 fi
 installed() { sed -n "s/^$1=//p" /etc/default/netmon-iceberg 2>/dev/null || true; }
-warehouse=$1
+# Absolute, as the units run from /.
+warehouse=$(realpath -m "$1")
 if [ $# -ge 2 ] && [ -n "$2" ]; then
-  raw=$2
+  raw=$(realpath -m "$2")
 else
   raw=$(installed RAW)
   raw=${raw:-/var/lib/netmon/raw}
 fi
+# RequiresMountsFor= below splits on spaces and expands %.
+case "$warehouse$raw" in
+  *[[:space:]%]*)
+    echo "WAREHOUSE and RAW can't contain spaces or %" >&2
+    exit 2
+    ;;
+esac
 if [ $# -eq 3 ]; then
   catalog=$3
 else

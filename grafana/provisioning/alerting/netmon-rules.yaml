@@ -9,10 +9,11 @@ groups:
     folder: netmon
     interval: 1m
     rules:
-      # One process sending or receiving over 10 MB/s, averaged over 5
-      # minutes ending a minute ago, as the last minute may not be synced yet.
+      # One program (all its processes on a host) sending or receiving over
+      # 10 MB/s, averaged over 5 minutes ending a minute ago, as the last
+      # minute may not be synced yet.
       - uid: netmon-high-traffic
-        title: Process moving over 10 MB/s
+        title: Program moving over 10 MB/s
         condition: C
         for: 0s
         noDataState: OK

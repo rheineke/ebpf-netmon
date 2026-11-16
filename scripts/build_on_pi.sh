@@ -35,12 +35,18 @@ fi
 
 echo "== Checking the kernel"
 uname -r
-for opt in BPF_SYSCALL BPF_EVENTS KPROBES; do
-  if [ -r /proc/config.gz ] && ! zgrep -q "^CONFIG_$opt=y" /proc/config.gz; then
-    echo "kernel lacks CONFIG_$opt; netmon cannot run here" >&2
-    exit 1
-  fi
-done
+# Raspberry Pi kernels publish their config only once the module is loaded.
+[ -r /proc/config.gz ] || sudo modprobe -q configs 2>/dev/null || true
+if [ -r /proc/config.gz ]; then
+  for opt in BPF_SYSCALL BPF_EVENTS KPROBES KPROBE_EVENTS EVENT_TRACING; do
+    if ! zgrep -q "^CONFIG_$opt=y" /proc/config.gz; then
+      echo "kernel lacks CONFIG_$opt; netmon cannot run here" >&2
+      exit 1
+    fi
+  done
+else
+  echo "no /proc/config.gz; skipped the kernel config check"
+fi
 
 echo "== Building"
 rm -rf build

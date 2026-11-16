@@ -18,3 +18,18 @@ struct netmon_traffic {
 	unsigned int uid;
 	char comm[NETMON_COMM_LEN];
 };
+
+/*
+ * The record of the sock:sock_send_length and sock:sock_recv_length
+ * tracepoints (kernel 6.3+), laid out as their format files describe it.
+ * No BTF describes it on a Raspberry Pi, so netmon.cpp checks these offsets
+ * against tracefs before attaching.
+ */
+struct netmon_sock_msg_length {
+	unsigned long long common; /* type, flags, preempt count, pid */
+	unsigned long long sk;
+	unsigned short family;
+	unsigned short protocol;
+	int ret; /* bytes sent or received, or -errno */
+	int flags; /* MSG_* flags; 0 for sends */
+};

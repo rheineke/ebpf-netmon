@@ -2,18 +2,39 @@
 # Install with scripts/install_service.sh.
 [Unit]
 Description=netmon per-process network byte counts
-After=network.target
+After=network.target time-sync.target
 
 [Service]
-ExecStart=/usr/local/bin/netmon -i 10 -n 0 -o /var/lib/netmon/raw
+# -w: a Pi has no clock battery, so it boots with the last shutdown's time.
+# Hold reports until NTP sets the clock, for at most 5 minutes; nothing is
+# lost meanwhile.
+ExecStart=/usr/local/bin/netmon -i 10 -n 0 -w 300 -o /var/lib/netmon/raw
 Restart=on-failure
 RestartSec=10
 StateDirectory=netmon
-# Loading BPF needs root, but nothing else does.
+# Root, for its files, but holding only what loading and attaching BPF
+# programs needs (kernel 5.8+). netmon reads process names, which any
+# process can set, so keep the rest of the system out of its reach.
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+ProtectHostname=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+# Not ProtectClock: it also blocks reading the clock's state, which -w uses.
 
 [Install]
 WantedBy=multi-user.target
