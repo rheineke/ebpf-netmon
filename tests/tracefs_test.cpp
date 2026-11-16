@@ -1,8 +1,10 @@
 // Checks the tracepoint format parsing that guards netmon.bpf.c's fixed
 // offsets into the sock tracepoints' records.
+#include <cerrno>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -112,6 +114,26 @@ void test_check_tracepoint()
 	check(check_tracepoint(root, "sock", "sock_send_length", kExpected)
 			      .find("needs Linux 6.3") != std::string::npos,
 	      "says when the kernel lacks the tracepoint");
+	// A link to itself: open() fails with ELOOP, even for root.
+	std::filesystem::create_directories(root / "events/sock/loop");
+	std::filesystem::create_symlink("format",
+					root / "events/sock/loop/format");
+	std::string loop = check_tracepoint(root, "sock", "loop", kExpected);
+	check(loop.find("can't read") != std::string::npos &&
+		      loop.find(std::strerror(ELOOP)) != std::string::npos,
+	      "says why it can't read a format file");
+
+	std::string none = (root / "none").string();
+	check(tracefs_root({none, root.string()}) == root.string(),
+	      "finds tracefs at the first root that has events/");
+	check(tracefs_root({none}).empty(),
+	      "finds nothing where there is none");
+	// events/ a link to itself: there, but stat() fails, with ELOOP.
+	std::filesystem::create_directories(root / "looped");
+	std::filesystem::create_symlink("events", root / "looped/events");
+	std::string looped = (root / "looped").string();
+	check(tracefs_root({looped, root.string()}) == looped,
+	      "takes a root it can't read, so the error says why");
 	std::filesystem::remove_all(root);
 }
 

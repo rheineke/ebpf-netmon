@@ -132,11 +132,6 @@ def fill_macros(sql, interval=3600):
         rf"\1 <= toDateTime({int(end.timestamp())})",
         sql,
     )
-    sql = re.sub(
-        r"\$__timeInterval\((\w+)\)",
-        rf"toStartOfInterval(toDateTime(\1), INTERVAL {interval} second)",
-        sql,
-    )
     return sql.replace("$__interval_s", str(interval))
 
 

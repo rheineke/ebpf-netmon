@@ -115,6 +115,16 @@ jobs:
           if scripts/install_converter.sh "/srv/a warehouse" 2>/dev/null; then
             fail "took a WAREHOUSE with a space"
           fi
+          # A warehouse someone on the share swapped for a link to a local
+          # folder: refused, and root leaves the folder alone.
+          sudo install -d /srv/local-victim
+          sudo touch /srv/local-victim/key
+          sudo ln -s /srv/local-victim /srv/linked-warehouse
+          if scripts/install_converter.sh /srv/linked-warehouse 2>/dev/null; then
+            fail "took a WAREHOUSE that is a symlink"
+          fi
+          [ "$(sudo stat -c %U /srv/local-victim /srv/local-victim/key | sort -u)" = root ] \
+            || fail "handed a linked WAREHOUSE's target to netmon"
       # Grafana and its ClickHouse plugin, on the REST step's data.
       - name: Grafana
         run: |
@@ -130,7 +140,10 @@ jobs:
             curl -fs http://127.0.0.1:3000/api/health >/dev/null && break
             sleep 2
           done
-          NETMON_TEST_ALERT_EMAIL=alerts@example.com .venv/bin/python tests/grafana_test.py
+          # grafana_test also takes a test mail on 127.0.0.1:2525 and checks the
+          # login Grafana sends.
+          NETMON_TEST_ALERT_EMAIL=alerts@example.com NETMON_TEST_SMTP_PASSWORD="$password" \
+            .venv/bin/python tests/grafana_test.py
       - name: Sync
         run: tests/sync_test.sh
       - name: clang-tidy

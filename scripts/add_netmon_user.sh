@@ -12,7 +12,7 @@
 #
 # Each DIR is made if missing and handed to netmon while root still can (on
 # local disk, or before the NAS squashes root). This stops unless netmon then
-# owns everything in it.
+# owns everything in it. DIR must be an absolute path through no symlinks.
 set -eu
 
 if id netmon >/dev/null 2>&1; then
@@ -29,11 +29,23 @@ else
 fi
 
 for dir in "$@"; do
-  sudo install -d -o netmon -g users "$dir" 2>/dev/null \
-    || sudo -u netmon mkdir -p "$dir"
+  # Whoever can write the share could plant links to local files there, so
+  # root never follows one. DIR must go through none (callers pass it
+  # unresolved), and chown -h changes links, not their targets, from inside
+  # each folder (-execdir), so a folder swapped for a link meanwhile can't
+  # redirect it.
+  for real in "$(realpath -m -- "$dir" 2>/dev/null)" \
+    "$(sudo realpath -m -- "$dir" 2>/dev/null)"; do
+    if [ -n "$real" ] && [ "$real" != "$dir" ]; then
+      echo "$dir goes through a symlink, to $real; give a path without one" >&2
+      exit 1
+    fi
+  done
+  sudo mkdir -p "$dir" 2>/dev/null || sudo -u netmon mkdir -p "$dir"
+  sudo chown -h netmon:users "$dir" 2>/dev/null || true
   # Only what needs it: chown changes ctime, which the converter reads.
   sudo find "$dir" \( ! -user netmon -o ! -group users \) \
-    -exec chown netmon:users {} + 2>/dev/null || true
+    -execdir chown -h netmon:users {} + 2>/dev/null || true
   other=$(sudo find "$dir" ! -user netmon -print -quit)
   if [ -n "$other" ] || ! sudo -u netmon test -w "$dir"; then
     echo "netmon (uid $(id -u netmon)) doesn't own ${other:-$dir}; see README.md" >&2

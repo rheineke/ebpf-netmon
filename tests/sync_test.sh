@@ -52,6 +52,64 @@ if scripts/install_sync.sh "/srv/netmon sync" 2>/dev/null; then
 fi
 echo "ok  : stops for a RAW_ROOT with a space"
 
+# Links someone else planted on the share, to local files: the installer runs
+# as root, so it must change the links, never what they point at.
+victim=/srv/netmon-victim
+sudo install -d -m 755 "$victim.d"
+echo secret | sudo tee "$victim" >/dev/null
+sudo chmod 640 "$victim"
+sudo ln -s "$victim" "$dest/2026-01-01/planted.jsonl"
+sudo ln -s "$victim.d" "$dest/planted"
+sudo chown -h 5555:5555 "$dest/2026-01-01/planted.jsonl" "$dest/planted"
+status=0
+NETMON_UID=4321 scripts/install_sync.sh "$share" >/dev/null 2>&1 || status=$?
+if [ "$(sudo stat -c %U:%G "$victim" "$victim.d" | sort -u)" != root:root ]; then
+  echo "FAIL: the installer changed the owner of a link's target" >&2
+  exit 1
+fi
+if [ $status != 0 ] || [ "$(sudo stat -c %U "$dest/planted")" != netmon ]; then
+  echo "FAIL: the installer left a link netmon doesn't own" >&2
+  exit 1
+fi
+sudo rm "$dest/2026-01-01/planted.jsonl" "$dest/planted"
+echo "ok  : leaves the targets of links on the share alone"
+linked=/srv/netmon-linked
+sudo mkdir -p "$linked"
+sudo ln -s "$victim.d" "$linked/$(hostname)"
+if scripts/install_sync.sh "$linked" 2>/dev/null; then
+  echo "FAIL: took a DEST that is a symlink" >&2
+  exit 1
+fi
+if [ "$(sudo stat -c %U "$victim.d")" != root ]; then
+  echo "FAIL: handed a symlinked DEST's target to netmon" >&2
+  exit 1
+fi
+sudo rm -r "$linked" "$victim" "$victim.d"
+echo "ok  : stops for a DEST that is a symlink"
+
+# An unmounted share: RAW_ROOT's parent isn't there.
+if scripts/install_sync.sh /srv/no-share/netmon/raw 2>/dev/null \
+  || sudo test -e "/$(hostname)"; then
+  echo "FAIL: synced to /$(hostname) for a RAW_ROOT that doesn't exist" >&2
+  exit 1
+fi
+echo "ok  : stops for a RAW_ROOT that doesn't exist"
+
+# Another machine with this host name already syncs here.
+mark=$dest/.netmon-sync-id
+if ! sudo test -s "$mark"; then
+  echo "FAIL: the installer left no sync id in DEST" >&2
+  exit 1
+fi
+ours=$(sudo cat "$mark")
+echo other-machine | sudo -u netmon tee "$mark" >/dev/null
+if NETMON_UID=4321 scripts/install_sync.sh "$share" >/dev/null 2>&1; then
+  echo "FAIL: took a DEST another machine syncs to" >&2
+  exit 1
+fi
+echo "$ours" | sudo -u netmon tee "$mark" >/dev/null
+echo "ok  : stops for a DEST another machine syncs to"
+
 echo '{"ts":2}' | sudo tee -a "$raw/2026-01-01/00.jsonl" >/dev/null
 echo '{"ts":3}' | sudo tee "$raw/2026-01-01/01.jsonl" >/dev/null
 sudo systemctl start netmon-sync.service

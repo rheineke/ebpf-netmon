@@ -19,8 +19,9 @@ if [ $# -lt 1 ] || [ $# -gt 3 ]; then
   exit 2
 fi
 installed() { sed -n "s/^$1=//p" /etc/default/netmon-iceberg 2>/dev/null || true; }
-# Absolute, as the units run from /.
-warehouse=$(realpath -m "$1")
+# Absolute, as the units run from /. WAREHOUSE's symlinks aren't resolved:
+# add_netmon_user.sh refuses one, which someone on the share could plant.
+warehouse=$(realpath -m -s -- "$1")
 if [ $# -ge 2 ] && [ -n "$2" ]; then
   raw=$(realpath -m "$2")
 else
