@@ -108,6 +108,22 @@ jobs:
             *"Peer authentication failed"*) ;;
             *) fail "root can still log in to the catalog: $out" ;;
           esac
+          # A first run that skips a file it can't read stops the installer,
+          # with the journal lines that say which.
+          gone=$test/raw/gone/$(date -u -d '1 hour ago' +%Y-%m-%d/%H).jsonl
+          sudo mkdir -p "$(dirname "$gone")"
+          sudo ln -s /nonexistent "$gone"
+          status=0
+          out=$(NETMON_PYTHON=$python scripts/install_converter.sh $test/warehouse $test/raw \
+            "$NETMON_TEST_CATALOG" 2>&1) || status=$?
+          sudo rm -r $test/raw/gone
+          [ $status = 1 ] || fail "the installer exited $status past a skipped file"
+          [ "$(systemctl show -p ExecMainStatus --value netmon-iceberg.service)" = 66 ] \
+            || fail "the skipping run didn't exit 66: $out"
+          case $out in
+            *"$gone: skipped: "*) ;;
+            *) fail "the installer didn't say which file its first run skipped: $out" ;;
+          esac
           # Last, as the converter refuses a newer stray metadata file.
           sudo .venv/bin/python tests/dashboard_test.py stray $test
           .venv/bin/python tests/dashboard_test.py check $test

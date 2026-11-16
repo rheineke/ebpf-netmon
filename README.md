@@ -201,7 +201,8 @@ service's `-i 10`:
 {"ts":1792666260,"host":"raspberrypi","interval_s":10,"pid":4309,"uid":0,"comm":"nfsd","tcp_tx":84,"tcp_rx":120,"udp_tx":0,"udp_rx":0,"nfs_read":0,"nfs_write":0,"scale":1}
 ```
 
-To capture continuously on a Pi, after `scripts/build_on_pi.sh`:
+To capture continuously on a Pi, after `scripts/build_on_pi.sh` and once
+the Pi has its host name (see Several Pis):
 
 ```sh
 scripts/install_service.sh
@@ -253,13 +254,20 @@ RAW defaults to this machine's `/var/lib/netmon/raw`.
 Run one converter, and have every Pi copy its raw files to shared storage,
 such as an NFS share on a NAS mounted at the same path on each. Each Pi
 needs a host name of its own: Raspberry Pi OS names every Pi `raspberrypi`,
-and two Pis with one name would overwrite each other's files, so the sync's
-installer stops if another machine already syncs under its name.
+and two Pis with one name would overwrite each other's files. So the sync's
+installer writes the Pi's id, a hash of its board's serial number, to
+`RAW/HOST/.netmon-sync-id`, and every copy checks it: another Pi under the
+same name stops, and so does a copy of this Pi's SD card in another Pi,
+while this Pi keeps its folder with a new card. If the Pi itself is new,
+remove that file as `netmon` and re-run the installer.
 
 ```sh
 scripts/install_sync.sh /mnt/nas/netmon/raw     # on every Pi
 scripts/install_converter.sh /mnt/nas/netmon/warehouse /mnt/nas/netmon/raw
 ```
+
+The sync's installer needs `/mnt/nas/netmon` to exist, so that it stops
+while the share is unmounted, and makes the rest.
 
 The sync rsyncs `/var/lib/netmon/raw` to `RAW/$(hostname)/` every minute,
 and never deletes there. Local capture does not depend on the NAS: while it
@@ -267,7 +275,11 @@ is unmounted the sync and the converter skip their runs, and the next sync
 catches up. That needs the share in `/etc/fstab` (with `nofail`), so
 systemd knows it is a mount; under a share mounted by hand, the jobs would
 write to the empty folder beneath it. Each row carries the host name it was
-captured under, so renaming a Pi starts a new host in the table.
+captured under, so renaming a Pi starts a new host in the table. netmon
+reads the name when it starts, so restart it after a rename. Files
+captured under the old name would load as that name's host, so the sync's
+installer stops while `/var/lib/netmon/raw` holds any from the last 8 days;
+move them elsewhere.
 
 The converter looks back 7 days. It reports files that arrive later than
 that, but not hours that arrived on time while it was stopped for longer.
@@ -281,9 +293,9 @@ sudo -u netmon /opt/netmon/venv/bin/python /opt/netmon/to_iceberg.py \
 (The lock's folder, `/run/netmon-iceberg`, exists once either service has
 run since boot.) A raw file of the window that the converter can't read,
 such as a dangling link or a copy only its owner may read, is skipped. The
-run loads the rest, then exits with status 4, so the unit shows as failed
-(`systemctl --failed`). A file still unreadable when its hour leaves the
-window is never loaded.
+run loads the rest, then exits with status 66 (`EX_NOINPUT`), so the unit
+shows as failed (`systemctl --failed`). Once the file's hour leaves the
+window, only a run with a longer `--days` loads it.
 
 ### Running without root
 
@@ -308,7 +320,8 @@ scripts/install_sync.sh /mnt/nas/netmon/raw
 The installers pause their timers, let a run in progress finish, and hand
 the folders to `netmon` while root still can: on local disk, or before the
 NAS squashes root. They stop if `netmon` doesn't then own everything in
-them. The timers stay off, even across a reboot, until an installer gets
+them, and they refuse a path through a symlink, which older versions
+followed: give them the path `realpath` prints. The timers stay off, even across a reboot, until an installer gets
 to its end, where it starts them again. To move an existing setup with a
 PostgreSQL catalog, first re-run `scripts/install_postgres.sh`, so that
 only `netmon` can log in to it. Then re-run the other installers, check

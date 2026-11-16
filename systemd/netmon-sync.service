@@ -2,7 +2,9 @@
 # a converter loads it. Install with scripts/install_sync.sh, which writes
 # DEST to /etc/default/netmon-sync. rsync renames each file into place once
 # it is whole, and never deletes from DEST. Runs as netmon
-# (scripts/add_netmon_user.sh), so DEST must be writable by that user.
+# (scripts/add_netmon_user.sh), so DEST must be writable by that user. Each
+# copy first checks that DEST is this machine's (scripts/sync_id.sh), so a
+# copy of this SD card on another Pi stops rather than overwrite it.
 [Unit]
 Description=Copy netmon raw files to shared storage
 After=network-online.target remote-fs.target
@@ -12,6 +14,7 @@ Wants=network-online.target
 Type=oneshot
 User=netmon
 EnvironmentFile=/etc/default/netmon-sync
+ExecStartPre=/opt/netmon/sync_id.sh ${DEST}
 ExecStart=/usr/bin/rsync -rt --mkpath --chmod=D755,F644 /var/lib/netmon/raw/ ${DEST}/
 NoNewPrivileges=yes
 ProtectHome=yes

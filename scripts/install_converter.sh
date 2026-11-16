@@ -119,5 +119,11 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now netmon-iceberg.timer netmon-iceberg-maintain.timer
 
 echo "== First run"
-sudo systemctl start netmon-iceberg.service
-journalctl -u netmon-iceberg.service -n 3 --no-pager -o cat
+# A run that skipped unreadable files fails the unit, though it loaded the
+# rest and the install is complete; the journal says which files.
+if ! sudo systemctl start netmon-iceberg.service 2>/dev/null; then
+  sudo journalctl -u netmon-iceberg.service -n 20 --no-pager -o cat
+  echo "the first run failed; see above" >&2
+  exit 1
+fi
+sudo journalctl -u netmon-iceberg.service -n 3 --no-pager -o cat

@@ -37,7 +37,7 @@ for dir in "$@"; do
   for real in "$(realpath -m -- "$dir" 2>/dev/null)" \
     "$(sudo realpath -m -- "$dir" 2>/dev/null)"; do
     if [ -n "$real" ] && [ "$real" != "$dir" ]; then
-      echo "$dir goes through a symlink, to $real; give a path without one" >&2
+      echo "$dir must be an absolute path through no symlinks; it leads to $real" >&2
       exit 1
     fi
   done

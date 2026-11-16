@@ -31,6 +31,10 @@ Runs take turns through a lock file (--lock), and a run that stops partway
 leaves a marker on this machine's disk (--marker), so the next one deletes
 the metadata it wrote but never committed. Only main() does these; call
 convert() and maintain() only while no other run can.
+
+Exits 0 when done, 1 when it refuses to run (it says why), 2 for bad
+arguments, and 66 (EX_NOINPUT) when it skipped raw files it couldn't read,
+after loading the rest.
 """
 
 import argparse
@@ -99,7 +103,7 @@ ARROW_SCHEMA = pa.schema(
 # The services own these directories (RuntimeDirectory and StateDirectory).
 LOCK = "/run/netmon-iceberg/lock"  # only its user (or root) can write there
 MARKER = "/var/lib/netmon-iceberg/iceberg-run.json"  # local, kept across reboots
-SKIPPED_STATUS = 4  # a load that skipped raw files it couldn't read
+SKIPPED_STATUS = os.EX_NOINPUT  # 66: skipped raw files it couldn't read
 COMPACT_MAX_ROWS = 1_000_000  # bigger days stay as they are, to bound memory
 # NNNNN-UUID.metadata.json, numbered from 00000 by each commit.
 METADATA_NAME = re.compile(r"(\d+)-.+\.metadata\.json")
@@ -557,7 +561,11 @@ def maintain(warehouse, now=None, keep_days=28, catalog_uri=None, on_commit=None
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(
+        description=__doc__.splitlines()[0],
+        epilog="Exit status: 1 refused to run, 2 bad arguments, "
+        f"{SKIPPED_STATUS} skipped unreadable raw files.",
+    )
     parser.add_argument("--raw", default="/var/lib/netmon/raw")
     parser.add_argument("--warehouse", required=True)
     parser.add_argument(
@@ -605,6 +613,7 @@ def main():
     def marked(table):
         mark_run(args.marker, args.warehouse, table)
 
+    skips = []
     if args.maintain:
         done = maintain(
             args.warehouse,
@@ -614,7 +623,6 @@ def main():
         )
         print(", ".join(f"{n} {what}" for what, n in done.items()))
     else:
-        skips = []
         n = convert(
             args.raw,
             args.warehouse,
@@ -625,9 +633,9 @@ def main():
         )
         print(f"added {n} rows to {TABLE}")
     Path(args.marker).unlink()
-    if not args.maintain and skips:
+    if skips:
         # Loaded the rest, but fail the unit so that someone looks: once out
-        # of the window, a file is never loaded.
+        # of the window, a file is loaded only with a longer --days.
         print(f"{len(skips)} raw file(s) skipped", file=sys.stderr)
         sys.exit(SKIPPED_STATUS)
 
