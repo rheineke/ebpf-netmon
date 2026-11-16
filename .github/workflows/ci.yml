@@ -125,6 +125,22 @@ jobs:
           fi
           [ "$(sudo stat -c %U /srv/local-victim /srv/local-victim/key | sort -u)" = root ] \
             || fail "handed a linked WAREHOUSE's target to netmon"
+          # A first run that skips a file it can't read stops the installer,
+          # with the journal lines that say which.
+          gone=$test/raw/gone/$(date -u -d '1 hour ago' +%Y-%m-%d/%H).jsonl
+          sudo mkdir -p "$(dirname "$gone")"
+          sudo ln -s /nonexistent "$gone"
+          status=0
+          out=$(NETMON_PYTHON=$python scripts/install_converter.sh $test/warehouse $test/raw \
+            "$NETMON_TEST_CATALOG" 2>&1) || status=$?
+          sudo rm -r $test/raw/gone
+          [ $status = 1 ] || fail "the installer exited $status past a skipped file"
+          [ "$(systemctl show -p ExecMainStatus --value netmon-iceberg.service)" = 66 ] \
+            || fail "the skipping run didn't exit 66"
+          case $out in
+            *"$gone: skipped: "*) ;;
+            *) fail "the installer didn't say which file its first run skipped: $out" ;;
+          esac
       # Grafana and its ClickHouse plugin, on the REST step's data.
       - name: Grafana
         run: |

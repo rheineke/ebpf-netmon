@@ -231,7 +231,7 @@ def check_skips():
         check(
             "a run that skipped files loads the rest, then fails",
             (done.returncode, "added 2 rows" in done.stdout),
-            (to_iceberg.SKIPPED_STATUS, True),
+            (66, True),  # EX_NOINPUT, as README.md says
         )
     t = time.time()
     check(
