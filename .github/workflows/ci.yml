@@ -121,8 +121,8 @@ jobs:
           scripts/install_grafana.sh
           # Alert email, as typed at its prompts, with a password systemd
           # would mangle in an environment file.
-          password='p\a"ss '
-          printf '%s\n' alerts@example.com 127.0.0.1:2525 '' "$password" \
+          password='p\a"s s'
+          printf '%s\n' alerts@example.com 127.0.0.1:2525 '' '' "$password" \
             | scripts/configure_alert_email.sh
           [ "$(sudo cat /etc/grafana/netmon-smtp-password)" = "$password" ] \
             || { echo "FAIL: the SMTP password file differs"; exit 1; }

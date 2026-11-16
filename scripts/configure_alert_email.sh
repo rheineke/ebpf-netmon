@@ -16,12 +16,28 @@ read -rp "SMTP server [smtp.gmail.com:587]: " host
 host=${host:-smtp.gmail.com:587}
 read -rp "SMTP user [$to]: " user
 user=${user:-$to}
-# IFS= keeps any spaces at its ends.
+read -rp "Send from [$user]: " from
+from=${from:-$user}
 IFS= read -rsp "SMTP password: " password
 echo
-# systemd reads the settings file unquoted, so keep them plain; the password,
-# which may hold anything, goes in a file of its own.
-for value in "$to" "$host" "$user"; do
+case $password in
+  "" | [[:space:]]* | *[[:space:]])
+    echo "the password can't be empty or start or end with a space," \
+      "which Grafana would drop" >&2
+    exit 2
+    ;;
+esac
+case $host in
+  *:[0-9]*) ;;
+  *)
+    echo "give the SMTP server as host:port, e.g. smtp.gmail.com:587" >&2
+    exit 2
+    ;;
+esac
+# systemd reads the settings file unquoted, so keep them plain. The
+# password, which may hold anything, goes in a file of its own, which
+# Grafana reads through $__file{} (the apt package has no __FILE variables).
+for value in "$to" "$host" "$user" "$from"; do
   case $value in
     "" | *[[:space:]\\\"\']*)
       echo "addresses and servers can't be empty or hold spaces, quotes or \\" >&2
@@ -40,8 +56,8 @@ printf '%s\n' \
   GF_SMTP_ENABLED=true \
   "GF_SMTP_HOST=$host" \
   "GF_SMTP_USER=$user" \
-  "GF_SMTP_PASSWORD__FILE=$secret" \
-  "GF_SMTP_FROM_ADDRESS=$user" \
+  "GF_SMTP_PASSWORD=\$__file{$secret}" \
+  "GF_SMTP_FROM_ADDRESS=$from" \
   "GF_SMTP_FROM_NAME=netmon" \
   "NETMON_ALERT_EMAIL=$to" | sudo tee "$env" >/dev/null
 

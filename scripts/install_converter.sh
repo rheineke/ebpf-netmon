@@ -111,9 +111,7 @@ for unit in netmon-iceberg netmon-iceberg-maintain; do
   # If WAREHOUSE or RAW is on a mount (a NAS), skip runs while it is
   # unmounted rather than write a second warehouse under the mount point.
   sudo mkdir -p "/etc/systemd/system/$unit.service.d"
-  # The unit's ProtectSystem=strict leaves only WAREHOUSE writable.
-  printf '[Unit]\nRequiresMountsFor=%s %s\n[Service]\nReadWritePaths=%s\n' \
-    "$warehouse" "$raw" "$warehouse" \
+  printf '[Unit]\nRequiresMountsFor=%s %s\n' "$warehouse" "$raw" \
     | sudo tee "/etc/systemd/system/$unit.service.d/warehouse.conf" >/dev/null
 done
 sudo systemctl daemon-reload

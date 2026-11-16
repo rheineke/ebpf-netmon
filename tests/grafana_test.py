@@ -96,6 +96,9 @@ def check_alert_email():
     email = [p for p in points if p["name"] == "netmon email"]
     got = email[0]["settings"].get("addresses") if email else None
     check(f"the alert contact point sends to {want}", got == want, got)
+    # Grafana shows a set password as asterisks, and an unset one as "".
+    smtp = api("/api/admin/settings")["smtp"]
+    check("Grafana has the SMTP password", smtp.get("password", "") != "", smtp)
 
 
 def main():

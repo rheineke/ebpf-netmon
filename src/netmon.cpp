@@ -275,7 +275,8 @@ std::time_t sleep_to_boundary(int interval_s)
 	return std::max(due, now.tv_sec / interval_s * interval_s);
 }
 
-// Exit status when the sock tracepoints can't attach: restarting won't help.
+// Exit status when this kernel can't have the sock tracepoints (no tracefs,
+// too old, another layout): restarting won't help.
 constexpr int kCantCount = 3;
 
 int quiet_print(enum libbpf_print_level, const char *, va_list) { return 0; }
@@ -322,8 +323,9 @@ public:
 			bpf_link__destroy(p.link);
 	}
 
-	// Attaches the tracepoints; false, saying why, if one can't attach.
-	bool attach_required()
+	// Attaches the tracepoints. Returns 0, or saying why: kCantCount if
+	// this kernel can't have them, 1 if attaching failed and may not again.
+	int attach_required()
 	{
 		mount_tracefs();
 		const std::string root = tracefs_root();
@@ -341,21 +343,24 @@ public:
 								     1),
 						 name.substr(event + 1),
 						 kSockMsgLength);
+			int status = kCantCount;
 			if (problem.empty()) {
 				p.link = bpf_program__attach(p.prog);
-				if (!p.link)
+				if (!p.link) {
 					problem = std::string(" ") +
 						  std::strerror(errno);
+					status = 1;
+				}
 			}
 			if (!problem.empty()) {
 				std::fprintf(stderr,
 					     "netmon: can't count TCP and UDP: "
 					     "%s:%s\n",
 					     name.c_str(), problem.c_str());
-				return false;
+				return status;
 			}
 		}
-		return true;
+		return 0;
 	}
 
 	// Attaches the kprobes it can. Says why for those it can't the first
@@ -431,8 +436,8 @@ private:
 int run(netmon_bpf *skel, const Options &opts)
 {
 	Probes probes(skel);
-	if (!probes.attach_required())
-		return kCantCount;
+	if (int status = probes.attach_required())
+		return status;
 	probes.attach_optional(false);
 
 	std::signal(SIGINT, on_signal);
@@ -441,7 +446,11 @@ int run(netmon_bpf *skel, const Options &opts)
 	int map_fd = bpf_map__fd(skel->maps.traffic);
 	const bool use_proc = in_initial_pid_namespace();
 	Totals prev;
-	collect_map(map_fd, prev, use_proc);  // report only traffic from now on
+	// Report only traffic from now on. A table starts at a boundary, so its
+	// first report covers a whole interval; files count from the start.
+	if (!opts.json)
+		sleep_to_boundary(opts.interval_s);
+	collect_map(map_fd, prev, use_proc);
 	std::mt19937_64 rng(std::random_device{}());
 	const std::string host = host_name();
 	HourlyFiles files(opts.out_dir);

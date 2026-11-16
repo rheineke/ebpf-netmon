@@ -16,9 +16,10 @@ ExecStart=/usr/bin/rsync -rt --mkpath --chmod=D755,F644 /var/lib/netmon/raw/ ${D
 NoNewPrivileges=yes
 ProtectHome=yes
 PrivateTmp=yes
-# The rest of the system read-only: the installer's drop-in adds DEST with
-# ReadWritePaths=, and systemd makes the state and runtime directories.
-ProtectSystem=strict
+# /usr, /boot and /etc read-only. Not ProtectSystem=strict, whose
+# ReadWritePaths=DEST systemd would set up as root before dropping to netmon:
+# on a NAS that squashes root, that fails when root can't reach DEST.
+ProtectSystem=full
 PrivateDevices=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes

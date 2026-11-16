@@ -135,12 +135,17 @@ def check_backlog_and_clock():
         for days in (3, 2, 1):
             write_hour(raw, "pi-a", five - dt.timedelta(days=days), 2)
         write_hour(raw, "pi-a", five - dt.timedelta(days=9), 2)  # just arrived
-        err = io.StringIO()
+        err, commits = io.StringIO(), []
+
+        def committed(table):
+            commits.append(table.metadata_location)
+
         with contextlib.redirect_stderr(err):
-            added = to_iceberg.convert(raw, warehouse, NOW)
+            added = to_iceberg.convert(raw, warehouse, NOW, on_commit=committed)
         table = to_iceberg.open_table(warehouse)
         check("a 3-day backlog loads", added, 6)
         check("in a commit per day", len(table.snapshots()), 3)
+        check("each reported, for the run marker", len(set(commits)), 3)
         check(
             "a file too late to load is reported", "with --days" in err.getvalue(), True
         )

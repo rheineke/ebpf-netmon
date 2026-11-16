@@ -5,15 +5,15 @@ eBPF network traffic monitoring for Raspberry Pis (Debian trixie, arm64).
 ```
  each Pi                               NAS                   one Pi
 ┌──────────────────────────────┐      ┌──────────────┐      ┌──────────────────────┐
-│ netmon (BPF) ─ hourly JSONL ─┼rsync─▶ raw/HOST/... ├──────▶ to_iceberg.py        │
-│ /var/lib/netmon/raw          │      │              │      │   (hourly)           │
-└──────────────────────────────┘      │ Iceberg      ◀──────┤                      │
-                                      │ warehouse    ├──────▶ ClickHouse ─ Grafana │
+│ netmon (BPF) ─ hourly JSONL ─┼rsync─▶ raw/HOST/... ├──┬───▶ to_iceberg.py        │
+│ /var/lib/netmon/raw          │      │              │  │   │   (hourly)           │
+└──────────────────────────────┘      │ Iceberg      ◀──┼───┤                      │
+                                      │ warehouse    ├──┴───▶ ClickHouse ─ Grafana │
                                       └──────────────┘      └──────────────────────┘
 ```
 
 `netmon` counts each process's TCP, UDP and NFS bytes in the kernel, and
-writes a row per process every 10 seconds. A minute later the row is on the
+every 10 seconds writes a row for each process that moved any. A minute later the row is on the
 NAS, and Grafana's live view shows it. Each hour the converter loads the
 finished hour into an Iceberg table, which ClickHouse serves to Grafana's
 dashboard and alerts.
@@ -37,7 +37,8 @@ the clock is synchronized.
 ### How it counts
 
 - **TCP and UDP**: the `sock:sock_send_length` and `sock:sock_recv_length`
-  tracepoints (kernel 6.3+). They fire once per `sock_sendmsg()` and
+  tracepoints (kernel 6.3+; `sendfile()` and `splice()` into a socket reach
+  them from 6.5). They fire once per `sock_sendmsg()` and
   `sock_recvmsg()`, which every send and receive goes through, with the
   bytes moved. Peeks are skipped, since the read that follows counts.
   MPTCP counts as TCP. `splice()` from a TCP socket skips them, so a
@@ -54,6 +55,8 @@ tracefs itself, which needs `--privileged`.
 
 Traffic over loopback (`127.0.0.1`, say Grafana querying ClickHouse on the
 same Pi) counts as both sent and received, as each end is a process here.
+So does traffic through a VPN run as a process (Tailscale, wireguard-go,
+OpenVPN): the app's TCP inside the tunnel and the daemon's UDP outside it.
 A raw IP socket (`SOCK_RAW` with `IPPROTO_TCP`, as some packet tools use)
 counts as TCP or UDP too: the tracepoint doesn't tell socket types apart.
 Packet capture through `AF_PACKET` (tcpdump, libpcap) isn't counted.
@@ -187,7 +190,8 @@ the Synology NAS (read-only) and a loopback export (read and write).
 once its hour has passed. Each row is one process in one interval of
 `interval_s` seconds, ending at `ts`. Reports fall on wall-clock multiples
 of `-i` (:00, :10, :20…) on every host, so a dashboard bucket a multiple of
-that wide holds whole reports:
+that wide holds whole reports. The dashboard's rate panels assume the
+service's `-i 10`:
 
 ```json
 {"ts":1792666260,"host":"raspberrypi","interval_s":10,"pid":4309,"uid":0,"comm":"nfsd","tcp_tx":84,"tcp_rx":120,"udp_tx":0,"udp_rx":0,"nfs_read":0,"nfs_write":0,"scale":1}
@@ -226,7 +230,9 @@ safe and an hour copied before it was complete is filled in later. It
 commits a day at a time, so a long backlog loads in bounded memory. It
 refuses to commit with the clock more than a minute behind the table's last
 commit, since Iceberg's Java readers reject a history that goes back in
-time. To run it at five past every hour:
+time. (If a clock that ran ahead made that commit, the converter waits
+until real time passes it, or roll the table back to an earlier snapshot.)
+To run it at five past every hour:
 
 ```sh
 scripts/install_converter.sh WAREHOUSE [RAW]
@@ -255,7 +261,8 @@ sudo -u netmon /opt/netmon/venv/bin/python /opt/netmon/to_iceberg.py \
   --warehouse WAREHOUSE --raw RAW --catalog CATALOG --days 30
 ```
 
-Catching up that way needs the share in `/etc/fstab` (with `nofail`), so systemd
+(The lock's folder, `/run/netmon-iceberg`, exists once either timer has run
+since boot.) Catching up that way needs the share in `/etc/fstab` (with `nofail`), so systemd
 knows it is a mount; under a share mounted by hand, the jobs would write to
 the empty folder beneath it. Each row carries the host name it was captured under, so
 renaming a Pi starts a new host in the table.
@@ -399,10 +406,11 @@ To get them by email, run this on the Grafana machine, in a terminal:
 scripts/configure_alert_email.sh
 ```
 
-It asks for the address and an SMTP login (for Gmail, an app password)
-and stores them in `/etc/grafana/netmon-alerts.env`, and the password in
-`/etc/grafana/netmon-smtp-password`, both readable only by root and
-Grafana. Renaming a host makes its old name fire "Host stopped
+It asks for the address, an SMTP login (for Gmail, an app password) and
+the sender, and stores them in `/etc/grafana/netmon-alerts.env`, and the
+password in `/etc/grafana/netmon-smtp-password`, which Grafana reads
+through `$__file{}`; both are readable only by root and Grafana. CI checks
+that Grafana has the password. Renaming a host makes its old name fire "Host stopped
 reporting" until a day after its last row, when the alert resolves; so
 does a host that stays down that long.
 
