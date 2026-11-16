@@ -2,7 +2,7 @@
 # Install with scripts/install_service.sh.
 [Unit]
 Description=netmon per-process network byte counts
-After=network.target time-sync.target
+After=network.target
 
 [Service]
 # -w: a Pi has no clock battery, so it boots with the last shutdown's time.
@@ -11,6 +11,9 @@ After=network.target time-sync.target
 ExecStart=/usr/local/bin/netmon -i 10 -n 0 -w 300 -o /var/lib/netmon/raw
 Restart=on-failure
 RestartSec=10
+# Exit 3: this kernel can't give netmon the sock tracepoints (the journal
+# says why). Retrying every 10 s won't change that.
+RestartPreventExitStatus=3
 StateDirectory=netmon
 # Root, for its files, but holding only what loading and attaching BPF
 # programs needs (kernel 5.8+). netmon reads process names, which any

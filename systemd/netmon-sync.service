@@ -16,3 +16,18 @@ ExecStart=/usr/bin/rsync -rt --mkpath --chmod=D755,F644 /var/lib/netmon/raw/ ${D
 NoNewPrivileges=yes
 ProtectHome=yes
 PrivateTmp=yes
+# The rest of the system read-only: the installer's drop-in adds DEST with
+# ReadWritePaths=, and systemd makes the state and runtime directories.
+ProtectSystem=strict
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native

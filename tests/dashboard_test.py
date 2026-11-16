@@ -122,7 +122,7 @@ def stray(test_dir):
     (folder / "99999-stray.metadata.json").write_bytes(first.read_bytes())
 
 
-def fill_macros(sql):
+def fill_macros(sql, interval=3600):
     """Does what Grafana and its ClickHouse plugin do before sending SQL."""
     end = START + dt.timedelta(hours=HOURS)
     sql = sql.replace("${host:singlequote}", "'pi-a', 'pi-b'")
@@ -134,13 +134,13 @@ def fill_macros(sql):
     )
     sql = re.sub(
         r"\$__timeInterval\((\w+)\)",
-        r"toStartOfInterval(toDateTime(\1), INTERVAL 3600 second)",
+        rf"toStartOfInterval(toDateTime(\1), INTERVAL {interval} second)",
         sql,
     )
-    return sql.replace("$__interval_s", "3600")
+    return sql.replace("$__interval_s", str(interval))
 
 
-def query(sql):
+def query(sql, interval=3600):
     out = subprocess.run(
         [
             "clickhouse-client",
@@ -150,7 +150,7 @@ def query(sql):
             "JSONEachRow",
             "--output_format_json_quote_64bit_integers=0",
         ],
-        input=fill_macros(sql),
+        input=fill_macros(sql, interval),
         capture_output=True,
         text=True,
     )
@@ -211,6 +211,7 @@ def check(test_dir):
         else:
             check_eq(f"{title}: rows", len(rows), 4)  # 2 hosts x 2 comms
             check_eq(f"{title}: pids", {r["pids"] for r in rows}, {1})
+    check_bucket_rates(dash)
     check_alerts()
     check_locked_down()
     print("PASS")
@@ -268,6 +269,32 @@ def check_high_traffic(title, sql, limit):
     check_eq(f"{title}: programs in its window", sorted(rates), ["big", "small"])
     check_eq(f"{title}: rate", round(rates["big"]), round(3_100_000_000 / 300))
     check_eq(f"{title}: fires", rates["big"] > limit >= rates["small"], True)
+
+
+def check_bucket_rates(dash):
+    """Grafana picks 15 s buckets for a 6-hour view on many screens. Over a
+    steady rate reported every 10 s, each rate panel must draw a flat line
+    at every bucket width, not alternate between 2/3 and 4/3 of it."""
+    start = int(START.timestamp())
+    steady = (  # an hour of reports, 1,000 bytes per counter each
+        f"SELECT toDateTime64({start} + 10 * (i + 1), 6, 'UTC') AS ts,"
+        " 'pi-a' AS host, 'p' AS comm, 0 AS uid, 1.0 AS scale,"
+        + ", ".join(f"toInt64(1000) AS {c}" for c in COUNTERS)
+        + " FROM (SELECT arrayJoin(range(360)) AS i)"
+    )
+    for panel in dash["panels"]:
+        if panel["type"] != "timeseries":
+            continue
+        sql = panel["targets"][0]["rawSql"].replace(
+            "netmon.traffic_live", f"({steady})"
+        )
+        title = panel["title"]
+        seen = set()
+        for interval in (10, 15, 20, 60):
+            rates = [r["bytes_per_s"] for r in query(sql, interval)][1:-1]  # whole
+            check_eq(f"{title}: flat at {interval} s buckets", len(set(rates)), 1)
+            seen |= set(rates)
+        check_eq(f"{title}: the same rate at every width", len(seen), 1)
 
 
 def check_alerts():

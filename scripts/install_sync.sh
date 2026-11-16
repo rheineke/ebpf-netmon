@@ -38,7 +38,8 @@ echo "DEST=$dest" | sudo tee /etc/default/netmon-sync >/dev/null
 sudo install -m 644 systemd/netmon-sync.service systemd/netmon-sync.timer \
   /etc/systemd/system/
 sudo mkdir -p /etc/systemd/system/netmon-sync.service.d
-printf '[Unit]\nRequiresMountsFor=%s\n' "$dest" \
+# The unit's ProtectSystem=strict leaves only DEST writable.
+printf '[Unit]\nRequiresMountsFor=%s\n[Service]\nReadWritePaths=%s\n' "$dest" "$dest" \
   | sudo tee /etc/systemd/system/netmon-sync.service.d/dest.conf >/dev/null
 sudo systemctl daemon-reload
 sudo systemctl enable --now netmon-sync.timer

@@ -6,8 +6,10 @@ Partway through, it moves the table from the default SQLite catalog to
 $NETMON_TEST_CATALOG (a SQLAlchemy URI), or to a second SQLite file.
 """
 
+import contextlib
 import datetime as dt
 import fcntl
+import io
 import json
 import os
 import subprocess
@@ -15,6 +17,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from unittest import mock
 
 from pyiceberg.exceptions import NoSuchTableError
 
@@ -123,8 +126,45 @@ def check_units():
     )
 
 
+def check_backlog_and_clock():
+    """A backlog commits a day at a time, a file that arrives too late to load
+    is reported, and a clock behind the last commit commits nothing."""
+    with tempfile.TemporaryDirectory() as tmp:
+        raw, warehouse = Path(tmp) / "raw", Path(tmp) / "warehouse"
+        five = NOW.replace(hour=5, minute=0)
+        for days in (3, 2, 1):
+            write_hour(raw, "pi-a", five - dt.timedelta(days=days), 2)
+        write_hour(raw, "pi-a", five - dt.timedelta(days=9), 2)  # just arrived
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            added = to_iceberg.convert(raw, warehouse, NOW)
+        table = to_iceberg.open_table(warehouse)
+        check("a 3-day backlog loads", added, 6)
+        check("in a commit per day", len(table.snapshots()), 3)
+        check(
+            "a file too late to load is reported", "with --days" in err.getvalue(), True
+        )
+
+        write_hour(raw, "pi-a", five - dt.timedelta(days=1, hours=1), 2)
+        behind = table.metadata.last_updated_ms / 1000 - 120
+        with mock.patch("time.time", return_value=behind):
+            refused = refuses(to_iceberg.convert, raw, warehouse, NOW)
+            check("a clock behind the last commit refuses", refused, True)
+            refused = refuses(to_iceberg.maintain, warehouse, NOW)
+            check("and so does maintenance", refused, True)
+        check(
+            "committing nothing", len(to_iceberg.open_table(warehouse).snapshots()), 3
+        )
+        check(
+            "then loads with the clock right",
+            to_iceberg.convert(raw, warehouse, NOW),
+            2,
+        )
+
+
 def main():
     check_units()
+    check_backlog_and_clock()
     with tempfile.TemporaryDirectory() as tmp:
         raw, warehouse = Path(tmp) / "raw", Path(tmp) / "warehouse"
         h10 = NOW.replace(hour=10, minute=0)

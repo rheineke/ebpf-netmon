@@ -2,6 +2,22 @@
 
 eBPF network traffic monitoring for Raspberry Pis (Debian trixie, arm64).
 
+```
+ each Pi                               NAS                   one Pi
+┌──────────────────────────────┐      ┌──────────────┐      ┌──────────────────────┐
+│ netmon (BPF) ─ hourly JSONL ─┼rsync─▶ raw/HOST/... ├──────▶ to_iceberg.py        │
+│ /var/lib/netmon/raw          │      │              │      │   (hourly)           │
+└──────────────────────────────┘      │ Iceberg      ◀──────┤                      │
+                                      │ warehouse    ├──────▶ ClickHouse ─ Grafana │
+                                      └──────────────┘      └──────────────────────┘
+```
+
+`netmon` counts each process's TCP, UDP and NFS bytes in the kernel, and
+writes a row per process every 10 seconds. A minute later the row is on the
+NAS, and Grafana's live view shows it. Each hour the converter loads the
+finished hour into an Iceberg table, which ClickHouse serves to Grafana's
+dashboard and alerts.
+
 ## netmon
 
 `netmon` prints the TCP and UDP bytes each process sent and received in the
@@ -38,6 +54,9 @@ tracefs itself, which needs `--privileged`.
 
 Traffic over loopback (`127.0.0.1`, say Grafana querying ClickHouse on the
 same Pi) counts as both sent and received, as each end is a process here.
+A raw IP socket (`SOCK_RAW` with `IPPROTO_TCP`, as some packet tools use)
+counts as TCP or UDP too: the tracepoint doesn't tell socket types apart.
+Packet capture through `AF_PACKET` (tcpdump, libpcap) isn't counted.
 
 The tracepoints replace kprobes on `tcp_sendmsg`, `tcp_cleanup_rbuf` and
 `udp(v6)_sendmsg`/`recvmsg`, which overcounted: a `MSG_WAITALL` read was
@@ -166,10 +185,12 @@ the Synology NAS (read-only) and a loopback export (read and write).
 `netmon -o DIR` appends each report as JSON lines to
 `DIR/YYYY-MM-DD/HH.jsonl`, one file per UTC hour, so a file is complete
 once its hour has passed. Each row is one process in one interval of
-`interval_s` seconds, ending at `ts`:
+`interval_s` seconds, ending at `ts`. Reports fall on wall-clock multiples
+of `-i` (:00, :10, :20…) on every host, so a dashboard bucket a multiple of
+that wide holds whole reports:
 
 ```json
-{"ts":1792666261,"host":"raspberrypi","interval_s":10,"pid":4309,"uid":0,"comm":"nfsd","tcp_tx":84,"tcp_rx":120,"udp_tx":0,"udp_rx":0,"nfs_read":0,"nfs_write":0,"scale":1}
+{"ts":1792666260,"host":"raspberrypi","interval_s":10,"pid":4309,"uid":0,"comm":"nfsd","tcp_tx":84,"tcp_rx":120,"udp_tx":0,"udp_rx":0,"nfs_read":0,"nfs_write":0,"scale":1}
 ```
 
 To capture continuously on a Pi, after `scripts/build_on_pi.sh`:
@@ -189,7 +210,9 @@ network, and a read-only view of the system apart from its own folder
 (`systemd-analyze security` rates it 2.8, against 8.7 before). A Pi has no
 clock battery and boots with the time of its last shutdown, so the service
 holds its reports until NTP sets the clock (`-w 300`); the counts keep
-adding up meanwhile, so the first report covers everything. A crash that
+adding up meanwhile, so the first report covers everything. If the kernel
+can't give it the sock tracepoints (before Linux 6.3), netmon exits with
+status 3, saying why, and systemd doesn't restart it. A crash that
 cuts off the last line of an hour's file costs only that row: the next run
 starts a new line.
 
@@ -199,8 +222,11 @@ starts a new line.
 Iceberg table `netmon.traffic`, stored as Parquet and partitioned by day,
 with a SQLite catalog in the warehouse directory. A file is loaded again
 only when it has more rows than the table holds for its hour, so reruns are
-safe and an hour copied before it was complete is filled in later. To run
-it at five past every hour:
+safe and an hour copied before it was complete is filled in later. It
+commits a day at a time, so a long backlog loads in bounded memory. It
+refuses to commit with the clock more than a minute behind the table's last
+commit, since Iceberg's Java readers reject a history that goes back in
+time. To run it at five past every hour:
 
 ```sh
 scripts/install_converter.sh WAREHOUSE [RAW]
@@ -221,7 +247,15 @@ scripts/install_converter.sh /mnt/nas/netmon/warehouse /mnt/nas/netmon/raw
 The sync rsyncs `/var/lib/netmon/raw` to `RAW/$(hostname)/` every minute,
 and never deletes there. Local capture does not depend on the NAS: while it
 is unmounted the sync and the converter skip their runs, and the next sync
-catches up. That needs the share in `/etc/fstab` (with `nofail`), so systemd
+catches up. The converter looks back 7 days; it reports files that arrive
+later than that, which load with a longer look-back, as `netmon`:
+
+```sh
+sudo -u netmon /opt/netmon/venv/bin/python /opt/netmon/to_iceberg.py \
+  --warehouse WAREHOUSE --raw RAW --catalog CATALOG --days 30
+```
+
+Catching up that way needs the share in `/etc/fstab` (with `nofail`), so systemd
 knows it is a mount; under a share mounted by hand, the jobs would write to
 the empty folder beneath it. Each row carries the host name it was captured under, so
 renaming a Pi starts a new host in the table.
@@ -231,7 +265,8 @@ renaming a Pi starts a new host in the table.
 The sync and the converter run as the user `netmon`, which the installers
 create (`scripts/add_netmon_user.sh`). It only needs to read
 `/var/lib/netmon/raw` and write the shared folders, so neither job holds
-root on the NAS. Have the NAS map root to a guest (root squash, e.g.
+root on the NAS. Their units are sandboxed too: no capabilities, and the
+system read-only apart from the folder each writes and its own state. Have the NAS map root to a guest (root squash, e.g.
 Synology's "Map root to guest"), and give `netmon` the uid of a NAS user
 that owns the share and has no admin rights. Every installer that creates
 `netmon` takes it (the sync, the converter and PostgreSQL), and stops if
@@ -280,7 +315,7 @@ scripts/install_converter.sh WAREHOUSE RAW \
   'postgresql+psycopg2://netmon@/netmon?host=/var/run/postgresql'
 ```
 
-PostgreSQL is reached over its Unix socket only, with no password. On its
+The converter reaches PostgreSQL over its Unix socket, with no password. On its
 first run the converter adopts the table already in the warehouse, so
 nothing is copied; ClickHouse reads the warehouse directly and doesn't
 change. The old catalog then refuses to run, since its metadata is out of
@@ -309,7 +344,9 @@ to this machine only, with Apache Iceberg's own server (from its
 `apache/iceberg-rest-fixture` image, checked by hash) and Debian's Java.
 It logs in to PostgreSQL as `netmon_rest`, which may only read, and can't
 write files. It uses about 200 MB of memory, and live queries take about
-0.2 s longer. To read the folder again, `systemctl disable --now
+0.2 s longer. A reader of the folder can, rarely, catch a metadata file the
+converter is still writing and fail that one query; through the catalog it
+can't, so use this for alerts you rely on. To read the folder again, `systemctl disable --now
 netmon-iceberg-rest`, remove `/etc/default/netmon-iceberg-rest` and re-run
 `install_clickhouse.sh`.
 
@@ -330,7 +367,9 @@ ClickHouse listens on 127.0.0.1 only. It has two views:
   RAW for hours not yet in Iceberg, so it is as recent as the raw files:
   about a minute behind with the per-minute sync. It opens only the raw
   files of hours not in Iceberg yet, found by path, so queries take about
-  0.4 s longer on a Pi 4. An hour the converter loaded before all of it
+  0.4 s longer on a Pi 4. It still lists every raw file to find them, and
+  nothing deletes old raw files yet, so that cost grows with the history:
+  about 0.7 s more for a year of three hosts' files. An hour the converter loaded before all of it
   arrived shows its late rows after the next run, at five past.
 
 Grafana's ClickHouse user, `grafana`, may only read these views; they read
@@ -361,8 +400,9 @@ scripts/configure_alert_email.sh
 ```
 
 It asks for the address and an SMTP login (for Gmail, an app password)
-and stores them in `/etc/grafana/netmon-alerts.env`, readable only by root
-and Grafana. Renaming a host makes its old name fire "Host stopped
+and stores them in `/etc/grafana/netmon-alerts.env`, and the password in
+`/etc/grafana/netmon-smtp-password`, both readable only by root and
+Grafana. Renaming a host makes its old name fire "Host stopped
 reporting" until a day after its last row, when the alert resolves; so
 does a host that stays down that long.
 
@@ -379,10 +419,11 @@ every panel and alert query through Grafana's ClickHouse plugin
 
 ## Run a Docker-built binary on a Pi
 
-The binary links libbpf statically and needs only `libelf1t64` and `zlib1g`:
+The binary links libbpf statically and needs only `libelf1t64` and `zlib1g`.
+Build it for arm64, even on another kind of machine:
 
 ```sh
-docker build --target build -t ebpf-netmon:build .
+docker build --platform linux/arm64 --target build -t ebpf-netmon:build .
 docker run --rm -v "$PWD":/out ebpf-netmon:build cp build/netmon /out/
 scp netmon pi:
 ssh -t pi sudo ./netmon

@@ -10,9 +10,11 @@ The raw files are left as they are.
 
 A file is loaded again when it has more rows than the table holds for its
 host and hour, so an hour copied before it was complete (a NAS that was
-down) is replaced once the rest arrives. Each run commits in one
-transaction, so a crash loads all of its hours or none. Run one converter
-per warehouse.
+down) is replaced once the rest arrives. Each run commits one transaction
+per UTC day, so memory stays bounded after a long outage, and a crash loads
+all of a day's hours or none. A file that arrives after its hour has left
+the --days window is reported, not loaded; rerun with a larger --days to
+load it. Run one converter per warehouse.
 
 The catalog, which points at the table's current metadata, is a SQLite file
 in the warehouse unless --catalog names a SQLAlchemy URI, such as
@@ -343,24 +345,30 @@ def hour_filter(host, start):
     )
 
 
-def convert(raw, warehouse, now=None, days=7, catalog_uri=None):
-    """Loads every finished hour the table lacks rows of. Returns rows added."""
-    now = now or dt.datetime.now(dt.UTC)
-    this_hour = now.replace(minute=0, second=0, microsecond=0)
-    oldest = this_hour - dt.timedelta(days=days)
-    table = open_table(warehouse, catalog_uri)
-    counts = hour_counts(table, oldest)
-    hours, files = {}, []  # (host, hour) -> {row's values: row}
-    for path in raw_files(raw):
-        start = hour_of(path)
-        if start is None or not oldest <= start < this_hour:
-            continue  # not a raw file, too old, or still being written
-        # Counting lines is cheap; parse only files that may have new rows.
-        host = first_host(path)
-        if host is None or path.read_bytes().count(b"\n") <= counts.get(
-            (host, start), 0
-        ):
-            continue
+def check_clock(table):
+    """Exits rather than commit with the clock over a minute behind the
+    table's last commit: Iceberg's Java readers, such as the REST catalog,
+    refuse a table whose history goes back in time, for weeks."""
+    last = table.metadata.last_updated_ms / 1000
+    if time.time() < last - 60:
+        sys.exit(
+            f"the clock is {last - time.time():.0f} s behind the table's last"
+            " commit; not committing until it is set right"
+        )
+
+
+def late_files(paths):
+    """Raw files outside the --days window that arrived lately, say from a Pi
+    that was away: rsync keeps their old times, but ctime is the arrival."""
+    recent = time.time() - 2 * 3600  # the last run or two
+    return [path for path in paths if path.stat().st_ctime > recent]
+
+
+def load_day(table, paths, counts):
+    """Loads one day's files, in one transaction. Returns rows added."""
+    hours = {}  # (host, hour) -> {row's values: row}
+    loaded = []
+    for path, start in paths:
         # A file has one host unless the machine was renamed mid-hour.
         rows = read_rows(path)
         end = start + dt.timedelta(hours=1)
@@ -373,20 +381,52 @@ def convert(raw, warehouse, now=None, days=7, catalog_uri=None):
         for row in rows:
             values = tuple(row.get(name) for name in ARROW_SCHEMA.names)
             hours.setdefault((row["host"], start), {})[values] = row
-        files.append(path)
+        loaded.append(path)
     # Two copies of an hour (a renamed Pi's old folder, a backup) share their
     # rows, which count once.
     new = {key: rows for key, rows in hours.items() if len(rows) > counts.get(key, 0)}
     replace = [key for key in new if key in counts]
     if new:
+        check_clock(table)
         with table.transaction() as tx:
             for host, start in replace:
                 tx.delete(hour_filter(host, start))
             rows = [row for hour in new.values() for row in hour.values()]
             tx.append(pa.Table.from_pylist(rows, schema=ARROW_SCHEMA))
-    for path in files:
+    for path in loaded:
         print(f"loaded {path}")
     return sum(len(rows) for rows in new.values()) - sum(counts[k] for k in replace)
+
+
+def convert(raw, warehouse, now=None, days=7, catalog_uri=None):
+    """Loads every finished hour the table lacks rows of. Returns rows added."""
+    now = now or dt.datetime.now(dt.UTC)
+    this_hour = now.replace(minute=0, second=0, microsecond=0)
+    oldest = this_hour - dt.timedelta(days=days)
+    table = open_table(warehouse, catalog_uri)
+    counts = hour_counts(table, oldest)
+    by_day, too_old = {}, []  # day -> [(path, hour)]
+    for path in raw_files(raw):
+        start = hour_of(path)
+        if start is None or start >= this_hour:
+            continue  # not a raw file, or still being written
+        if start < oldest:
+            too_old.append(path)
+            continue
+        # Counting lines is cheap; parse only files that may have new rows.
+        host = first_host(path)
+        if host is None or path.read_bytes().count(b"\n") <= counts.get(
+            (host, start), 0
+        ):
+            continue
+        by_day.setdefault(start.date(), []).append((path, start))
+    if late := late_files(too_old):
+        print(
+            f"{len(late)} raw file(s) arrived after leaving the {days}-day window,"
+            f" such as {late[0]}; load them with --days",
+            file=sys.stderr,
+        )
+    return sum(load_day(table, by_day[day], counts) for day in sorted(by_day))
 
 
 def day_filter(start):
@@ -459,6 +499,7 @@ def maintain(warehouse, now=None, keep_days=28, catalog_uri=None):
     """Compacts, expires and cleans the table; returns what it did."""
     now = now or dt.datetime.now(dt.UTC)
     table = open_table(warehouse, catalog_uri)
+    check_clock(table)
     today = now.replace(hour=0, minute=0, second=0, microsecond=0)
     days = compact(table, today)
     snapshots = len(table.snapshots())

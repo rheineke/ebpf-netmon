@@ -80,8 +80,16 @@ if ! /usr/local/bin/uv --version 2>/dev/null | grep -q "^uv $uv_version"; then
   trap 'rm -rf "$tmp"' EXIT
   base=https://github.com/astral-sh/uv/releases/download/$uv_version
   curl -fsSL -o "$tmp/$tarball" "$base/$tarball"
-  curl -fsSL -o "$tmp/$tarball.sha256" "$base/$tarball.sha256"
-  (cd "$tmp" && sha256sum -c "$tarball.sha256")
+  # Pinned here, not fetched from the same release as the tarball.
+  case $tarball in
+    uv-aarch64-*) sha256=4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 ;;
+    uv-x86_64-*) sha256=f68d291c75783122dad58ab77def0e13f3233f358731db5d6d7e8715603b928f ;;
+    *)
+      echo "no pinned uv for $tarball" >&2
+      exit 1
+      ;;
+  esac
+  echo "$sha256  $tmp/$tarball" | sha256sum -c --quiet
   tar -xzf "$tmp/$tarball" -C "$tmp"
   sudo install -m 755 "$tmp/${tarball%.tar.gz}/uv" /usr/local/bin/uv
 fi
@@ -103,7 +111,9 @@ for unit in netmon-iceberg netmon-iceberg-maintain; do
   # If WAREHOUSE or RAW is on a mount (a NAS), skip runs while it is
   # unmounted rather than write a second warehouse under the mount point.
   sudo mkdir -p "/etc/systemd/system/$unit.service.d"
-  printf '[Unit]\nRequiresMountsFor=%s %s\n' "$warehouse" "$raw" \
+  # The unit's ProtectSystem=strict leaves only WAREHOUSE writable.
+  printf '[Unit]\nRequiresMountsFor=%s %s\n[Service]\nReadWritePaths=%s\n' \
+    "$warehouse" "$raw" "$warehouse" \
     | sudo tee "/etc/systemd/system/$unit.service.d/warehouse.conf" >/dev/null
 done
 sudo systemctl daemon-reload

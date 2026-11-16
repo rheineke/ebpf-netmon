@@ -22,6 +22,13 @@ if [ $# -lt 1 ] || [ $# -gt 2 ]; then
 fi
 warehouse=$(realpath "$1")
 raw=$(realpath "${2:-/var/lib/netmon/raw}")
+# The paths go into SQL strings and a sed replacement below.
+case "$warehouse$raw" in
+  *[[:space:]\\\"\'\&\|%]*)
+    echo "WAREHOUSE and RAW can't contain spaces, quotes, \\, &, | or %" >&2
+    exit 2
+    ;;
+esac
 files=$(python3 -c 'import os, sys; print(os.path.commonpath(sys.argv[1:]))' \
   "$warehouse" "$raw")
 if [ "$files" = / ]; then
