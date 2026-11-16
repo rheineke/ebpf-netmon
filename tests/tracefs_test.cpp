@@ -122,6 +122,18 @@ void test_check_tracepoint()
 	check(loop.find("can't read") != std::string::npos &&
 		      loop.find(std::strerror(ELOOP)) != std::string::npos,
 	      "says why it can't read a format file");
+
+	std::string none = (root / "none").string();
+	check(tracefs_root({none, root.string()}) == root.string(),
+	      "finds tracefs at the first root that has events/");
+	check(tracefs_root({none}).empty(),
+	      "finds nothing where there is none");
+	// events/ a link to itself: there, but stat() fails, with ELOOP.
+	std::filesystem::create_directories(root / "looped");
+	std::filesystem::create_symlink("events", root / "looped/events");
+	std::string looped = (root / "looped").string();
+	check(tracefs_root({looped, root.string()}) == looped,
+	      "takes a root it can't read, so the error says why");
 	std::filesystem::remove_all(root);
 }
 

@@ -109,8 +109,10 @@ pids of its own, it shows the names the BPF side saw instead of reading
 `/proc`. The smoke test moves known traffic in a process per case and
 checks netmon's counts for each pid exactly: plain TCP and UDP, a
 `MSG_WAITALL` read that sleeps, TCP and UDP peeks, `splice()`, IPv6 to IPv4,
-traffic while another process holds 12 threads blocked in sends and
-receives, and a process name full of characters JSON must escape.
+MPTCP, traffic while another process holds 12 threads blocked in sends and
+receives, a thread renamed after it started (the name read from `/proc`),
+and a process name full of characters JSON must escape. It also checks
+that netmon logs the `splice()` calls a crowd of them made it miss.
 
 ## Linters and formatters
 
@@ -236,7 +238,8 @@ time. If a clock that ran ahead made that commit, the converter waits
 until real time passes it. Don't roll the table back instead: a rollback
 keeps the future commit in the table's logs, which Java readers reject
 just the same. If the wait outlasts the converter's 7-day look-back, load
-the hours it missed as below.
+the hours it missed with `--days`, as under Several Pis below.
+
 To run it at five past every hour:
 
 ```sh
@@ -248,7 +251,10 @@ RAW defaults to this machine's `/var/lib/netmon/raw`.
 ### Several Pis
 
 Run one converter, and have every Pi copy its raw files to shared storage,
-such as an NFS share on a NAS mounted at the same path on each:
+such as an NFS share on a NAS mounted at the same path on each. Each Pi
+needs a host name of its own: Raspberry Pi OS names every Pi `raspberrypi`,
+and two Pis with one name would overwrite each other's files, so the sync's
+installer stops if another machine already syncs under its name.
 
 ```sh
 scripts/install_sync.sh /mnt/nas/netmon/raw     # on every Pi
@@ -273,8 +279,11 @@ sudo -u netmon /opt/netmon/venv/bin/python /opt/netmon/to_iceberg.py \
 ```
 
 (The lock's folder, `/run/netmon-iceberg`, exists once either service has
-run since boot.) A raw file the converter can't read, such as a dangling
-link or a copy only its owner may read, is reported and skipped each run.
+run since boot.) A raw file of the window that the converter can't read,
+such as a dangling link or a copy only its owner may read, is skipped. The
+run loads the rest, then exits with status 4, so the unit shows as failed
+(`systemctl --failed`). A file still unreadable when its hour leaves the
+window is never loaded.
 
 ### Running without root
 

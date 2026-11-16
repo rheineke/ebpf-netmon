@@ -184,25 +184,55 @@ def check_backlog_and_clock():
 
 
 def check_skips():
-    """A raw file that can't be read is reported and skipped, and doesn't
-    stop the others loading. Only recent arrivals count as late."""
+    """A raw file of the window that can't be read is reported and skipped,
+    doesn't stop the others loading, and fails the run. One outside the
+    window isn't reported. Only recent arrivals count as late."""
     with tempfile.TemporaryDirectory() as tmp:
         raw, warehouse = Path(tmp) / "raw", Path(tmp) / "warehouse"
         five = NOW.replace(hour=5, minute=0)
         write_hour(raw, "pi-a", five, 3)
-        dangling = raw / "pi-a" / "2026-10-01" / "05.jsonl"  # old, and gone
-        dangling.parent.mkdir(parents=True)
-        dangling.symlink_to(Path(tmp) / "missing")
+        for day in ("2026-10-22", "2026-10-01"):  # in the window, and long gone
+            dangling = raw / "pi-c" / day / "05.jsonl"
+            dangling.parent.mkdir(parents=True)
+            dangling.symlink_to(Path(tmp) / "missing")
         unreadable = os.geteuid() != 0  # root reads anything
         if unreadable:
             write_hour(raw, "pi-b", five, 2)
             (raw / "pi-b" / "2026-10-22" / "05.jsonl").chmod(0)
-        err = io.StringIO()
+        err, skips = io.StringIO(), []
         with contextlib.redirect_stderr(err):
-            added = to_iceberg.convert(raw, warehouse, NOW)
+            added = to_iceberg.convert(raw, warehouse, NOW, on_skip=skips.append)
         check("the readable files load", added, 3)
-        reported = err.getvalue().count(": skipped: ")
-        check("the others are reported", reported, 1 + unreadable)
+        check("the window's others are reported", len(skips), 1 + unreadable)
+        check("each once", err.getvalue().count(": skipped: "), len(skips))
+        skipped = [
+            line for line in err.getvalue().splitlines() if ": skipped: " in line
+        ]
+        check("not the old link", any("2026-10-01" in line for line in skipped), False)
+
+        table, skips = to_iceberg.open_table(warehouse), []
+        gone = raw / "pi-a" / "2026-10-22" / "06.jsonl"  # since the listing
+        with contextlib.redirect_stderr(io.StringIO()):
+            added = to_iceberg.load_day(
+                table, [(gone, five + dt.timedelta(hours=1))], {}, skips.append
+            )
+        check("a file gone before its load is skipped", (added, skips), (0, [gone]))
+
+        # main() loads the rest, then fails, so that the unit shows it.
+        day = dt.datetime.now(dt.UTC).replace(minute=0, second=0, microsecond=0)
+        day -= dt.timedelta(days=1)
+        write_hour(raw, "pi-a", day, 2)
+        (raw / "pi-c" / day.strftime("%Y-%m-%d")).mkdir(exist_ok=True)
+        (raw / "pi-c" / day.strftime("%Y-%m-%d") / "00.jsonl").symlink_to(gone)
+        run = [sys.executable, str(TOOLS / "to_iceberg.py"), "--raw", str(raw)]
+        run += ["--warehouse", str(warehouse), "--lock", str(Path(tmp) / "lock")]
+        run += ["--marker", str(Path(tmp) / "marker.json")]
+        done = subprocess.run(run, capture_output=True, text=True)
+        check(
+            "a run that skipped files loads the rest, then fails",
+            (done.returncode, "added 2 rows" in done.stdout),
+            (to_iceberg.SKIPPED_STATUS, True),
+        )
     t = time.time()
     check(
         "a file that arrived hours ago isn't late",

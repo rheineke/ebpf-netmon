@@ -83,14 +83,16 @@ inline std::string check_format(std::istream &format,
 	return problems;
 }
 
-// Where tracefs is mounted, as libbpf looks for it, or "" if nowhere. A
-// root that is there but can't be read counts, so the error says why.
-inline std::string tracefs_root()
+// Where tracefs is mounted: the first of roots, the two places libbpf knows,
+// that has events/, or "" if none. A root that is there but can't be read
+// counts, so the error says why.
+inline std::string tracefs_root(
+	const std::vector<std::string> &roots = {"/sys/kernel/tracing",
+						 "/sys/kernel/debug/tracing"})
 {
-	for (const char *root :
-	     {"/sys/kernel/tracing", "/sys/kernel/debug/tracing"}) {
+	for (const std::string &root : roots) {
 		struct stat st{};
-		if (stat((std::string(root) + "/events").c_str(), &st) == 0 ||
+		if (stat((root + "/events").c_str(), &st) == 0 ||
 		    errno != ENOENT)
 			return root;
 	}

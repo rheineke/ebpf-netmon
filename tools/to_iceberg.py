@@ -99,6 +99,7 @@ ARROW_SCHEMA = pa.schema(
 # The services own these directories (RuntimeDirectory and StateDirectory).
 LOCK = "/run/netmon-iceberg/lock"  # only its user (or root) can write there
 MARKER = "/var/lib/netmon-iceberg/iceberg-run.json"  # local, kept across reboots
+SKIPPED_STATUS = 4  # a load that skipped raw files it couldn't read
 COMPACT_MAX_ROWS = 1_000_000  # bigger days stay as they are, to bound memory
 # NNNNN-UUID.metadata.json, numbered from 00000 by each commit.
 METADATA_NAME = re.compile(r"(\d+)-.+\.metadata\.json")
@@ -365,12 +366,14 @@ def late_files(ctimes, newest):
     return [path for path, ctime in ctimes.items() if ctime > newest - 2 * 3600]
 
 
-def skipped(path, error):
+def skipped(path, error, on_skip):
     """Reports a raw file that can't be read, which shouldn't stop the rest."""
     print(f"{path}: skipped: {error.strerror or error}", file=sys.stderr)
+    if on_skip:
+        on_skip(path)
 
 
-def load_day(table, paths, counts):
+def load_day(table, paths, counts, on_skip=None):
     """Loads one day's files, in one transaction. Returns rows added."""
     hours = {}  # (host, hour) -> {row's values: row}
     loaded = []
@@ -379,7 +382,7 @@ def load_day(table, paths, counts):
         try:
             rows = read_rows(path)
         except OSError as e:  # gone since the listing
-            skipped(path, e)
+            skipped(path, e, on_skip)
             continue
         end = start + dt.timedelta(hours=1)
         if outside := sum(not start <= row["ts"] < end for row in rows):
@@ -408,9 +411,12 @@ def load_day(table, paths, counts):
     return sum(len(rows) for rows in new.values()) - sum(counts[k] for k in replace)
 
 
-def convert(raw, warehouse, now=None, days=7, catalog_uri=None, on_commit=None):
+def convert(
+    raw, warehouse, now=None, days=7, catalog_uri=None, on_commit=None, on_skip=None
+):
     """Loads every finished hour the table lacks rows of. Returns rows added.
-    Calls on_commit(table) after each commit."""
+    Calls on_commit(table) after each commit, and on_skip(path) for each file
+    of the window it can't read."""
     now = now or dt.datetime.now(dt.UTC)
     this_hour = now.replace(minute=0, second=0, microsecond=0)
     oldest = this_hour - dt.timedelta(days=days)
@@ -421,21 +427,25 @@ def convert(raw, warehouse, now=None, days=7, catalog_uri=None, on_commit=None):
         start = hour_of(path)
         if start is None:
             continue  # not a raw file
+        if not oldest <= start < this_hour:
+            # Only its arrival matters (late_files): a link's own will do.
+            try:
+                ctime = path.lstat().st_ctime
+            except OSError:
+                continue  # gone since the listing
+            newest = max(newest, ctime)
+            if start < oldest:
+                too_old[path] = ctime
+            continue  # too old, or still being written
         try:
             ctime = path.stat().st_ctime
-            if oldest <= start < this_hour:
-                # Counting lines is cheap; parse only files that may have new rows.
-                host = first_host(path)
-                lines = path.read_bytes().count(b"\n")
+            # Counting lines is cheap; parse only files that may have new rows.
+            host = first_host(path)
+            lines = path.read_bytes().count(b"\n")
         except OSError as e:  # unreadable, a dangling link, or just deleted
-            skipped(path, e)
+            skipped(path, e, on_skip)
             continue
         newest = max(newest, ctime)
-        if start >= this_hour:
-            continue  # still being written
-        if start < oldest:
-            too_old[path] = ctime
-            continue
         if host is None or lines <= counts.get((host, start), 0):
             continue
         by_day.setdefault(start.date(), []).append((path, start))
@@ -448,7 +458,7 @@ def convert(raw, warehouse, now=None, days=7, catalog_uri=None, on_commit=None):
     added = 0
     for day in sorted(by_day):
         before = table.metadata_location
-        added += load_day(table, by_day[day], counts)
+        added += load_day(table, by_day[day], counts, on_skip)
         if on_commit and table.metadata_location != before:
             on_commit(table)
     return added
@@ -604,15 +614,22 @@ def main():
         )
         print(", ".join(f"{n} {what}" for what, n in done.items()))
     else:
+        skips = []
         n = convert(
             args.raw,
             args.warehouse,
             days=args.days,
             catalog_uri=args.catalog,
             on_commit=marked,
+            on_skip=skips.append,
         )
         print(f"added {n} rows to {TABLE}")
     Path(args.marker).unlink()
+    if not args.maintain and skips:
+        # Loaded the rest, but fail the unit so that someone looks: once out
+        # of the window, a file is never loaded.
+        print(f"{len(skips)} raw file(s) skipped", file=sys.stderr)
+        sys.exit(SKIPPED_STATUS)
 
 
 if __name__ == "__main__":

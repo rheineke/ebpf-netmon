@@ -87,6 +87,29 @@ fi
 sudo rm -r "$linked" "$victim" "$victim.d"
 echo "ok  : stops for a DEST that is a symlink"
 
+# An unmounted share: RAW_ROOT's parent isn't there.
+if scripts/install_sync.sh /srv/no-share/netmon/raw 2>/dev/null \
+  || sudo test -e "/$(hostname)"; then
+  echo "FAIL: synced to /$(hostname) for a RAW_ROOT that doesn't exist" >&2
+  exit 1
+fi
+echo "ok  : stops for a RAW_ROOT that doesn't exist"
+
+# Another machine with this host name already syncs here.
+mark=$dest/.netmon-sync-id
+if ! sudo test -s "$mark"; then
+  echo "FAIL: the installer left no sync id in DEST" >&2
+  exit 1
+fi
+ours=$(sudo cat "$mark")
+echo other-machine | sudo -u netmon tee "$mark" >/dev/null
+if NETMON_UID=4321 scripts/install_sync.sh "$share" >/dev/null 2>&1; then
+  echo "FAIL: took a DEST another machine syncs to" >&2
+  exit 1
+fi
+echo "$ours" | sudo -u netmon tee "$mark" >/dev/null
+echo "ok  : stops for a DEST another machine syncs to"
+
 echo '{"ts":2}' | sudo tee -a "$raw/2026-01-01/00.jsonl" >/dev/null
 echo '{"ts":3}' | sudo tee "$raw/2026-01-01/01.jsonl" >/dev/null
 sudo systemctl start netmon-sync.service

@@ -115,6 +115,16 @@ jobs:
           if scripts/install_converter.sh "/srv/a warehouse" 2>/dev/null; then
             fail "took a WAREHOUSE with a space"
           fi
+          # A warehouse someone on the share swapped for a link to a local
+          # folder: refused, and root leaves the folder alone.
+          sudo install -d /srv/local-victim
+          sudo touch /srv/local-victim/key
+          sudo ln -s /srv/local-victim /srv/linked-warehouse
+          if scripts/install_converter.sh /srv/linked-warehouse 2>/dev/null; then
+            fail "took a WAREHOUSE that is a symlink"
+          fi
+          [ "$(sudo stat -c %U /srv/local-victim /srv/local-victim/key | sort -u)" = root ] \
+            || fail "handed a linked WAREHOUSE's target to netmon"
       # Grafana and its ClickHouse plugin, on the REST step's data.
       - name: Grafana
         run: |
