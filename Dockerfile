@@ -17,7 +17,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=build /src/build/netmon /usr/local/bin/netmon
 ENTRYPOINT ["netmon"]
 
-# Generates known TCP and UDP traffic and checks netmon counted it.
+# Moves known TCP and UDP traffic and checks netmon counted it exactly:
+# docker run --rm --privileged --pid=host.
 FROM runtime AS test
 RUN apt-get update && apt-get install -y --no-install-recommends python3 \
     && rm -rf /var/lib/apt/lists/*

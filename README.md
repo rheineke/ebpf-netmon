@@ -13,13 +13,45 @@ last interval, and the NFS file bytes it read and wrote, like `top`:
 ```
 
 Options: `-i` interval in seconds (default 2), `-c` number of reports,
-`-n` rows (0 = all), `-k` priority-sample rows (see below), `-j` JSON lines,
-`-o DIR` JSON lines appended to hourly files (see Capture).
+`-n` rows (default 10, 0 = all), `-k` priority-sample rows (see below), `-j`
+JSON lines, `-o DIR` JSON lines appended to hourly files, all rows unless
+`-n` says otherwise (see Capture), `-w SECONDS` hold reports at start until
+the clock is synchronized.
 
-It uses kprobes on `tcp_sendmsg`, `tcp_cleanup_rbuf`, `udp(v6)_sendmsg` and
-`udp(v6)_recvmsg`, and kretprobes on `nfs_file_read`, `nfs_file_splice_read`
-and `nfs_file_write`. It reads only their integer arguments and return values.
-So it needs no CO-RE and no kernel BTF, which Raspberry Pi kernels don't ship.
+### How it counts
+
+- **TCP and UDP**: the `sock:sock_send_length` and `sock:sock_recv_length`
+  tracepoints (kernel 6.3+). They fire once per `sock_sendmsg()` and
+  `sock_recvmsg()`, which every send and receive goes through, with the
+  bytes moved. Peeks are skipped, since the read that follows counts.
+  MPTCP counts as TCP. `splice()` from a TCP socket skips them, so a
+  kretprobe on `tcp_splice_read` counts it.
+- **NFS**: kretprobes on `nfs_file_read`, `nfs_file_splice_read` and
+  `nfs_file_write` (see NFS traffic below).
+
+It reads only the tracepoints' records and the functions' return values,
+never kernel structs. So it needs no CO-RE and no kernel BTF, which Raspberry
+Pi kernels don't ship. At startup it checks the tracepoints' record layout
+against tracefs. Without the tracepoints, or with another layout, it exits
+saying why rather than run without TCP and UDP. In a container it mounts
+tracefs itself, which needs `--privileged`.
+
+Traffic over loopback (`127.0.0.1`, say Grafana querying ClickHouse on the
+same Pi) counts as both sent and received, as each end is a process here.
+
+The tracepoints replace kprobes on `tcp_sendmsg`, `tcp_cleanup_rbuf` and
+`udp(v6)_sendmsg`/`recvmsg`, which overcounted: a `MSG_WAITALL` read was
+counted again each time it slept, peeks counted twice, and so did an IPv6
+socket sending to an IPv4 address, which goes through both `udpv6_sendmsg`
+and `udp_sendmsg`. The smoke test checks each of these exactly.
+
+A kretprobe can track only so many calls in progress at once: 10 on a
+4-core Pi, across all processes. Each thread blocked inside the function
+holds one, so with ten NFS reads waiting on a slow NAS, the next one's bytes
+go uncounted. netmon reads the kernel's count of these and logs
+`netmon: kretprobe/nfs_file_read missed N calls`. Probes that can't attach,
+such as NFS before the `nfs` module loads at the first mount, are retried
+every minute.
 
 ## Priority sampling
 
@@ -34,7 +66,7 @@ the (N+1)th highest priority, a kept row's estimated weight is `max(w, tau)`.
 Each row carries `scale = max(w, tau) / w` (1 when nothing was dropped).
 Multiply its counters by `scale` and sum them: the sum over any subset, such as
 one user, one program or all UDP, is an unbiased estimate of that subset's
-true total. Big talkers are always kept with scale 1, and the many small ones
+true total. Big talkers are almost always kept with scale 1, and the many small ones
 are represented by a few rows with larger scales. Unlike the `-n` top-N cut,
 `-k` doesn't drop the small talkers' traffic from the totals.
 
@@ -44,10 +76,18 @@ Everything builds in Docker on Debian trixie:
 
 ```sh
 docker build --target test -t ebpf-netmon:test .  # also runs unit tests
-docker run --rm --privileged ebpf-netmon:test   # smoke test
+docker run --rm --privileged --pid=host ebpf-netmon:test   # smoke test
 docker build --target runtime -t ebpf-netmon .
-docker run --rm --privileged ebpf-netmon        # watch the Docker VM
+docker run --rm --privileged --pid=host ebpf-netmon        # watch the Docker VM
 ```
+
+`--pid=host` because netmon reports the host's pids: in a container with
+pids of its own, it shows the names the BPF side saw instead of reading
+`/proc`. The smoke test moves known traffic in a process per case and
+checks netmon's counts for each pid exactly: plain TCP and UDP, a
+`MSG_WAITALL` read that sleeps, TCP and UDP peeks, `splice()`, IPv6 to IPv4,
+traffic while another process holds 12 threads blocked in sends and
+receives, and a process name full of characters JSON must escape.
 
 ## Linters and formatters
 
@@ -101,9 +141,12 @@ counts for the server process match the bytes that actually arrived.
 
 ### NFS traffic
 
-The NFS client sends and receives in kernel threads (`kworker/...-nfsiod`,
-`-xprtiod`, `-rpciod`), so the wire bytes show up as their `tcp_rx`/`tcp_tx`.
-`NFS_RD` and `NFS_WR` charge the file bytes to the process that read or wrote
+The NFS client's wire bytes don't say which process asked for them. Replies
+arrive in kernel threads (`kworker/...-xprtiod`), so they show up as those
+threads' `tcp_rx`. Requests mostly leave from kernel threads too, but a
+synchronous call (a `stat()`, an `open()`) is sent by the calling process,
+along with any requests queued behind it, so a process's `tcp_tx` can
+include some NFS request bytes. `NFS_RD` and `NFS_WR` charge the file bytes to the process that read or wrote
 them, through `read()`, `sendfile()`/`splice()` or `write()`. They count
 file bytes, not wire bytes: reads served from the page cache count too, and
 memory-mapped access does not.
@@ -122,7 +165,8 @@ the Synology NAS (read-only) and a loopback export (read and write).
 
 `netmon -o DIR` appends each report as JSON lines to
 `DIR/YYYY-MM-DD/HH.jsonl`, one file per UTC hour, so a file is complete
-once its hour has passed. Each row is one process in one interval:
+once its hour has passed. Each row is one process in one interval of
+`interval_s` seconds, ending at `ts`:
 
 ```json
 {"ts":1792666261,"host":"raspberrypi","interval_s":10,"pid":4309,"uid":0,"comm":"nfsd","tcp_tx":84,"tcp_rx":120,"udp_tx":0,"udp_rx":0,"nfs_read":0,"nfs_write":0,"scale":1}
@@ -139,6 +183,15 @@ to `/var/lib/netmon/raw`. The raw files are kept as written; converting
 them to Parquet is a separate step. Nothing deletes old files yet. An idle
 Pi writes about 650 rows (120 KB) an hour, or 3 MB a day; busier Pis write
 more.
+
+The service runs as root, but with only `CAP_BPF` and `CAP_PERFMON`, no
+network, and a read-only view of the system apart from its own folder
+(`systemd-analyze security` rates it 2.8, against 8.7 before). A Pi has no
+clock battery and boots with the time of its last shutdown, so the service
+holds its reports until NTP sets the clock (`-w 300`); the counts keep
+adding up meanwhile, so the first report covers everything. A crash that
+cuts off the last line of an hour's file costs only that row: the next run
+starts a new line.
 
 ## Iceberg
 
@@ -168,7 +221,9 @@ scripts/install_converter.sh /mnt/nas/netmon/warehouse /mnt/nas/netmon/raw
 The sync rsyncs `/var/lib/netmon/raw` to `RAW/$(hostname)/` every minute,
 and never deletes there. Local capture does not depend on the NAS: while it
 is unmounted the sync and the converter skip their runs, and the next sync
-catches up. Each row carries the host name it was captured under, so
+catches up. That needs the share in `/etc/fstab` (with `nofail`), so systemd
+knows it is a mount; under a share mounted by hand, the jobs would write to
+the empty folder beneath it. Each row carries the host name it was captured under, so
 renaming a Pi starts a new host in the table.
 
 ### Running without root
@@ -279,7 +334,9 @@ ClickHouse listens on 127.0.0.1 only. It has two views:
   arrived shows its late rows after the next run, at five past.
 
 Grafana's ClickHouse user, `grafana`, may only read these views; they read
-the files as `netmon_views`, which can't log in.
+the files as `netmon_views`, which can't log in. ClickHouse's own `default`
+user keeps its passwordless login from this machine, for the installer, so
+don't give untrusted users a shell here.
 
 Grafana serves the `netmon traffic` dashboard on port 3000, from
 `netmon.traffic_live`, refreshing every 30 seconds. The first login is
@@ -294,7 +351,7 @@ minute ("Host stopped reporting" every 2), in
 | Rule | Fires when |
 |---|---|
 | Host stopped reporting | a host seen in the last day has had no rows for 2 minutes at 5 checks in a row (about 10 minutes) |
-| Process moving over 10 MB/s | one process averages over 10 MB/s sent or received for 5 minutes |
+| Program moving over 10 MB/s | one program (all its processes on a host) averages over 10 MB/s sent or received for 5 minutes |
 | Iceberg converter behind | the newest row in Iceberg is over 2 hours old |
 
 To get them by email, run this on the Grafana machine, in a terminal:
@@ -315,7 +372,10 @@ ARMv8.0 build, which has no releases.
 
 `tests/dashboard_test.py` checks every dashboard query's totals through
 ClickHouse, with the latest hour only in raw files and again once it is
-converted; CI runs it.
+converted, and each alert query's result, including the high-traffic
+rate over rows in its window. CI runs it, then installs Grafana and runs
+every panel and alert query through Grafana's ClickHouse plugin
+(`tests/grafana_test.py`).
 
 ## Run a Docker-built binary on a Pi
 

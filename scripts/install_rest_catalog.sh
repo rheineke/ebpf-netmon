@@ -17,6 +17,13 @@ if [ $# -ne 1 ]; then
   exit 2
 fi
 warehouse=$(realpath "$1")
+# RequiresMountsFor= below splits on spaces and expands %.
+case "$warehouse" in
+  *[[:space:]%]*)
+    echo "WAREHOUSE can't contain spaces or %" >&2
+    exit 2
+    ;;
+esac
 cd "$(dirname "$0")/.."
 
 echo "== Installing Java and PostgreSQL's JDBC driver"

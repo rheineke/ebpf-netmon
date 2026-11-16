@@ -11,7 +11,12 @@ cd "$(dirname "$0")/.."
 
 echo "== Installing Grafana from apt.grafana.com"
 key=/usr/share/keyrings/grafana.gpg
-curl -fsSL https://apt.grafana.com/gpg.key | sudo gpg --batch --yes --dearmor -o "$key"
+# Download, then convert: piped, a failed download would still replace the
+# key with an empty one.
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+curl -fsSL -o "$tmp/grafana.key" https://apt.grafana.com/gpg.key
+sudo gpg --batch --yes --dearmor -o "$key" "$tmp/grafana.key"
 echo "deb [signed-by=$key] https://apt.grafana.com stable main" \
   | sudo tee /etc/apt/sources.list.d/grafana.list >/dev/null
 sudo apt-get update -qq
