@@ -4,7 +4,10 @@ MULTIARCH := $(shell $(CC) -print-multiarch)
 CLANG ?= clang
 # Debian installs bpftool in /usr/sbin, which is not on a normal user's PATH.
 BPFTOOL ?= $(or $(shell command -v bpftool),/usr/sbin/bpftool)
-CXXFLAGS ?= -O2 -g -Wall -Wextra -Werror
+# Hardened: netmon runs as root and reads names any process can set.
+HARDEN := -D_FORTIFY_SOURCE=3 -fstack-protector-strong -fstack-clash-protection \
+	-Wl,-z,relro,-z,now
+CXXFLAGS ?= -O2 -g -Wall -Wextra -Werror $(HARDEN)
 BUILD := build
 
 .PHONY: all test tidy sanitize clean
@@ -43,7 +46,7 @@ tidy: $(BUILD)/netmon.skel.h
 # The same build with ASan and UBSan in build/asan; any report is fatal.
 # Runs the unit tests; the Docker sanitize stage also runs the smoke test.
 SANITIZE := -fsanitize=address,undefined -fno-sanitize-recover=all \
-	-fno-omit-frame-pointer
+	-fno-omit-frame-pointer -U_FORTIFY_SOURCE
 sanitize:
 	$(MAKE) BUILD=$(BUILD)/asan CXXFLAGS="$(CXXFLAGS) $(SANITIZE)" all test
 

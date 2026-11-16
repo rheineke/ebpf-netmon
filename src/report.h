@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <ctime>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -82,6 +83,14 @@ inline int interval_seconds(std::chrono::steady_clock::duration since_last)
 {
 	auto s = std::chrono::round<std::chrono::seconds>(since_last).count();
 	return static_cast<int>(std::max<decltype(s)>(1, s));
+}
+
+// The next multiple of interval_s after now, on the wall clock. Reporting
+// there puts every host's reports at :00, :10, :20 (for -i 10), so a
+// dashboard bucket a multiple of the interval wide holds whole reports.
+inline std::time_t next_boundary(std::time_t now, int interval_s)
+{
+	return (now / interval_s + 1) * interval_s;
 }
 
 // A Pi has no clock battery, so it boots with its last shutdown's time.

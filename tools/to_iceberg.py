@@ -10,9 +10,11 @@ The raw files are left as they are.
 
 A file is loaded again when it has more rows than the table holds for its
 host and hour, so an hour copied before it was complete (a NAS that was
-down) is replaced once the rest arrives. Each run commits in one
-transaction, so a crash loads all of its hours or none. Run one converter
-per warehouse.
+down) is replaced once the rest arrives. Each run commits one transaction
+per UTC day, so memory stays bounded after a long outage, and a crash loads
+all of a day's hours or none. A file that arrives after its hour has left
+the --days window is reported, not loaded; rerun with a larger --days to
+load it. Run one converter per warehouse.
 
 The catalog, which points at the table's current metadata, is a SQLite file
 in the warehouse unless --catalog names a SQLAlchemy URI, such as
@@ -343,24 +345,31 @@ def hour_filter(host, start):
     )
 
 
-def convert(raw, warehouse, now=None, days=7, catalog_uri=None):
-    """Loads every finished hour the table lacks rows of. Returns rows added."""
-    now = now or dt.datetime.now(dt.UTC)
-    this_hour = now.replace(minute=0, second=0, microsecond=0)
-    oldest = this_hour - dt.timedelta(days=days)
-    table = open_table(warehouse, catalog_uri)
-    counts = hour_counts(table, oldest)
-    hours, files = {}, []  # (host, hour) -> {row's values: row}
-    for path in raw_files(raw):
-        start = hour_of(path)
-        if start is None or not oldest <= start < this_hour:
-            continue  # not a raw file, too old, or still being written
-        # Counting lines is cheap; parse only files that may have new rows.
-        host = first_host(path)
-        if host is None or path.read_bytes().count(b"\n") <= counts.get(
-            (host, start), 0
-        ):
-            continue
+def check_clock(table):
+    """Exits rather than commit with the clock over a minute behind the
+    table's last commit: Iceberg's Java readers, such as the REST catalog,
+    refuse a table whose history goes back in time, for weeks."""
+    last = table.metadata.last_updated_ms / 1000
+    if time.time() < last - 60:
+        sys.exit(
+            f"the table's last commit is {last - time.time():.0f} s ahead of this"
+            " clock: this clock is behind, or one that was ahead made it."
+            " Not committing until this clock passes it."
+        )
+
+
+def late_files(ctimes, newest):
+    """Raw files outside the --days window that arrived lately, say from a Pi
+    that was away: rsync keeps their old mtimes, but ctime is the arrival.
+    Measured from the newest ctime in RAW, by the same (NAS) clock."""
+    return [path for path, ctime in ctimes.items() if ctime > newest - 2 * 3600]
+
+
+def load_day(table, paths, counts):
+    """Loads one day's files, in one transaction. Returns rows added."""
+    hours = {}  # (host, hour) -> {row's values: row}
+    loaded = []
+    for path, start in paths:
         # A file has one host unless the machine was renamed mid-hour.
         rows = read_rows(path)
         end = start + dt.timedelta(hours=1)
@@ -373,20 +382,63 @@ def convert(raw, warehouse, now=None, days=7, catalog_uri=None):
         for row in rows:
             values = tuple(row.get(name) for name in ARROW_SCHEMA.names)
             hours.setdefault((row["host"], start), {})[values] = row
-        files.append(path)
+        loaded.append(path)
     # Two copies of an hour (a renamed Pi's old folder, a backup) share their
     # rows, which count once.
     new = {key: rows for key, rows in hours.items() if len(rows) > counts.get(key, 0)}
     replace = [key for key in new if key in counts]
     if new:
+        check_clock(table)
         with table.transaction() as tx:
             for host, start in replace:
                 tx.delete(hour_filter(host, start))
             rows = [row for hour in new.values() for row in hour.values()]
             tx.append(pa.Table.from_pylist(rows, schema=ARROW_SCHEMA))
-    for path in files:
+    for path in loaded:
         print(f"loaded {path}")
     return sum(len(rows) for rows in new.values()) - sum(counts[k] for k in replace)
+
+
+def convert(raw, warehouse, now=None, days=7, catalog_uri=None, on_commit=None):
+    """Loads every finished hour the table lacks rows of. Returns rows added.
+    Calls on_commit(table) after each commit."""
+    now = now or dt.datetime.now(dt.UTC)
+    this_hour = now.replace(minute=0, second=0, microsecond=0)
+    oldest = this_hour - dt.timedelta(days=days)
+    table = open_table(warehouse, catalog_uri)
+    counts = hour_counts(table, oldest)
+    by_day, too_old, newest = {}, {}, 0  # day -> [(path, hour)]; path -> ctime
+    for path in raw_files(raw):
+        start = hour_of(path)
+        if start is None:
+            continue  # not a raw file
+        ctime = path.stat().st_ctime
+        newest = max(newest, ctime)
+        if start >= this_hour:
+            continue  # still being written
+        if start < oldest:
+            too_old[path] = ctime
+            continue
+        # Counting lines is cheap; parse only files that may have new rows.
+        host = first_host(path)
+        if host is None or path.read_bytes().count(b"\n") <= counts.get(
+            (host, start), 0
+        ):
+            continue
+        by_day.setdefault(start.date(), []).append((path, start))
+    if late := late_files(too_old, newest):
+        print(
+            f"{len(late)} raw file(s) arrived after leaving the {days}-day window,"
+            f" such as {late[0]}; load them with --days",
+            file=sys.stderr,
+        )
+    added = 0
+    for day in sorted(by_day):
+        before = table.metadata_location
+        added += load_day(table, by_day[day], counts)
+        if on_commit and table.metadata_location != before:
+            on_commit(table)
+    return added
 
 
 def day_filter(start):
@@ -396,7 +448,7 @@ def day_filter(start):
     )
 
 
-def compact(table, before):
+def compact(table, before, on_commit=None):
     """Rewrites each day before `before` held in several files as one file."""
     files, rows = {}, {}
     for task in table.scan(row_filter=LessThan("ts", before.isoformat())).plan_files():
@@ -412,6 +464,8 @@ def compact(table, before):
         with table.transaction() as tx:
             tx.delete(day_filter(start))
             tx.append(rows.cast(ARROW_SCHEMA))
+        if on_commit:
+            on_commit(table)
     return len(days)
 
 
@@ -455,17 +509,21 @@ def delete_unreferenced(table, before):
     return deleted
 
 
-def maintain(warehouse, now=None, keep_days=28, catalog_uri=None):
-    """Compacts, expires and cleans the table; returns what it did."""
+def maintain(warehouse, now=None, keep_days=28, catalog_uri=None, on_commit=None):
+    """Compacts, expires and cleans the table; returns what it did. Calls
+    on_commit(table) after each commit."""
     now = now or dt.datetime.now(dt.UTC)
     table = open_table(warehouse, catalog_uri)
+    check_clock(table)
     today = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    days = compact(table, today)
+    days = compact(table, today, on_commit)
     snapshots = len(table.snapshots())
     table.maintenance.expire_snapshots().older_than(
         now - dt.timedelta(days=keep_days)
     ).commit()
     table = open_table(warehouse, catalog_uri)
+    if on_commit:
+        on_commit(table)
     expired = snapshots - len(table.snapshots())
     deleted = delete_unreferenced(table, now - dt.timedelta(days=1))
     return {
@@ -518,13 +576,28 @@ def main():
     table = open_table(args.warehouse, args.catalog)  # exits if it's stale
     Path(args.marker).parent.mkdir(parents=True, exist_ok=True)
     mark_run(args.marker, args.warehouse, table)
+
+    # The marker's start must stay in the table's metadata log, which keeps
+    # 100 entries, for recover() to act, so move it on with every commit.
+    def marked(table):
+        mark_run(args.marker, args.warehouse, table)
+
     if args.maintain:
         done = maintain(
-            args.warehouse, keep_days=args.keep_days, catalog_uri=args.catalog
+            args.warehouse,
+            keep_days=args.keep_days,
+            catalog_uri=args.catalog,
+            on_commit=marked,
         )
         print(", ".join(f"{n} {what}" for what, n in done.items()))
     else:
-        n = convert(args.raw, args.warehouse, days=args.days, catalog_uri=args.catalog)
+        n = convert(
+            args.raw,
+            args.warehouse,
+            days=args.days,
+            catalog_uri=args.catalog,
+            on_commit=marked,
+        )
         print(f"added {n} rows to {TABLE}")
     Path(args.marker).unlink()
 

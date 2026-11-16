@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <csignal>
 #include <cstdarg>
 #include <cstddef>
@@ -245,6 +246,39 @@ bool clock_synced()
 	return adjtimex(&tx) != TIME_ERROR;
 }
 
+// Sleeps until the next multiple of interval_s on the wall clock, or a stop,
+// and returns that time: the report's timestamp. If the clock steps back,
+// it waits for the next boundary from there; if it steps forward, the
+// report takes the latest boundary passed.
+std::time_t sleep_to_boundary(int interval_s)
+{
+	timespec now{};
+	clock_gettime(CLOCK_REALTIME, &now);
+	std::time_t due = next_boundary(now.tv_sec, interval_s);
+	while (!g_stop) {
+		clock_gettime(CLOCK_REALTIME, &now);
+		double left = static_cast<double>(due - now.tv_sec) -
+			      static_cast<double>(now.tv_nsec) / 1e9;
+		if (left <= 0)
+			break;
+		if (left > interval_s) {  // the clock stepped back
+			due = next_boundary(now.tv_sec, interval_s);
+			continue;
+		}
+		// At most a second at a time, so a stop is seen at once.
+		double nap = std::min(left, 1.0);
+		timespec ts{static_cast<std::time_t>(nap),
+			    static_cast<long>((nap - std::floor(nap)) * 1e9)};
+		nanosleep(&ts, nullptr);
+	}
+	clock_gettime(CLOCK_REALTIME, &now);
+	return std::max(due, now.tv_sec / interval_s * interval_s);
+}
+
+// Exit status when this kernel can't have the sock tracepoints (no tracefs,
+// too old, another layout): restarting won't help.
+constexpr int kCantCount = 3;
+
 int quiet_print(enum libbpf_print_level, const char *, va_list) { return 0; }
 
 // The fields of the sock tracepoints that netmon.bpf.c reads.
@@ -289,8 +323,9 @@ public:
 			bpf_link__destroy(p.link);
 	}
 
-	// Attaches the tracepoints; false, saying why, if one can't attach.
-	bool attach_required()
+	// Attaches the tracepoints. Returns 0, or saying why: kCantCount if
+	// this kernel can't have them, 1 if attaching failed and may not again.
+	int attach_required()
 	{
 		mount_tracefs();
 		const std::string root = tracefs_root();
@@ -308,21 +343,24 @@ public:
 								     1),
 						 name.substr(event + 1),
 						 kSockMsgLength);
+			int status = kCantCount;
 			if (problem.empty()) {
 				p.link = bpf_program__attach(p.prog);
-				if (!p.link)
+				if (!p.link) {
 					problem = std::string(" ") +
 						  std::strerror(errno);
+					status = 1;
+				}
 			}
 			if (!problem.empty()) {
 				std::fprintf(stderr,
 					     "netmon: can't count TCP and UDP: "
 					     "%s:%s\n",
 					     name.c_str(), problem.c_str());
-				return false;
+				return status;
 			}
 		}
-		return true;
+		return 0;
 	}
 
 	// Attaches the kprobes it can. Says why for those it can't the first
@@ -398,8 +436,8 @@ private:
 int run(netmon_bpf *skel, const Options &opts)
 {
 	Probes probes(skel);
-	if (!probes.attach_required())
-		return 1;
+	if (int status = probes.attach_required())
+		return status;
 	probes.attach_optional(false);
 
 	std::signal(SIGINT, on_signal);
@@ -408,7 +446,11 @@ int run(netmon_bpf *skel, const Options &opts)
 	int map_fd = bpf_map__fd(skel->maps.traffic);
 	const bool use_proc = in_initial_pid_namespace();
 	Totals prev;
-	collect_map(map_fd, prev, use_proc);  // report only traffic from now on
+	// Report only traffic from now on. A table starts at a boundary, so its
+	// first report covers a whole interval; files count from the start.
+	if (!opts.json)
+		sleep_to_boundary(opts.interval_s);
+	collect_map(map_fd, prev, use_proc);
 	std::mt19937_64 rng(std::random_device{}());
 	const std::string host = host_name();
 	HourlyFiles files(opts.out_dir);
@@ -420,8 +462,7 @@ int run(netmon_bpf *skel, const Options &opts)
 	bool said_holding = false;
 	int reports = 0;
 	while (!g_stop && (!opts.count || reports < opts.count)) {
-		for (int s = 0; s < opts.interval_s && !g_stop; ++s)
-			sleep(1);
+		std::time_t due = sleep_to_boundary(opts.interval_s);
 		if (Clock::now() - last_retry >= std::chrono::minutes(1)) {
 			probes.attach_optional(true);
 			last_retry = Clock::now();
@@ -448,10 +489,11 @@ int run(netmon_bpf *skel, const Options &opts)
 			print_table(rows, opts, interval_s);
 			continue;
 		}
-		std::time_t now = std::time(nullptr);
-		std::FILE *out = opts.out_dir.empty() ? stdout : files.at(now);
+		// A stop's last report is cut short: stamp it when it was made.
+		std::time_t ts = g_stop ? std::time(nullptr) : due;
+		std::FILE *out = opts.out_dir.empty() ? stdout : files.at(ts);
 		if (!out ||
-		    !print_json(out, now, host, rows, opts, interval_s)) {
+		    !print_json(out, ts, host, rows, opts, interval_s)) {
 			std::fprintf(stderr, "netmon: write failed\n");
 			return 1;
 		}

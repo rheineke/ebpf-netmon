@@ -328,6 +328,10 @@ def check_files(out_dir, stdout_rows, pids):
         sys.exit(f"FAIL: host {rows[0]['host']}, want {socket.gethostname()}")
     if not set(pids) <= {row["pid"] for row in rows}:
         sys.exit("FAIL: -o left out some processes' rows")
+    # -i 2: reports on even seconds, but for the last, cut short by the stop.
+    stamps = sorted({row["ts"] for row in rows})
+    if odd := [ts for ts in stamps[:-1] if ts % 2]:
+        sys.exit(f"FAIL: reports off the 2 s boundaries: {odd}")
     print(f"ok  : -o wrote {len(rows)} rows to {len(paths)} file(s)")
 
 
@@ -366,7 +370,7 @@ def main():
         text=True,
     )
     out_dir = tempfile.mkdtemp()
-    to_files = subprocess.Popen(["netmon", "-i", "1", "-w", "5", "-o", out_dir])
+    to_files = subprocess.Popen(["netmon", "-i", "2", "-w", "5", "-o", out_dir])
     time.sleep(1.5)  # let the probes attach and the baseline read happen
 
     results = {name: run_scenario(name) for name in SCENARIOS}

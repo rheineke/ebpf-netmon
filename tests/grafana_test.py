@@ -9,6 +9,7 @@ first login; CI runs it:
 
 import base64
 import json
+import os
 import sys
 import time
 import urllib.error
@@ -85,7 +86,23 @@ def check_alert_rules():
         check(f"alert rule {name!r} evaluates ({state})", state != "error", error)
 
 
+def check_alert_email():
+    """With scripts/configure_alert_email.sh run, the contact point has the
+    address it was given, read from Grafana's environment."""
+    want = os.environ.get("NETMON_TEST_ALERT_EMAIL")
+    if not want:
+        return
+    points = api("/api/v1/provisioning/contact-points")
+    email = [p for p in points if p["name"] == "netmon email"]
+    got = email[0]["settings"].get("addresses") if email else None
+    check(f"the alert contact point sends to {want}", got == want, got)
+    # Grafana shows a set password as asterisks, and an unset one as "".
+    smtp = api("/api/admin/settings")["smtp"]
+    check("Grafana has the SMTP password", smtp.get("password", "") != "", smtp)
+
+
 def main():
+    check_alert_email()
     health = api(f"/api/datasources/uid/{DATASOURCE}/health")
     check("ClickHouse data source health", health.get("status") == "OK", health)
     check_panels()

@@ -31,7 +31,9 @@ fi
 for dir in "$@"; do
   sudo install -d -o netmon -g users "$dir" 2>/dev/null \
     || sudo -u netmon mkdir -p "$dir"
-  sudo chown -R netmon:users "$dir" 2>/dev/null || true
+  # Only what needs it: chown changes ctime, which the converter reads.
+  sudo find "$dir" \( ! -user netmon -o ! -group users \) \
+    -exec chown netmon:users {} + 2>/dev/null || true
   other=$(sudo find "$dir" ! -user netmon -print -quit)
   if [ -n "$other" ] || ! sudo -u netmon test -w "$dir"; then
     echo "netmon (uid $(id -u netmon)) doesn't own ${other:-$dir}; see README.md" >&2

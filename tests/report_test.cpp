@@ -127,6 +127,15 @@ void test_interval_seconds()
 	      "a report cut short by a stop is at least 1 s");
 }
 
+void test_next_boundary()
+{
+	check(next_boundary(1794794100, 10) == 1794794110,
+	      "on a boundary, the next one");
+	check(next_boundary(1794794107, 10) == 1794794110,
+	      "between boundaries, the next multiple of the interval");
+	check(next_boundary(1794794107, 1) == 1794794108, "-i 1: each second");
+}
+
 void test_clock_hold()
 {
 	using std::chrono::seconds;
@@ -160,6 +169,7 @@ int main()
 	test_deltas();
 	test_walk_restart();
 	test_interval_seconds();
+	test_next_boundary();
 	test_clock_hold();
 	if (failures)
 		std::printf("%d failed\n", failures);
