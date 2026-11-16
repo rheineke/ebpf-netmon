@@ -150,13 +150,15 @@ def check_alert_email():
     with socketserver.ThreadingTCPServer(SMTP, SMTPCapture) as server:
         server.logins = []
         threading.Thread(target=server.serve_forever, daemon=True).start()
-        config = {"name": "netmon test", "type": "email"}
-        config["settings"] = {"addresses": want}
-        receiver = {"name": "netmon test", "grafana_managed_receiver_configs": [config]}
-        api(
-            "/api/alertmanager/grafana/config/api/v1/receivers/test",
-            {"receivers": [receiver]},
-        )
+        # Grafana 13's receiver test, on the provisioned contact point.
+        base = "/apis/notifications.alerting.grafana.app/v1beta1/namespaces/default"
+        receivers = api(f"{base}/receivers")["items"]
+        receiver = next(r for r in receivers if r["spec"]["title"] == "netmon email")
+        integration = receiver["spec"]["integrations"][0]
+        test = {key: integration[key] for key in ("type", "uid", "settings")}
+        name = receiver["metadata"]["name"]
+        sent = api(f"{base}/receivers/{name}/test", {"integration": test})
+        check("Grafana sends a test mail", sent.get("status") == "success", sent)
         for _ in range(30):
             if server.logins:
                 break
