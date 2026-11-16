@@ -10,7 +10,9 @@ first login; CI runs it:
 import base64
 import json
 import os
+import socketserver
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -20,6 +22,47 @@ ROOT = Path(__file__).resolve().parent.parent
 GRAFANA = "http://127.0.0.1:3000"
 AUTH = "Basic " + base64.b64encode(b"admin:admin").decode()
 DATASOURCE = "netmon-clickhouse"
+SMTP = ("127.0.0.1", 2525)  # the server CI gives configure_alert_email.sh
+
+
+class SMTPCapture(socketserver.StreamRequestHandler):
+    """Just enough of an SMTP server to take a mail, recording the AUTH
+    PLAIN login it was sent, as (user, password), in server.logins."""
+
+    def handle(self):
+        def send(line):
+            self.wfile.write(line.encode() + b"\r\n")
+
+        send("220 localhost ESMTP netmon test")
+        in_data = False
+        for raw in self.rfile:
+            line = raw.decode(errors="replace").rstrip("\r\n")
+            if in_data:
+                if line == ".":
+                    in_data = False
+                    send("250 queued")
+                continue
+            verb, _, arg = line.partition(" ")
+            verb = verb.upper()
+            if verb in ("EHLO", "HELO"):
+                send("250-localhost")
+                send("250 AUTH PLAIN")
+            elif verb == "AUTH":
+                initial = arg.partition(" ")[2]
+                if not initial:
+                    send("334 ")
+                    initial = self.rfile.readline().decode().strip()
+                login = base64.b64decode(initial).split(b"\0")[1:]
+                self.server.logins.append(tuple(x.decode() for x in login))
+                send("235 accepted")
+            elif verb == "DATA":
+                in_data = True
+                send("354 go on")
+            elif verb == "QUIT":
+                send("221 bye")
+                return
+            else:
+                send("250 ok")
 
 
 def api(path, body=None):
@@ -99,6 +142,31 @@ def check_alert_email():
     # Grafana shows a set password as asterisks, and an unset one as "".
     smtp = api("/api/admin/settings")["smtp"]
     check("Grafana has the SMTP password", smtp.get("password", "") != "", smtp)
+    password = os.environ.get("NETMON_TEST_SMTP_PASSWORD")
+    if not password:
+        return
+    # Asterisks can hide the wrong password, so take a test mail and look.
+    socketserver.ThreadingTCPServer.allow_reuse_address = True
+    with socketserver.ThreadingTCPServer(SMTP, SMTPCapture) as server:
+        server.logins = []
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        config = {"name": "netmon test", "type": "email"}
+        config["settings"] = {"addresses": want}
+        receiver = {"name": "netmon test", "grafana_managed_receiver_configs": [config]}
+        api(
+            "/api/alertmanager/grafana/config/api/v1/receivers/test",
+            {"receivers": [receiver]},
+        )
+        for _ in range(30):
+            if server.logins:
+                break
+            time.sleep(1)
+        server.shutdown()
+    check(
+        "Grafana logs in to SMTP with the configured password",
+        server.logins[:1] == [(smtp["user"], password)],
+        [user for user, _ in server.logins],  # never the password
+    )
 
 
 def main():

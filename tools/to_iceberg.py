@@ -349,11 +349,11 @@ def check_clock(table):
     """Exits rather than commit with the clock over a minute behind the
     table's last commit: Iceberg's Java readers, such as the REST catalog,
     refuse a table whose history goes back in time, for weeks."""
-    last = table.metadata.last_updated_ms / 1000
-    if time.time() < last - 60:
+    ahead = table.metadata.last_updated_ms / 1000 - time.time()
+    if ahead > 60:
         sys.exit(
-            f"the table's last commit is {last - time.time():.0f} s ahead of this"
-            " clock: this clock is behind, or one that was ahead made it."
+            f"the table's last commit is {ahead:.0f} s ({ahead / 3600:.1f} h) ahead"
+            " of this clock: this clock is behind, or one that was ahead made it."
             " Not committing until this clock passes it."
         )
 
@@ -365,13 +365,22 @@ def late_files(ctimes, newest):
     return [path for path, ctime in ctimes.items() if ctime > newest - 2 * 3600]
 
 
+def skipped(path, error):
+    """Reports a raw file that can't be read, which shouldn't stop the rest."""
+    print(f"{path}: skipped: {error.strerror or error}", file=sys.stderr)
+
+
 def load_day(table, paths, counts):
     """Loads one day's files, in one transaction. Returns rows added."""
     hours = {}  # (host, hour) -> {row's values: row}
     loaded = []
     for path, start in paths:
         # A file has one host unless the machine was renamed mid-hour.
-        rows = read_rows(path)
+        try:
+            rows = read_rows(path)
+        except OSError as e:  # gone since the listing
+            skipped(path, e)
+            continue
         end = start + dt.timedelta(hours=1)
         if outside := sum(not start <= row["ts"] < end for row in rows):
             print(f"{path}: skipped {outside} row(s) outside its hour", file=sys.stderr)
@@ -412,18 +421,22 @@ def convert(raw, warehouse, now=None, days=7, catalog_uri=None, on_commit=None):
         start = hour_of(path)
         if start is None:
             continue  # not a raw file
-        ctime = path.stat().st_ctime
+        try:
+            ctime = path.stat().st_ctime
+            if oldest <= start < this_hour:
+                # Counting lines is cheap; parse only files that may have new rows.
+                host = first_host(path)
+                lines = path.read_bytes().count(b"\n")
+        except OSError as e:  # unreadable, a dangling link, or just deleted
+            skipped(path, e)
+            continue
         newest = max(newest, ctime)
         if start >= this_hour:
             continue  # still being written
         if start < oldest:
             too_old[path] = ctime
             continue
-        # Counting lines is cheap; parse only files that may have new rows.
-        host = first_host(path)
-        if host is None or path.read_bytes().count(b"\n") <= counts.get(
-            (host, start), 0
-        ):
+        if host is None or lines <= counts.get((host, start), 0):
             continue
         by_day.setdefault(start.date(), []).append((path, start))
     if late := late_files(too_old, newest):

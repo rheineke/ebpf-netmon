@@ -3,8 +3,12 @@
 // so netmon refuses to attach one whose fields have moved.
 #pragma once
 
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
+#include <cerrno>
+#include <cstring>
 #include <fstream>
 #include <istream>
 #include <stdexcept>
@@ -79,13 +83,15 @@ inline std::string check_format(std::istream &format,
 	return problems;
 }
 
-// Where tracefs is mounted, as libbpf looks for it, or "" if nowhere.
+// Where tracefs is mounted, as libbpf looks for it, or "" if nowhere. A
+// root that is there but can't be read counts, so the error says why.
 inline std::string tracefs_root()
 {
 	for (const char *root :
 	     {"/sys/kernel/tracing", "/sys/kernel/debug/tracing"}) {
 		struct stat st{};
-		if (stat((std::string(root) + "/events").c_str(), &st) == 0)
+		if (stat((std::string(root) + "/events").c_str(), &st) == 0 ||
+		    errno != ENOENT)
 			return root;
 	}
 	return "";
@@ -103,9 +109,14 @@ check_tracepoint(const std::string &root, const std::string &category,
 	std::string path = root;
 	path.append("/events/").append(category).append("/");
 	path.append(event).append("/format");
-	std::ifstream format(path);
-	if (!format)
+	// open() first: unlike std::ifstream, it says why it failed.
+	int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+	if (fd < 0 && errno == ENOENT)
 		return " this kernel has no " + category + ":" + event +
 		       " tracepoint (it needs Linux 6.3 or later)";
+	if (fd < 0)
+		return " can't read " + path + ": " + std::strerror(errno);
+	close(fd);
+	std::ifstream format(path);
 	return check_format(format, expected);
 }

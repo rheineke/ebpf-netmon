@@ -130,7 +130,10 @@ jobs:
             curl -fs http://127.0.0.1:3000/api/health >/dev/null && break
             sleep 2
           done
-          NETMON_TEST_ALERT_EMAIL=alerts@example.com .venv/bin/python tests/grafana_test.py
+          # grafana_test also takes a test mail on 127.0.0.1:2525 and checks the
+          # login Grafana sends.
+          NETMON_TEST_ALERT_EMAIL=alerts@example.com NETMON_TEST_SMTP_PASSWORD="$password" \
+            .venv/bin/python tests/grafana_test.py
       - name: Sync
         run: tests/sync_test.sh
       - name: clang-tidy

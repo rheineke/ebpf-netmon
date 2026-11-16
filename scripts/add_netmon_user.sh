@@ -29,11 +29,18 @@ else
 fi
 
 for dir in "$@"; do
+  # Whoever can write the share could plant a link to a local file, so root
+  # never follows one: not DIR itself (install would chown its target), and
+  # not a link inside it (chown -h changes the link, not what it points at).
+  if [ -L "$dir" ] || sudo test -L "$dir"; then
+    echo "$dir is a symlink; give the folder it points to" >&2
+    exit 1
+  fi
   sudo install -d -o netmon -g users "$dir" 2>/dev/null \
     || sudo -u netmon mkdir -p "$dir"
   # Only what needs it: chown changes ctime, which the converter reads.
   sudo find "$dir" \( ! -user netmon -o ! -group users \) \
-    -exec chown netmon:users {} + 2>/dev/null || true
+    -exec chown -h netmon:users {} + 2>/dev/null || true
   other=$(sudo find "$dir" ! -user netmon -print -quit)
   if [ -n "$other" ] || ! sudo -u netmon test -w "$dir"; then
     echo "netmon (uid $(id -u netmon)) doesn't own ${other:-$dir}; see README.md" >&2

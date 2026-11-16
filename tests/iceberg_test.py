@@ -76,6 +76,22 @@ STOPS = (
     " to_iceberg.convert = lambda *args, **kwargs: sys.exit(3); to_iceberg.main()"
 )
 
+# Runs main() and dies, as in a power cut, right after its Nth commit writes
+# its metadata file and before the catalog points at it. N is $CRASH_AT.
+CRASHES = """
+import os, sys, to_iceberg
+from pyiceberg.catalog import MetastoreCatalog
+write, calls = MetastoreCatalog._write_metadata, []
+def write_then_die(*args, **kwargs):
+    write(*args, **kwargs)
+    calls.append(1)
+    if len(calls) == int(os.environ["CRASH_AT"]):
+        os._exit(9)
+MetastoreCatalog._write_metadata = staticmethod(write_then_die)
+sys.argv[0] = "to_iceberg"
+to_iceberg.main()
+"""
+
 
 def refuses(f, *args):
     try:
@@ -167,9 +183,65 @@ def check_backlog_and_clock():
         )
 
 
+def check_skips():
+    """A raw file that can't be read is reported and skipped, and doesn't
+    stop the others loading. Only recent arrivals count as late."""
+    with tempfile.TemporaryDirectory() as tmp:
+        raw, warehouse = Path(tmp) / "raw", Path(tmp) / "warehouse"
+        five = NOW.replace(hour=5, minute=0)
+        write_hour(raw, "pi-a", five, 3)
+        dangling = raw / "pi-a" / "2026-10-01" / "05.jsonl"  # old, and gone
+        dangling.parent.mkdir(parents=True)
+        dangling.symlink_to(Path(tmp) / "missing")
+        unreadable = os.geteuid() != 0  # root reads anything
+        if unreadable:
+            write_hour(raw, "pi-b", five, 2)
+            (raw / "pi-b" / "2026-10-22" / "05.jsonl").chmod(0)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            added = to_iceberg.convert(raw, warehouse, NOW)
+        check("the readable files load", added, 3)
+        reported = err.getvalue().count(": skipped: ")
+        check("the others are reported", reported, 1 + unreadable)
+    t = time.time()
+    check(
+        "a file that arrived hours ago isn't late",
+        to_iceberg.late_files({"old": t - 3 * 3600, "new": t}, t),
+        ["new"],
+    )
+
+
+def check_crash_recovery():
+    """A run that dies mid-commit, after more commits than the table keeps
+    metadata files of, is cleaned up by the next one: main() moves its run
+    marker on with each commit."""
+    with tempfile.TemporaryDirectory() as tmp:
+        raw, warehouse = Path(tmp) / "raw", Path(tmp) / "warehouse"
+        now = dt.datetime.now(dt.UTC).replace(hour=3, minute=0, second=0, microsecond=0)
+        for days in range(1, 6):
+            write_hour(raw, "pi-a", now - dt.timedelta(days=days), 1)
+        table = to_iceberg.open_table(warehouse)
+        with table.transaction() as tx:
+            tx.set_properties({"write.metadata.previous-versions-max": "2"})
+        run = [sys.executable, "-c", CRASHES, "--raw", str(raw)]
+        run += ["--warehouse", str(warehouse), "--lock", str(Path(tmp) / "lock")]
+        run += ["--marker", str(Path(tmp) / "marker.json")]
+        env = os.environ | {"PYTHONPATH": str(TOOLS), "CRASH_AT": "4"}
+        quiet = {"env": env, "stdout": subprocess.DEVNULL}
+        check(
+            "a run dies on its 4th commit", subprocess.run(run, **quiet).returncode, 9
+        )
+        env["CRASH_AT"] = "0"
+        check("the next run recovers", subprocess.run(run, **quiet).returncode, 0)
+        rows = to_iceberg.open_table(warehouse).scan().to_arrow().num_rows
+        check("and loads the rest", rows, 5)
+
+
 def main():
     check_units()
     check_backlog_and_clock()
+    check_skips()
+    check_crash_recovery()
     with tempfile.TemporaryDirectory() as tmp:
         raw, warehouse = Path(tmp) / "raw", Path(tmp) / "warehouse"
         h10 = NOW.replace(hour=10, minute=0)
