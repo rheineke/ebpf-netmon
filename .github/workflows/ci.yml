@@ -93,11 +93,13 @@ jobs:
           [ "$(systemctl show -p User --value netmon-iceberg.service)" = netmon ] \
             || fail "the converter doesn't run as netmon"
           # The installer's run, the first; the timer's may follow.
-          added=$(sudo journalctl -u netmon-iceberg.service -o cat \
-            | sed -n '/^added /{s/^added \([0-9]*\) rows.*/\1/p;q;}')
-          [ "${added:-0}" -gt 0 ] || fail "the netmon run loaded nothing"
-          rows=$(($(cat $test/iceberg_rows) + added))  # before tee empties the file
-          echo "$rows" | sudo tee $test/iceberg_rows
+          for table in traffic interfaces; do
+            added=$(sudo journalctl -u netmon-iceberg.service -o cat \
+              | sed -n "/^added [0-9]* rows to netmon.$table\$/{s/^added \([0-9]*\) .*/\1/p;q;}")
+            [ "${added:-0}" -gt 0 ] || fail "the netmon run loaded nothing into $table"
+            rows=$(($(cat $test/iceberg_rows.$table) + added))  # before tee empties it
+            echo "$rows" | sudo tee $test/iceberg_rows.$table
+          done
           .venv/bin/python tests/dashboard_test.py check $test
           sudo systemctl start netmon-iceberg-maintain.service
           .venv/bin/python tests/dashboard_test.py check $test

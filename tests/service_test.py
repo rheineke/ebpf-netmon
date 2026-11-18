@@ -1,6 +1,8 @@
 """Checks the netmon service as scripts/install_service.sh installs it: it
 runs sandboxed with only CAP_BPF and CAP_PERFMON, and its hourly files count
-this process's traffic exactly. Needs systemd and sudo; CI runs it:
+this process's traffic exactly. Its private network has only a loopback, yet
+its interface files count the host's: lo carried this process's traffic.
+Needs systemd and sudo; CI runs it:
 
   scripts/install_service.sh && python3 tests/service_test.py
 """
@@ -62,7 +64,7 @@ def counted():
     """This process's totals in the service's files, and their hosts."""
     got = {"tcp_tx": 0, "tcp_rx": 0, "udp_tx": 0, "udp_rx": 0}
     hosts = set()
-    for path in glob.glob(os.path.join(RAW, "*", "*.jsonl")):
+    for path in glob.glob(os.path.join(RAW, "*", "[0-9][0-9].jsonl")):
         for line in open(path):
             row = json.loads(line)
             if row.get("pid") == os.getpid():
@@ -70,6 +72,19 @@ def counted():
                 for k in got:
                     got[k] += row[k]
     return got, hosts
+
+
+def interfaces_since(start):
+    """The bytes each interface sent in the service's reports from start on,
+    and the interface files' hosts."""
+    sent, hosts = {}, set()
+    for path in glob.glob(os.path.join(RAW, "*", "*.interfaces.jsonl")):
+        for line in open(path):
+            row = json.loads(line)
+            if row["ts"] > start:
+                hosts.add(row["host"])
+                sent[row["interface"]] = sent.get(row["interface"], 0) + row["tx_bytes"]
+    return sent, hosts
 
 
 def fail(why):
@@ -85,6 +100,7 @@ def main():
         fail(f"capabilities {caps}, want only cap_bpf and cap_perfmon")
     print("ok  : running, with only cap_bpf and cap_perfmon")
 
+    start = time.time()
     want = move_traffic()
     # Reports come every 10 s, but the unit's -w 300 holds them while the
     # clock is unsynchronized.
@@ -97,6 +113,24 @@ def main():
     if hosts != {socket.gethostname()}:
         fail(f"rows say host {hosts}, want {socket.gethostname()}")
     print(f"ok  : {RAW} counts {got}")
+
+    # The report after the traffic is in; lo carried it, headers and all.
+    moved = want["tcp_tx"] + want["udp_tx"]
+    deadline = time.monotonic() + 30  # written just after the processes' rows
+    while (sent := interfaces_since(int(start))[0]).get("lo", 0) < moved:
+        if time.monotonic() > deadline:
+            break
+        time.sleep(2)
+    sent, hosts = interfaces_since(int(start))
+    if sent.get("lo", 0) < moved:
+        fail(
+            f"lo sent {sent.get('lo', 0)} bytes in the interface files, want >= {moved}"
+        )
+    if set(sent) == {"lo"}:
+        fail(f"only lo in the interface files, the service's own namespace: {sent}")
+    if hosts != {socket.gethostname()}:
+        fail(f"interface rows say host {hosts}, want {socket.gethostname()}")
+    print(f"ok  : the host's interfaces, not the sandbox's: {sorted(sent)}")
     print("PASS")
 
 

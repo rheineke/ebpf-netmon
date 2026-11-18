@@ -317,11 +317,12 @@ def check_files(out_dir, stdout_rows, pids):
     """-o writes the same rows as -j -n 0 to out_dir/YYYY-MM-DD/HH.jsonl:
     every row, though -n defaults to 10."""
     paths = glob.glob(os.path.join(out_dir, "*", "*.jsonl"))
-    rows = [json.loads(line) for p in paths for line in open(p)]
     for p in paths:
         day, hour = p.split(os.sep)[-2:]
-        if len(day) != 10 or len(hour) != len("HH.jsonl"):
+        if len(day) != 10 or hour[2:] not in (".jsonl", ".interfaces.jsonl"):
             sys.exit(f"FAIL: unexpected file name {p}")
+    paths = [p for p in paths if not p.endswith(".interfaces.jsonl")]
+    rows = [json.loads(line) for p in paths for line in open(p)]
     if not rows or set(rows[0]) != set(stdout_rows[0]):
         sys.exit(f"FAIL: file rows differ from stdout rows: {rows[:1]}")
     if rows[0]["host"] != socket.gethostname():
@@ -333,6 +334,35 @@ def check_files(out_dir, stdout_rows, pids):
     if odd := [ts for ts in stamps[:-1] if ts % 2]:
         sys.exit(f"FAIL: reports off the 2 s boundaries: {odd}")
     print(f"ok  : -o wrote {len(rows)} rows to {len(paths)} file(s)")
+
+
+def check_interface_files(out_dir, results, err):
+    """-o also writes what each interface moved to HH.interfaces.jsonl. In
+    the host's network namespace, as on a Pi, lo carried at least every
+    byte the scenarios sent; a container's own lo isn't the host's."""
+    if "can't read /proc/1/net/dev" in err:
+        sys.exit(f"FAIL: netmon couldn't read the interface counters:\n{err}")
+    paths = glob.glob(os.path.join(out_dir, "*", "*.interfaces.jsonl"))
+    rows = [json.loads(line) for p in paths for line in open(p)]
+    keys = {"ts", "host", "interval_s", "interface"}
+    keys |= {f"{d}_{u}" for d in ("rx", "tx") for u in ("bytes", "packets")}
+    if bad := [row for row in rows if set(row) != keys]:
+        sys.exit(f"FAIL: interface rows with other fields: {bad[:1]}")
+    if odd := sorted({row["ts"] for row in rows})[:-1]:
+        if odd := [ts for ts in odd if ts % 2]:
+            sys.exit(f"FAIL: interface rows off the 2 s boundaries: {odd}")
+    if os.stat("/proc/self/ns/net").st_ino != os.stat("/proc/1/ns/net").st_ino:
+        print(
+            f"skip: lo's bytes, not in the host's network namespace ({len(rows)} rows)"
+        )
+        return
+    sent = sum(
+        want.get(k, 0) for _, want in results.values() for k in ("tcp_tx", "udp_tx")
+    )
+    lo = sum(row["tx_bytes"] for row in rows if row["interface"] == "lo")
+    if lo < sent:
+        sys.exit(f"FAIL: lo sent {lo} bytes, but the scenarios sent {sent}")
+    print(f"ok  : lo sent {lo} bytes, at least the scenarios' {sent}")
 
 
 def check_missed_logged(err):
@@ -370,7 +400,11 @@ def main():
         text=True,
     )
     out_dir = tempfile.mkdtemp()
-    to_files = subprocess.Popen(["netmon", "-i", "2", "-w", "5", "-o", out_dir])
+    to_files = subprocess.Popen(
+        ["netmon", "-i", "2", "-w", "5", "-o", out_dir],
+        stderr=subprocess.PIPE,
+        text=True,
+    )
     time.sleep(1.5)  # let the probes attach and the baseline read happen
 
     results = {name: run_scenario(name) for name in SCENARIOS}
@@ -379,6 +413,7 @@ def main():
         p.terminate()
     out, err = netmon.communicate(timeout=30)
     sampled_out, _ = sampled.communicate(timeout=30)
+    _, files_err = to_files.communicate(timeout=30)
     for p in (netmon, sampled, to_files):
         if p.wait(timeout=30) != 0:
             sys.exit(f"FAIL: {p.args} exited with {p.returncode}")
@@ -391,6 +426,7 @@ def main():
         pid for pid, want in results.values() if any(want.get(k) for k in COUNTERS)
     ]
     check_files(out_dir, rows, moved)
+    check_interface_files(out_dir, results, files_err)
     if failed:
         sys.exit(f"FAIL: wrong counts for {failed}")
     print("PASS")

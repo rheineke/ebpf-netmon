@@ -1,5 +1,5 @@
-// Checks json_escape() and HourlyFiles: hour boundaries, appends, and a
-// line cut off by a crash.
+// Checks json_escape() and HourlyFiles: hour boundaries, suffixes, appends,
+// and a line cut off by a crash.
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -52,6 +52,9 @@ void test_hourly_files(const std::filesystem::path &dir)
 	      "path is DIR/YYYY-MM-DD/HH.jsonl in UTC");
 	check(files.path_for(after) == dir / "2026-03-08" / "07.jsonl",
 	      "a new hour gets a new file");
+	check(HourlyFiles(dir.string(), ".interfaces.jsonl").path_for(before) ==
+		      dir / "2026-03-08" / "06.interfaces.jsonl",
+	      "another suffix follows the hour");
 
 	std::FILE *f = files.at(before);
 	check(f != nullptr, "opens and creates the day folder");

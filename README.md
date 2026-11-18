@@ -13,7 +13,8 @@ eBPF network traffic monitoring for Raspberry Pis (Debian trixie, arm64).
 ```
 
 `netmon` counts each process's TCP, UDP and NFS bytes in the kernel, and
-every 10 seconds writes a row for each process that moved any. A minute
+every 10 seconds writes a row for each process that moved any, and for each
+network interface, to check the processes' rows against. A minute
 later the row is on the NAS, and Grafana's live view shows it. Each hour the
 converter loads the finished hour into an Iceberg table, which ClickHouse
 serves to Grafana's dashboard and alerts.
@@ -201,6 +202,21 @@ service's `-i 10`:
 {"ts":1792666260,"host":"raspberrypi","interval_s":10,"pid":4309,"uid":0,"comm":"nfsd","tcp_tx":84,"tcp_rx":120,"udp_tx":0,"udp_rx":0,"nfs_read":0,"nfs_write":0,"scale":1}
 ```
 
+Each report also appends what every network interface moved in its
+interval, headers and all, to `DIR/YYYY-MM-DD/HH.interfaces.jsonl`: the
+kernel's counters from `/proc/1/net/dev`, the host's network namespace
+(the service has a private one, with only a loopback). Interfaces that
+moved nothing are left out, and the first report counts from when netmon
+started, as the processes' rows do:
+
+```json
+{"ts":1792666260,"host":"raspberrypi","interval_s":10,"interface":"eth0","rx_bytes":21714,"rx_packets":61,"tx_bytes":9822,"tx_packets":48}
+```
+
+They are an independent total to check netmon's per-process counts
+against, as HRT checks theirs against their switches' counters (see How
+much netmon accounts for).
+
 To capture continuously on a Pi, after `scripts/build_on_pi.sh` and once
 the Pi has its host name (see Several Pis):
 
@@ -212,7 +228,8 @@ It installs `netmon` and a systemd service that reports every 10 seconds
 to `/var/lib/netmon/raw`. The raw files are kept as written; converting
 them to Parquet is a separate step. Nothing deletes old files yet. An idle
 Pi writes about 650 rows (120 KB) an hour, or 3 MB a day; busier Pis write
-more.
+more. The interface files add 360 rows (50 KB) an hour for each interface
+in use, such as `eth0` and `lo`.
 
 The service runs as root, but with only `CAP_BPF` and `CAP_PERFMON`, no
 network, and a read-only view of the system apart from its own folder
@@ -228,8 +245,9 @@ starts a new line.
 ## Iceberg
 
 `tools/to_iceberg.py` appends each finished hour of raw files to the
-Iceberg table `netmon.traffic`, stored as Parquet and partitioned by day,
-with a SQLite catalog in the warehouse directory. A file is loaded again
+Iceberg table `netmon.traffic`, and of interface files to
+`netmon.interfaces`, stored as Parquet and partitioned by day, with a
+SQLite catalog in the warehouse directory. A file is loaded again
 only when it has more rows than the table holds for its hour, so reruns are
 safe and an hour copied before it was complete is filled in later. It
 commits a day at a time, so a long backlog loads in bounded memory. It
@@ -400,7 +418,12 @@ scripts/install_clickhouse.sh WAREHOUSE [RAW]
 scripts/install_grafana.sh
 ```
 
-ClickHouse listens on 127.0.0.1 only. It has two views:
+Install the converter first: ClickHouse's views need its tables, and an
+upgrade that adds a table needs its next run (`install_converter.sh` runs
+it at once).
+
+ClickHouse listens on 127.0.0.1 only. It has two views of each table, the
+processes' rows (`traffic`) and the interfaces' (`interfaces`):
 
 - `netmon.traffic` reads the Iceberg table with `icebergLocal`, up to the
   last hour the converter loaded.
@@ -415,6 +438,8 @@ ClickHouse listens on 127.0.0.1 only. It has two views:
   next run, at five past. ClickHouse must be able to read every file
   in RAW: one it can't open fails the live view's queries until the file
   is two days old.
+- `netmon.interfaces` and `netmon.interfaces_live` do the same for the
+  interface files.
 
 Grafana's ClickHouse user, `grafana`, may only read these views; they read
 the files as `netmon_views`, which can't log in. ClickHouse's own `default`
@@ -422,8 +447,30 @@ user keeps its passwordless login from this machine, for the installer, so
 don't give untrusted users a shell here.
 
 Grafana serves the `netmon traffic` dashboard on port 3000, from
-`netmon.traffic_live`, refreshing every 30 seconds. The first login is
-admin/admin.
+`netmon.traffic_live` and `netmon.interfaces_live`, refreshing every 30
+seconds. The first login is admin/admin.
+
+### How much netmon accounts for
+
+The dashboard's heatmap, "Traffic netmon accounts for", is HRT's check of
+their eBPF totals against their switches' counters, per Pi: a row for each
+host's received and sent bytes, a column per time bucket, and in each cell
+the bytes netmon charged to processes (TCP and UDP, scaled) as a share of
+what the host's interfaces moved. Green is all of it, red half or less.
+
+The interfaces count each packet's headers, which a process's sends and
+receives don't, so the heatmap takes 66 bytes a packet off theirs:
+Ethernet, IPv4 and TCP with timestamps. A bare ACK is then nothing, as it
+should be. It counts `lo` as well, since netmon counts traffic between
+local processes; it leaves out bridges and veth pairs (`veth*`, `docker*`,
+`br-*`, `virbr*`), whose packets cross another interface too.
+
+What stays uncounted is traffic no process sends or receives through a
+socket: ICMP (ping), ARP, DHCP and IPv6 neighbour discovery, packet
+capture, TCP retransmissions, and IPv6's 20 bytes of headers more than the
+66 allowed for. On a Pi 4 serving this dashboard, netmon accounted for
+about 94% each way. Over 100% means bytes counted twice, as a VPN run as a
+process does: inside the tunnel and out.
 
 ### Alerts
 

@@ -33,11 +33,17 @@ inline std::string json_escape(const std::string &s)
 	return out;
 }
 
-// Appends to dir/YYYY-MM-DD/HH.jsonl for the UTC hour of each report, so
-// files are complete once the hour has passed and easy to convert in bulk.
+// Appends to dir/YYYY-MM-DD/HH.jsonl (or another suffix) for the UTC hour
+// of each report, so files are complete once the hour has passed and easy
+// to convert in bulk.
 class HourlyFiles {
 public:
-	explicit HourlyFiles(std::string dir) : dir_(std::move(dir)) {}
+	// suffix ends each file's name, after the hour: .jsonl for the
+	// processes' rows, .interfaces.jsonl for the interfaces'.
+	explicit HourlyFiles(std::string dir, std::string suffix = ".jsonl")
+	    : dir_(std::move(dir)), suffix_(std::move(suffix))
+	{
+	}
 	HourlyFiles(const HourlyFiles &) = delete;
 	HourlyFiles &operator=(const HourlyFiles &) = delete;
 	~HourlyFiles() { close(); }
@@ -69,8 +75,8 @@ public:
 		gmtime_r(&ts, &tm);
 		char day[16], hour[16];
 		std::strftime(day, sizeof(day), "%F", &tm);
-		std::strftime(hour, sizeof(hour), "%H.jsonl", &tm);
-		return std::filesystem::path(dir_) / day / hour;
+		std::strftime(hour, sizeof(hour), "%H", &tm);
+		return std::filesystem::path(dir_) / day / (hour + suffix_);
 	}
 
 private:
@@ -94,6 +100,7 @@ private:
 	}
 
 	std::string dir_;
+	std::string suffix_;
 	std::filesystem::path path_;
 	std::FILE *file_ = nullptr;
 };

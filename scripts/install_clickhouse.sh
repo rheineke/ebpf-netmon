@@ -1,12 +1,14 @@
 #!/bin/bash
-# Installs ClickHouse with views over the Iceberg table that the converter
+# Installs ClickHouse with views over the Iceberg tables that the converter
 # writes (scripts/install_converter.sh) and over recent raw files.
 #
 #   scripts/install_clickhouse.sh WAREHOUSE [RAW]
 #
 # RAW defaults to /var/lib/netmon/raw. ClickHouse may read only under the
 # deepest folder holding both, so keep them together (e.g. on one share).
-# With scripts/install_rest_catalog.sh installed, ClickHouse reads the table
+# The converter makes the tables, so run scripts/install_converter.sh
+# first (again, after an upgrade that adds one).
+# With scripts/install_rest_catalog.sh installed, ClickHouse reads the tables
 # through that catalog; otherwise it reads the newest metadata file in
 # WAREHOUSE.
 #
@@ -17,7 +19,7 @@
 set -eu
 
 if [ $# -lt 1 ] || [ $# -gt 2 ]; then
-  sed -n '2,16s/^# \{0,1\}//p' "$0" >&2
+  sed -n '2,18s/^# \{0,1\}//p' "$0" >&2
   exit 2
 fi
 warehouse=$(realpath "$1")
@@ -106,10 +108,13 @@ if [ -f $rest ]; then
     ENGINE = DataLakeCatalog('http://127.0.0.1:8181/v1', 'auto')
     SETTINGS catalog_type = 'rest', warehouse = 'netmon'"
   traffic="netmon_lake.\`netmon.traffic\`"
+  interfaces="netmon_lake.\`netmon.interfaces\`"
 else
   traffic="icebergLocal('$warehouse/netmon/traffic')"
+  interfaces="icebergLocal('$warehouse/netmon/interfaces')"
 fi
-sed -e "s|@TRAFFIC@|$traffic|g" -e "s|@RAW@|$raw|g" clickhouse/views.sql \
+sed -e "s|@TRAFFIC@|$traffic|g" -e "s|@INTERFACES@|$interfaces|g" \
+  -e "s|@RAW@|$raw|g" clickhouse/views.sql \
   | clickhouse-client --multiquery
 clickhouse-client --user grafana -q \
   'SELECT host, count() AS rows, max(ts) AS latest FROM netmon.traffic_live GROUP BY host'

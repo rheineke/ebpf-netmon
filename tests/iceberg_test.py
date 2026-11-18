@@ -54,6 +54,23 @@ def write_hour(raw, host, start, rows, extra=""):
         f.write(extra)
 
 
+def write_interfaces(raw, host, start, reports, extra=""):
+    """Writes reports of lo and eth0, each moving 1000/10 in, 500/5 out."""
+    name = start.strftime("%H.interfaces.jsonl")
+    path = raw / host / start.strftime("%Y-%m-%d") / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        for i in range(reports):
+            for interface in ("lo", "eth0"):
+                row = {"ts": int(start.timestamp()) + 10 * (i + 1), "host": host}
+                row |= {"interval_s": 10, "interface": interface}
+                row |= {"rx_bytes": 1000, "rx_packets": 10}
+                row |= {"tx_bytes": 500, "tx_packets": 5}
+                f.write(json.dumps(row) + "\n")
+        f.write(extra)
+    return path
+
+
 def readable(table):
     """Whether every snapshot's files are all there."""
     try:
@@ -74,6 +91,16 @@ def mark_run(marker, warehouse, start):
 STOPS = (
     "import sys, to_iceberg; sys.argv[0] = 'to_iceberg';"
     " to_iceberg.convert = lambda *args, **kwargs: sys.exit(3); to_iceberg.main()"
+)
+
+# The same, but only for netmon.interfaces, which runs second.
+STOPS_ON_INTERFACES = (
+    "import sys, to_iceberg; sys.argv[0] = 'to_iceberg'; convert = to_iceberg.convert\n"
+    "def stop(*args, kind, **kwargs):\n"
+    "    if kind is to_iceberg.INTERFACES:\n"
+    "        sys.exit(3)\n"
+    "    return convert(*args, kind=kind, **kwargs)\n"
+    "to_iceberg.convert = stop; to_iceberg.main()"
 )
 
 # Runs main() and dies, as in a power cut, right after its Nth commit writes
@@ -241,6 +268,123 @@ def check_skips():
     )
 
 
+def check_interfaces():
+    """Interface files load into netmon.interfaces and process files into
+    netmon.traffic, each table ignoring the other's files; main() runs both,
+    each with a run marker of its own."""
+    traffic, interfaces = to_iceberg.TRAFFIC, to_iceberg.INTERFACES
+    day = Path("raw/pi/2026-10-22")
+    check(
+        "hours of each kind's files",
+        [
+            to_iceberg.hour_of(day / name, kind.suffix)
+            for kind in (traffic, interfaces)
+            for name in ("11.jsonl", "11.interfaces.jsonl")
+        ],
+        [NOW.replace(hour=11, minute=0), None, None, NOW.replace(hour=11, minute=0)],
+    )
+    check(
+        "run markers",
+        [to_iceberg.marker_for("/var/lib/x/run.json", k) for k in to_iceberg.KINDS],
+        ["/var/lib/x/run.json", "/var/lib/x/run-interfaces.json"],
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        raw, warehouse = Path(tmp) / "raw", Path(tmp) / "warehouse"
+        h10 = NOW.replace(hour=10, minute=0)
+        write_hour(raw, "pi-a", h10, 5)
+        bad = [
+            {"interface": None},
+            {"rx_bytes": 2**64 - 1},  # past a long
+            {"tx_packets": "5"},
+            {"ts": int(h10.timestamp()) + 3600},  # outside the file's hour
+        ]
+        path = write_interfaces(raw, "pi-a", h10, 3)
+        good = json.loads(path.read_text().splitlines()[0])
+        with open(path, "a") as f:
+            for row in bad:
+                f.write(json.dumps(good | row) + "\n")
+            f.write(json.dumps({k: v for k, v in good.items() if k != "tx_bytes"}))
+            f.write("\n" + json.dumps(good)[:30])  # cut off by a crash
+        write_interfaces(raw, "pi-b", h10 + dt.timedelta(hours=1), 2)
+        write_interfaces(raw, "pi-b", h10 + dt.timedelta(hours=2), 4)  # this hour
+
+        def load(kind, now=NOW):
+            return to_iceberg.convert(raw, warehouse, now, kind=kind)
+
+        check("process rows load alone", load(traffic), 5)
+        check("interface rows load, odd lines skipped", load(interfaces), 6 + 4)
+        check("then nothing", (load(traffic), load(interfaces)), (0, 0))
+        table = to_iceberg.open_table(warehouse, kind=interfaces)
+        rows = table.scan().to_arrow()
+        check("the interfaces table", table.name(), ("netmon", "interfaces"))
+        check(
+            "its columns",
+            rows.schema.names,
+            ["ts", "host", "interval_s", "interface"] + to_iceberg.IFACE_COUNTERS,
+        )
+        check(
+            "its totals",
+            [sum(rows[c].to_pylist()) for c in to_iceberg.IFACE_COUNTERS],
+            [10_000, 100, 5_000, 50],
+        )
+        check(
+            "process rows left alone",
+            to_iceberg.open_table(warehouse).scan().to_arrow().num_rows,
+            5,
+        )
+        check(
+            "each table's own folder",
+            sorted({p.parts[-4] for p in warehouse.rglob("*.parquet")}),
+            ["interfaces", "traffic"],
+        )
+
+        # main() loads both, the next hour now finished, and leaves no
+        # marker for either.
+        marker = Path(tmp) / "run.json"
+        run = [sys.executable, str(TOOLS / "to_iceberg.py"), "--raw", str(raw)]
+        run += ["--warehouse", str(warehouse), "--lock", str(Path(tmp) / "lock")]
+        run += ["--marker", str(marker), "--days", "100000"]
+        out = subprocess.run(run, capture_output=True, text=True)
+        check(
+            "main() runs both tables",
+            [line for line in out.stdout.splitlines() if line.startswith("added")],
+            ["added 0 rows to netmon.traffic", "added 8 rows to netmon.interfaces"],
+        )
+        check("and leaves no markers", sorted(Path(tmp).glob("run*.json")), [])
+        stopped = subprocess.run(
+            [sys.executable, "-c", STOPS_ON_INTERFACES, *run[2:]],
+            env=os.environ | {"PYTHONPATH": str(TOOLS)},
+            capture_output=True,
+        )
+        check(
+            "a run stopped on interfaces leaves only their marker",
+            (stopped.returncode, sorted(p.name for p in Path(tmp).glob("run*.json"))),
+            (3, ["run-interfaces.json"]),
+        )
+        check(
+            "the next run recovers it",
+            (subprocess.run(run, capture_output=True).returncode, marker.exists()),
+            (0, False),
+        )
+
+        month = NOW + dt.timedelta(days=30)
+        write_interfaces(raw, "pi-a", h10 - dt.timedelta(days=1), 1)
+        check("a day later", load(interfaces, month - dt.timedelta(days=29)), 2)
+        before = to_iceberg.open_table(warehouse, kind=interfaces).scan().to_arrow()
+        done = to_iceberg.maintain(warehouse, month, kind=interfaces)
+        check(
+            "maintenance compacts the interfaces' day of 3 files",
+            done["days compacted"],
+            1,
+        )
+        after = to_iceberg.open_table(warehouse, kind=interfaces).scan().to_arrow()
+        check(
+            "and keeps their rows",
+            sorted(after.to_pylist(), key=str),
+            sorted(before.to_pylist(), key=str),
+        )
+
+
 def check_crash_recovery():
     """A run that dies mid-commit, after more commits than the table keeps
     metadata files of, is cleaned up by the next one: main() moves its run
@@ -271,6 +415,7 @@ def main():
     check_units()
     check_backlog_and_clock()
     check_skips()
+    check_interfaces()
     check_crash_recovery()
     with tempfile.TemporaryDirectory() as tmp:
         raw, warehouse = Path(tmp) / "raw", Path(tmp) / "warehouse"

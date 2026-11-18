@@ -5,8 +5,9 @@
 
 Reads each RAW/.../YYYY-MM-DD/HH.jsonl from the last --days days whose UTC
 hour has ended, and loads it into netmon.traffic in WAREHOUSE, as Parquet
-partitioned by day. RAW may hold several hosts' files, e.g. RAW/HOST/....
-The raw files are left as they are.
+partitioned by day; and each HH.interfaces.jsonl, the interfaces' counters,
+into netmon.interfaces. RAW may hold several hosts' files, e.g.
+RAW/HOST/.... The raw files are left as they are.
 
 A file is loaded again when it has more rows than the table holds for its
 host and hour, so an hour copied before it was complete (a NAS that was
@@ -38,6 +39,7 @@ after loading the rest.
 """
 
 import argparse
+import dataclasses
 import datetime as dt
 import fcntl
 import json
@@ -98,6 +100,51 @@ ARROW_SCHEMA = pa.schema(
         pa.field("scale", pa.float64(), nullable=False),
     ]
 )
+# What each network interface moved in a report, headers and all.
+IFACE_COUNTERS = ["rx_bytes", "rx_packets", "tx_bytes", "tx_packets"]
+IFACE_SCHEMA = Schema(
+    NestedField(1, "ts", TimestamptzType(), required=True),
+    NestedField(2, "host", StringType(), required=True),
+    NestedField(3, "interval_s", IntegerType(), required=True),
+    NestedField(4, "interface", StringType(), required=True),
+    *(
+        NestedField(5 + i, name, LongType(), required=True)
+        for i, name in enumerate(IFACE_COUNTERS)
+    ),
+)
+IFACE_ARROW_SCHEMA = pa.schema(
+    [
+        pa.field("ts", pa.timestamp("us", tz="UTC"), nullable=False),
+        pa.field("host", pa.string(), nullable=False),
+        pa.field("interval_s", pa.int32(), nullable=False),
+        pa.field("interface", pa.string(), nullable=False),
+        *(pa.field(name, pa.int64(), nullable=False) for name in IFACE_COUNTERS),
+    ]
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class Kind:
+    """A table, and its raw files: RAW/.../YYYY-MM-DD/HH plus suffix."""
+
+    table: str
+    suffix: str
+    schema: Schema
+    arrow: pa.Schema
+    defaults: dict  # for fields that rows from older versions of netmon lack
+
+    @property
+    def name(self):
+        return self.table.partition(".")[2]
+
+
+TRAFFIC = Kind(
+    TABLE, ".jsonl", SCHEMA, ARROW_SCHEMA, dict.fromkeys(COUNTERS, 0)
+)  # NFS counters came later
+INTERFACES = Kind(
+    "netmon.interfaces", ".interfaces.jsonl", IFACE_SCHEMA, IFACE_ARROW_SCHEMA, {}
+)
+KINDS = (TRAFFIC, INTERFACES)
 
 
 # The services own these directories (RuntimeDirectory and StateDirectory).
@@ -114,9 +161,9 @@ def local_path(uri):
     return Path(urllib.parse.unquote(urllib.parse.urlparse(uri).path)).resolve()
 
 
-def metadata_files(warehouse):
+def metadata_files(warehouse, kind=TRAFFIC):
     """{path: version} of the table's metadata files in the warehouse."""
-    metadata = Path(warehouse).resolve() / "netmon" / "traffic" / "metadata"
+    metadata = Path(warehouse).resolve() / "netmon" / kind.name / "metadata"
     files = {}
     for path in metadata.glob("*.metadata.json"):
         if match := METADATA_NAME.fullmatch(path.name):
@@ -141,9 +188,9 @@ def complete(path):
     return False
 
 
-def newest_metadata(warehouse):
+def newest_metadata(warehouse, kind=TRAFFIC):
     """The table's newest complete metadata file in the warehouse, or None."""
-    files = sorted(metadata_files(warehouse).items(), key=lambda f: (f[1], f[0]))
+    files = sorted(metadata_files(warehouse, kind).items(), key=lambda f: (f[1], f[0]))
     return next((path for path, _ in reversed(files) if complete(path)), None)
 
 
@@ -174,7 +221,7 @@ def mark_run(marker, warehouse, table):
         os.close(folder)
 
 
-def recover(warehouse, catalog_uri, marker):
+def recover(warehouse, catalog_uri, marker, kind=TRAFFIC):
     """If the last run on this machine stopped partway, deletes the metadata
     files it wrote after its last commit: the catalog never took them, and
     their rows load again from the raw files. Only when this catalog has
@@ -189,14 +236,14 @@ def recover(warehouse, catalog_uri, marker):
         run = {}
     if run.get("warehouse") != str(warehouse) or not {"start", "started"} <= run.keys():
         return
-    table = load_table(open_catalog(warehouse, catalog_uri))
+    table = load_table(open_catalog(warehouse, catalog_uri), kind)
     if table is None:
         return
     current = local_path(table.metadata_location)
     history = {current} | {
         local_path(entry.metadata_file) for entry in table.metadata.metadata_log
     }
-    files = metadata_files(warehouse)
+    files = metadata_files(warehouse, kind)
     if local_path(run["start"]) not in history or current not in files:
         return
     for path, version in files.items():
@@ -206,17 +253,17 @@ def recover(warehouse, catalog_uri, marker):
     Path(marker).unlink()
 
 
-def load_table(catalog):
+def load_table(catalog, kind=TRAFFIC):
     """The catalog's table, or None if it has none. Exits if its metadata
     file is gone, as when another catalog took the table over long ago."""
     try:
-        return catalog.load_table(TABLE)
+        return catalog.load_table(kind.table)
     except NoSuchTableError:
         return None
     except FileNotFoundError as e:
         sys.exit(
             f"{e.filename or e}: this catalog's metadata is gone; another catalog"
-            f" has the table. Remove {TABLE} from this catalog to adopt it."
+            f" has the table. Remove {kind.table} from this catalog to adopt it."
         )
 
 
@@ -230,7 +277,7 @@ def open_catalog(warehouse, catalog_uri=None):
     return catalog
 
 
-def open_table(warehouse, catalog_uri=None):
+def open_table(warehouse, catalog_uri=None, kind=TRAFFIC):
     warehouse = Path(warehouse).resolve()
     if warehouse.as_uri() != f"file://{warehouse}":
         # pyiceberg would write to a folder named with the escapes, e.g. a%20b.
@@ -239,29 +286,33 @@ def open_table(warehouse, catalog_uri=None):
     catalog = open_catalog(warehouse, catalog_uri)
     # Not create_table_if_not_exists: it writes a metadata file even when the
     # table exists.
-    if table := load_table(catalog):
-        files = metadata_files(warehouse)
-        metadata = newest_metadata(warehouse)
+    if table := load_table(catalog, kind):
+        files = metadata_files(warehouse, kind)
+        metadata = newest_metadata(warehouse, kind)
         current = files.get(local_path(table.metadata_location), -1)
         if metadata and files[metadata] > current:
             sys.exit(
                 f"{metadata} is newer than {table.metadata_location}, which"
                 f" this catalog has: another catalog has committed since."
-                f" Remove {TABLE} from this catalog to adopt it."
+                f" Remove {kind.table} from this catalog to adopt it."
             )
         return table
-    metadata = newest_metadata(warehouse)
+    metadata = newest_metadata(warehouse, kind)
     if metadata:
         print(f"adopting {metadata}")
-        return catalog.register_table(TABLE, metadata.as_uri())
-    return catalog.create_table(TABLE, schema=SCHEMA, partition_spec=SPEC)
+        return catalog.register_table(kind.table, metadata.as_uri())
+    return catalog.create_table(kind.table, schema=kind.schema, partition_spec=SPEC)
 
 
-def hour_of(path):
-    """RAW/.../2026-10-22/11.jsonl -> 2026-10-22 11:00 UTC, or None."""
+def hour_of(path, suffix=".jsonl"):
+    """RAW/.../2026-10-22/11.jsonl -> 2026-10-22 11:00 UTC, or None. With
+    another suffix, 11.interfaces.jsonl say, files without it are None."""
+    if not path.name.endswith(suffix):
+        return None
     try:
         day = dt.date.fromisoformat(path.parent.name)
-        return dt.datetime(day.year, day.month, day.day, int(path.stem), tzinfo=dt.UTC)
+        hour = int(path.name.removesuffix(suffix))
+        return dt.datetime(day.year, day.month, day.day, hour, tzinfo=dt.UTC)
     except ValueError:
         return None
 
@@ -280,9 +331,9 @@ def first_host(path):
     return None
 
 
-def check_types(row):
-    """Raises TypeError unless row's fields fit ARROW_SCHEMA."""
-    for field in ARROW_SCHEMA:
+def check_types(row, schema=ARROW_SCHEMA):
+    """Raises TypeError unless row's fields fit schema."""
+    for field in schema:
         value = row[field.name]  # KeyError if missing
         if field.name == "ts" or pa.types.is_integer(field.type):
             bits = 32 if field.type == pa.int32() else 64
@@ -295,7 +346,7 @@ def check_types(row):
             raise TypeError(f"{field.name}: {value!r}")
 
 
-def read_rows(path):
+def read_rows(path, kind=TRAFFIC):
     """Parses a raw file, skipping lines cut off by a crash mid-write."""
     rows, bad = [], 0
     with open(path, errors="replace") as f:
@@ -305,9 +356,9 @@ def read_rows(path):
                 if not isinstance(row, dict):
                     raise TypeError(f"not an object: {row!r}")
                 row.setdefault("host", socket.gethostname())  # before -o had it
-                for name in COUNTERS:
-                    row.setdefault(name, 0)  # before NFS counters existed
-                check_types(row)
+                for name, value in kind.defaults.items():
+                    row.setdefault(name, value)
+                check_types(row, kind.arrow)
                 row["ts"] = dt.datetime.fromtimestamp(row["ts"], dt.UTC)
                 rows.append(row)
             except (ValueError, KeyError, TypeError, OverflowError, OSError):
@@ -317,11 +368,11 @@ def read_rows(path):
     return rows
 
 
-def raw_files(raw):
+def raw_files(raw, suffix=".jsonl"):
     """RAW's raw files, skipping folders starting with . # or @ (Synology's
     #recycle and @eaDir)."""
     raw = Path(raw)
-    for path in sorted(raw.rglob("*.jsonl")):
+    for path in sorted(raw.rglob(f"*{suffix}")):
         if not any(part[0] in ".#@" for part in path.relative_to(raw).parts[:-1]):
             yield path
 
@@ -377,14 +428,14 @@ def skipped(path, error, on_skip):
         on_skip(path)
 
 
-def load_day(table, paths, counts, on_skip=None):
+def load_day(table, paths, counts, on_skip=None, kind=TRAFFIC):
     """Loads one day's files, in one transaction. Returns rows added."""
     hours = {}  # (host, hour) -> {row's values: row}
     loaded = []
     for path, start in paths:
         # A file has one host unless the machine was renamed mid-hour.
         try:
-            rows = read_rows(path)
+            rows = read_rows(path, kind)
         except OSError as e:  # gone since the listing
             skipped(path, e, on_skip)
             continue
@@ -396,7 +447,7 @@ def load_day(table, paths, counts, on_skip=None):
         if len(rows) <= sum(counts.get(key, 0) for key in keys):
             continue  # the extra lines were malformed
         for row in rows:
-            values = tuple(row.get(name) for name in ARROW_SCHEMA.names)
+            values = tuple(row.get(name) for name in kind.arrow.names)
             hours.setdefault((row["host"], start), {})[values] = row
         loaded.append(path)
     # Two copies of an hour (a renamed Pi's old folder, a backup) share their
@@ -409,14 +460,21 @@ def load_day(table, paths, counts, on_skip=None):
             for host, start in replace:
                 tx.delete(hour_filter(host, start))
             rows = [row for hour in new.values() for row in hour.values()]
-            tx.append(pa.Table.from_pylist(rows, schema=ARROW_SCHEMA))
+            tx.append(pa.Table.from_pylist(rows, schema=kind.arrow))
     for path in loaded:
         print(f"loaded {path}")
     return sum(len(rows) for rows in new.values()) - sum(counts[k] for k in replace)
 
 
 def convert(
-    raw, warehouse, now=None, days=7, catalog_uri=None, on_commit=None, on_skip=None
+    raw,
+    warehouse,
+    now=None,
+    days=7,
+    catalog_uri=None,
+    on_commit=None,
+    on_skip=None,
+    kind=TRAFFIC,
 ):
     """Loads every finished hour the table lacks rows of. Returns rows added.
     Calls on_commit(table) after each commit, and on_skip(path) for each file
@@ -424,11 +482,11 @@ def convert(
     now = now or dt.datetime.now(dt.UTC)
     this_hour = now.replace(minute=0, second=0, microsecond=0)
     oldest = this_hour - dt.timedelta(days=days)
-    table = open_table(warehouse, catalog_uri)
+    table = open_table(warehouse, catalog_uri, kind)
     counts = hour_counts(table, oldest)
     by_day, too_old, newest = {}, {}, 0  # day -> [(path, hour)]; path -> ctime
-    for path in raw_files(raw):
-        start = hour_of(path)
+    for path in raw_files(raw, kind.suffix):
+        start = hour_of(path, kind.suffix)
         if start is None:
             continue  # not a raw file
         if not oldest <= start < this_hour:
@@ -462,7 +520,7 @@ def convert(
     added = 0
     for day in sorted(by_day):
         before = table.metadata_location
-        added += load_day(table, by_day[day], counts, on_skip)
+        added += load_day(table, by_day[day], counts, on_skip, kind)
         if on_commit and table.metadata_location != before:
             on_commit(table)
     return added
@@ -475,7 +533,7 @@ def day_filter(start):
     )
 
 
-def compact(table, before, on_commit=None):
+def compact(table, before, on_commit=None, kind=TRAFFIC):
     """Rewrites each day before `before` held in several files as one file."""
     files, rows = {}, {}
     for task in table.scan(row_filter=LessThan("ts", before.isoformat())).plan_files():
@@ -490,7 +548,7 @@ def compact(table, before, on_commit=None):
         rows = table.scan(row_filter=day_filter(start)).to_arrow()
         with table.transaction() as tx:
             tx.delete(day_filter(start))
-            tx.append(rows.cast(ARROW_SCHEMA))
+            tx.append(rows.cast(kind.arrow))
         if on_commit:
             on_commit(table)
     return len(days)
@@ -536,19 +594,21 @@ def delete_unreferenced(table, before):
     return deleted
 
 
-def maintain(warehouse, now=None, keep_days=28, catalog_uri=None, on_commit=None):
+def maintain(
+    warehouse, now=None, keep_days=28, catalog_uri=None, on_commit=None, kind=TRAFFIC
+):
     """Compacts, expires and cleans the table; returns what it did. Calls
     on_commit(table) after each commit."""
     now = now or dt.datetime.now(dt.UTC)
-    table = open_table(warehouse, catalog_uri)
+    table = open_table(warehouse, catalog_uri, kind)
     check_clock(table)
     today = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    days = compact(table, today, on_commit)
+    days = compact(table, today, on_commit, kind)
     snapshots = len(table.snapshots())
     table.maintenance.expire_snapshots().older_than(
         now - dt.timedelta(days=keep_days)
     ).commit()
-    table = open_table(warehouse, catalog_uri)
+    table = open_table(warehouse, catalog_uri, kind)
     if on_commit:
         on_commit(table)
     expired = snapshots - len(table.snapshots())
@@ -603,25 +663,47 @@ def main():
     except BlockingIOError:
         print("waiting for another run to finish", file=sys.stderr, flush=True)
         fcntl.flock(lock, fcntl.LOCK_EX)
-    recover(args.warehouse, args.catalog, args.marker)
-    table = open_table(args.warehouse, args.catalog)  # exits if it's stale
-    Path(args.marker).parent.mkdir(parents=True, exist_ok=True)
-    mark_run(args.marker, args.warehouse, table)
+    skips = []
+    for kind in KINDS:
+        run(args, kind, skips)
+    if skips:
+        # Loaded the rest, but fail the unit so that someone looks: once out
+        # of the window, a file is loaded only with a longer --days.
+        print(f"{len(skips)} raw file(s) skipped", file=sys.stderr)
+        sys.exit(SKIPPED_STATUS)
+
+
+def marker_for(marker, kind):
+    """Each table's run marker: --marker for netmon.traffic, as before there
+    were others, and NAME-interfaces.json beside it for netmon.interfaces."""
+    if kind is TRAFFIC:
+        return marker
+    path = Path(marker)
+    return str(path.with_name(f"{path.stem}-{kind.name}{path.suffix}"))
+
+
+def run(args, kind, skips):
+    """Loads or maintains one table, under the lock main() holds."""
+    marker = marker_for(args.marker, kind)
+    recover(args.warehouse, args.catalog, marker, kind)
+    table = open_table(args.warehouse, args.catalog, kind)  # exits if it's stale
+    Path(marker).parent.mkdir(parents=True, exist_ok=True)
+    mark_run(marker, args.warehouse, table)
 
     # The marker's start must stay in the table's metadata log, which keeps
     # 100 entries, for recover() to act, so move it on with every commit.
     def marked(table):
-        mark_run(args.marker, args.warehouse, table)
+        mark_run(marker, args.warehouse, table)
 
-    skips = []
     if args.maintain:
         done = maintain(
             args.warehouse,
             keep_days=args.keep_days,
             catalog_uri=args.catalog,
             on_commit=marked,
+            kind=kind,
         )
-        print(", ".join(f"{n} {what}" for what, n in done.items()))
+        print(f"{kind.table}: " + ", ".join(f"{n} {what}" for what, n in done.items()))
     else:
         n = convert(
             args.raw,
@@ -630,14 +712,10 @@ def main():
             catalog_uri=args.catalog,
             on_commit=marked,
             on_skip=skips.append,
+            kind=kind,
         )
-        print(f"added {n} rows to {TABLE}")
-    Path(args.marker).unlink()
-    if skips:
-        # Loaded the rest, but fail the unit so that someone looks: once out
-        # of the window, a file is loaded only with a longer --days.
-        print(f"{len(skips)} raw file(s) skipped", file=sys.stderr)
-        sys.exit(SKIPPED_STATUS)
+        print(f"added {n} rows to {kind.table}")
+    Path(marker).unlink()
 
 
 if __name__ == "__main__":
