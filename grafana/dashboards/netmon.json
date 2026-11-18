@@ -2,7 +2,7 @@
   "uid": "netmon-traffic",
   "title": "netmon traffic",
   "schemaVersion": 39,
-  "version": 2,
+  "version": 3,
   "editable": false,
   "time": {
     "from": "now-6h",
@@ -81,6 +81,90 @@
       ]
     },
     {
+      "id": 9,
+      "type": "heatmap",
+      "title": "Traffic netmon accounts for",
+      "description": "The bytes netmon charges to processes, as a share of what the host's interfaces moved less 66 bytes of headers a packet, per host and direction. Green: netmon accounts for it all. Red: traffic no process sent or received, such as ICMP, ARP, DHCP and TCP retransmissions. Over 100% shows as green: a VPN's bytes count inside and outside its tunnel.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "netmon-clickhouse"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {
+        "calculate": false,
+        "cellGap": 1,
+        "cellValues": {
+          "unit": "percentunit",
+          "decimals": 0
+        },
+        "color": {
+          "mode": "scheme",
+          "scheme": "RdYlGn",
+          "steps": 64,
+          "fill": "dark-orange",
+          "scale": "exponential",
+          "exponent": 0.5,
+          "reverse": true,
+          "min": 0.5,
+          "max": 1
+        },
+        "filterValues": {
+          "le": -1
+        },
+        "legend": {
+          "show": true
+        },
+        "rowsFrame": {
+          "layout": "auto"
+        },
+        "showValue": "never",
+        "tooltip": {
+          "mode": "single",
+          "yHistogram": false,
+          "showColorScale": true
+        },
+        "yAxis": {
+          "axisPlacement": "left",
+          "reverse": true
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "netmon-clickhouse"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "queryType": "timeseries",
+          "rawSql": "WITH\n  -- Whole 10 s reports per bucket, as in the rate panels.\n  intDiv($__interval_s + 9, 10) * 10 AS step,\n  -- Each packet's Ethernet, IP and TCP headers, which the interfaces count\n  -- and processes' sends and receives don't: 14 + 20 + 32 bytes for IPv4 TCP\n  -- with timestamps. A bare ACK is all headers.\n  66 AS headers,\n  processes AS (\n    SELECT toStartOfInterval(toDateTime(ts), toIntervalSecond(step)) AS time, host,\n      sum((tcp_rx + udp_rx) * scale) AS rx, sum((tcp_tx + udp_tx) * scale) AS tx\n    FROM netmon.traffic_live\n    WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)\n    GROUP BY time, host\n  ),\n  interfaces AS (\n    SELECT toStartOfInterval(toDateTime(ts), toIntervalSecond(step)) AS time, host,\n      greatest(sum(rx_bytes) - headers * sum(rx_packets), 0) AS rx,\n      greatest(sum(tx_bytes) - headers * sum(tx_packets), 0) AS tx\n    FROM netmon.interfaces_live\n    WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)\n      -- Bridges and veth pairs carry bytes that cross another interface too.\n      AND NOT match(interface, '^(veth|docker|br-|virbr)')\n    GROUP BY time, host\n  )\nSELECT time, concat(host, ' ', direction) AS row, accounted\nFROM (\n  SELECT i.time AS time, i.host AS host,\n    arrayJoin([('received', p.rx / nullIf(i.rx, 0)), ('sent', p.tx / nullIf(i.tx, 0))])\n      AS pair,\n    pair.1 AS direction, pair.2 AS accounted\n  FROM interfaces AS i LEFT JOIN processes AS p ON i.time = p.time AND i.host = p.host\n)\nORDER BY time, row"
+        }
+      ],
+      "interval": "10s",
+      "maxDataPoints": 100,
+      "transformations": [
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "^accounted (.*)$",
+            "renamePattern": "$1"
+          }
+        }
+      ]
+    },
+    {
       "id": 2,
       "type": "timeseries",
       "title": "Network by process (top 10)",
@@ -92,7 +176,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 4
+        "y": 11
       },
       "fieldConfig": {
         "defaults": {
@@ -148,7 +232,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 13
+        "y": 20
       },
       "fieldConfig": {
         "defaults": {
@@ -204,7 +288,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 13
+        "y": 20
       },
       "fieldConfig": {
         "defaults": {
@@ -260,7 +344,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 22
+        "y": 29
       },
       "fieldConfig": {
         "defaults": {
@@ -316,7 +400,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 22
+        "y": 29
       },
       "fieldConfig": {
         "defaults": {
@@ -372,7 +456,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 31
+        "y": 38
       },
       "fieldConfig": {
         "defaults": {
@@ -428,7 +512,7 @@
         "h": 10,
         "w": 24,
         "x": 0,
-        "y": 40
+        "y": 47
       },
       "fieldConfig": {
         "defaults": {

@@ -8,9 +8,9 @@
   uv run tests/dashboard_test.py stray DIR     # REST catalog only; again
 
 load writes four hours of known traffic from two hosts, ending in the
-last finished hour, to DIR/raw, converts the first three into
-DIR/warehouse, and then spoils one of them, which the live view must not
-open. The converter's own next run would load the fourth.
+last finished hour, with their interfaces' counters, to DIR/raw, converts
+the first three into DIR/warehouse, and then spoils one of them, which the
+live views must not open. The converter's own next run would load the fourth.
 check runs every panel of grafana/dashboards/netmon.json through
 clickhouse-client, as Grafana's user, with Grafana's macros filled in, and
 checks the totals, so the live view must add the last hour from the raw
@@ -38,7 +38,20 @@ ROOT = Path(__file__).resolve().parent.parent
 HOURS, ROWS = 4, 6  # per host, rows per hour
 COUNTERS = {"tcp_tx": 1, "tcp_rx": 2, "udp_tx": 3, "udp_rx": 4, "nfs_read": 5}
 COUNTERS["nfs_write"] = 6
+IFACE_COUNTERS = ("rx_bytes", "rx_packets", "tx_bytes", "tx_packets")
 SCALE = 2.0
+# Each report's interface rows: (interface, rx_bytes, rx_packets, tx_bytes,
+# tx_packets). Less the headers' 66 bytes a packet, pi-a's interfaces carry
+# the 12 bytes received and 8 sent of its processes' rows (with SCALE), and
+# pi-b's twice that. A veth pair's bytes, which also crossed a physical
+# interface, don't count.
+INTERFACES = {
+    "pi-a": [("eth0", 66 * 3 + 12, 3, 66 * 2 + 8, 2), ("lo", 66, 1, 66, 1)],
+    "pi-b": [("eth0", 66 * 3 + 24, 3, 66 * 2 + 16, 2), ("lo", 66, 1, 66, 1)],
+}
+for counts in INTERFACES.values():
+    counts.append(("veth1a2b3c", 10_000, 9, 10_000, 9))
+COVERAGE = {"pi-a": 1.0, "pi-b": 0.5}
 START = None  # the first hour; load picks it, the others read it from DIR
 CATALOG = os.environ.get("NETMON_TEST_CATALOG")
 
@@ -49,12 +62,14 @@ def convert(test_dir, hours):
 
     now = START + dt.timedelta(hours=hours)
     warehouse = test_dir / "warehouse"
-    n = to_iceberg.convert(
-        test_dir / "raw", warehouse, now, days=2, catalog_uri=CATALOG
-    )
-    print(f"loaded {n} rows")
-    rows = len(to_iceberg.open_table(warehouse, CATALOG).scan().to_arrow())
-    (test_dir / "iceberg_rows").write_text(str(rows))
+    for kind in to_iceberg.KINDS:
+        n = to_iceberg.convert(
+            test_dir / "raw", warehouse, now, days=2, catalog_uri=CATALOG, kind=kind
+        )
+        print(f"loaded {n} rows to {kind.table}")
+        table = to_iceberg.open_table(warehouse, CATALOG, kind)
+        rows = len(table.scan().to_arrow())
+        (test_dir / f"iceberg_rows.{kind.name}").write_text(str(rows))
 
 
 def maintain(test_dir):
@@ -62,7 +77,11 @@ def maintain(test_dir):
     import to_iceberg
 
     month = dt.datetime.now(dt.UTC) + dt.timedelta(days=30)
-    print(to_iceberg.maintain(test_dir / "warehouse", month, catalog_uri=CATALOG))
+    for kind in to_iceberg.KINDS:
+        done = to_iceberg.maintain(
+            test_dir / "warehouse", month, catalog_uri=CATALOG, kind=kind
+        )
+        print(kind.table, done)
 
 
 def load(test_dir):
@@ -71,10 +90,11 @@ def load(test_dir):
         import to_iceberg
         from pyiceberg.exceptions import NoSuchTableError
 
-        try:
-            to_iceberg.open_catalog(test_dir, CATALOG).drop_table(to_iceberg.TABLE)
-        except NoSuchTableError:
-            pass
+        for kind in to_iceberg.KINDS:
+            try:
+                to_iceberg.open_catalog(test_dir, CATALOG).drop_table(kind.table)
+            except NoSuchTableError:
+                pass
     this_hour = dt.datetime.now(dt.UTC).replace(minute=0, second=0, microsecond=0)
     start = this_hour - dt.timedelta(hours=HOURS)
     test_dir.mkdir(parents=True, exist_ok=True)
@@ -90,6 +110,13 @@ def load(test_dir):
                     row |= {"interval_s": 10, "pid": 100 + i % 2, "uid": i % 2}
                     row |= {"comm": f"proc{i % 2}", "scale": SCALE}
                     f.write(json.dumps(row | COUNTERS) + "\n")
+            with open(path.with_name(f"{hour:%H}.interfaces.jsonl"), "w") as f:
+                for i in range(ROWS):
+                    for name, *counts in INTERFACES[host]:
+                        row = {"ts": int(hour.timestamp()) + 600 * i, "host": host}
+                        row |= {"interval_s": 10, "interface": name}
+                        row |= dict(zip(IFACE_COUNTERS, counts, strict=True))
+                        f.write(json.dumps(row) + "\n")
     # Copies of pi-a's last hour, still only in raw files: a backup, which
     # must count once, and folders to skip, each with a row of its own.
     path = test_dir / "raw" / "pi-a" / f"{hour:%Y-%m-%d}" / f"{hour:%H}.jsonl"
@@ -109,9 +136,10 @@ def load(test_dir):
 def spoil_converted(test_dir):
     """Appends garbage to an hour already in Iceberg. The live view must skip
     that file without opening it: over 100 bad lines would fail its query."""
-    path = test_dir / "raw" / "pi-a" / f"{START:%Y-%m-%d}" / f"{START:%H}.jsonl"
-    with open(path, "a") as f:
-        f.write("not json\n" * 200)
+    for name in (f"{START:%H}.jsonl", f"{START:%H}.interfaces.jsonl"):
+        path = test_dir / "raw" / "pi-a" / f"{START:%Y-%m-%d}" / name
+        with open(path, "a") as f:
+            f.write("not json\n" * 200)
 
 
 def stray(test_dir):
@@ -171,10 +199,15 @@ def check(test_dir):
         check_eq(
             "read through the REST catalog", "netmon_lake" in query(sql)[0]["q"], True
         )
-    want = int((test_dir / "iceberg_rows").read_text())
+    want = int((test_dir / "iceberg_rows.traffic").read_text())
     check_eq("Iceberg rows, as the converter left them", int(iceberg), want)
     live = query("SELECT count() AS n FROM netmon.traffic_live")[0]["n"]
     check_eq("live rows", int(live), HOURS * ROWS * 2)
+    iceberg = query("SELECT count() AS n FROM netmon.interfaces")[0]["n"]
+    want = int((test_dir / "iceberg_rows.interfaces").read_text())
+    check_eq("Iceberg interface rows, as the converter left them", int(iceberg), want)
+    live = query("SELECT count() AS n FROM netmon.interfaces_live")[0]["n"]
+    check_eq("live interface rows", int(live), HOURS * ROWS * 2 * 3)
     hosts = [r["host"] for r in query(dash["templating"]["list"][0]["query"])]
     check_eq("host variable", hosts, ["pi-a", "pi-b"])
     for panel in dash["panels"]:
@@ -199,6 +232,17 @@ def check(test_dir):
             )
             check_eq(f"{title}: bytes", round(total), want)
             check_eq(f"{title}: buckets", len({r["time"] for r in rows}), HOURS)
+        elif panel["type"] == "heatmap":
+            check_eq(f"{title}: format", panel["targets"][0]["format"], 0)
+            got = {(r["time"], r["row"]): r["accounted"] for r in rows}
+            want = {
+                (time, f"{host} {direction}"): COVERAGE[host]
+                for time in {r["time"] for r in rows}
+                for host in INTERFACES
+                for direction in ("received", "sent")
+            }
+            check_eq(f"{title}: cells", got, want)
+            check_eq(f"{title}: buckets", len({r["time"] for r in rows}), HOURS)
         elif title == "Totals in range":
             got = {k: round(float(v)) for k, v in rows[0].items()}
             check_eq(title, got["TCP received"], 2 * 2 * per_host)
@@ -221,12 +265,14 @@ def check_locked_down():
         ("INSERT INTO FUNCTION file('grafana.txt', 'LineAsString') SELECT 'x'", denied),
         ("SELECT * FROM url('http://127.0.0.1:8123/', 'LineAsString')", denied),
         ("DROP VIEW netmon.traffic_live", denied),
+        ("DROP VIEW netmon.interfaces_live", denied),
         ("SELECT 1 SETTINGS max_memory_usage = 0", limited),
         ("SELECT 1 SETTINGS max_execution_time = 0", limited),
         ("SELECT 1 SETTINGS max_execution_time = 600", limited),
     ]
     if CATALOG:
         probes.append(("SELECT count() FROM netmon_lake.`netmon.traffic`", denied))
+        probes.append(("SELECT count() FROM netmon_lake.`netmon.interfaces`", denied))
     for sql, error in probes:
         out = subprocess.run(
             ["clickhouse-client", "--user", "grafana", "-q", sql],

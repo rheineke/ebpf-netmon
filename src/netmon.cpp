@@ -19,11 +19,13 @@
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <optional>
 #include <random>
 #include <string>
 #include <vector>
 
 #include "capture.h"
+#include "interfaces.h"
 #include "netmon.h"
 #include "netmon.skel.h"
 #include "priority_sample.h"
@@ -59,7 +61,8 @@ void usage(const char *prog)
 		"  -k  priority-sample this many rows per report, with\n"
 		"      unbiased estimates (see README); overrides -n\n"
 		"  -j  JSON lines instead of a table\n"
-		"  -o  append JSON lines to dir/YYYY-MM-DD/HH.jsonl (UTC)\n"
+		"  -o  append JSON lines to dir/YYYY-MM-DD/HH.jsonl (UTC), and\n"
+		"      the interfaces' counters to HH.interfaces.jsonl\n"
 		"  -w  at start, hold reports until the clock is synchronized,\n"
 		"      for at most this long; the counts keep adding up\n",
 		prog);
@@ -228,6 +231,69 @@ bool print_json(std::FILE *out, std::time_t ts, const std::string &host,
 	}
 	return std::fflush(out) == 0 && !std::ferror(out);
 }
+
+// The host's interfaces: pid 1's network namespace, as the service has a
+// private one of its own (PrivateNetwork=), with only a loopback in it.
+constexpr const char *kNetDev = "/proc/1/net/dev";
+
+// With -o, each report's interface counters, in dir/YYYY-MM-DD/
+// HH.interfaces.jsonl: what each interface moved since the last report, or
+// since netmon started for the first, as the processes' rows count.
+class InterfaceLog {
+public:
+	explicit InterfaceLog(const std::string &dir)
+	    : files_(dir, ".interfaces.jsonl")
+	{
+		started_ = read(prev_);
+	}
+
+	// Returns false if the write failed.
+	bool write(std::time_t ts, const std::string &host, int interval_s)
+	{
+		IfaceTotals cur;
+		if (!read(cur))
+			return true;  // the next read counts these bytes too
+		if (!started_) {  // counts from here, not from boot
+			prev_ = std::move(cur);
+			started_ = true;
+			return true;
+		}
+		auto rows = interface_deltas(cur, prev_);
+		if (rows.empty())
+			return true;
+		std::FILE *out = files_.at(ts);
+		if (!out)
+			return false;
+		for (const IfaceRow &row : rows)
+			std::fputs(interface_json(ts, host, interval_s, row)
+					   .c_str(),
+				   out);
+		return std::fflush(out) == 0 && !std::ferror(out);
+	}
+
+private:
+	// Says so the first time it can't read the counters.
+	bool read(IfaceTotals &totals)
+	{
+		if (std::ifstream in(kNetDev); in) {
+			totals = parse_net_dev(in);
+			if (!totals.empty())
+				return true;
+		}
+		if (!warned_)
+			std::fprintf(stderr,
+				     "netmon: can't read %s; not recording "
+				     "interface counters\n",
+				     kNetDev);
+		warned_ = true;
+		return false;
+	}
+
+	HourlyFiles files_;
+	IfaceTotals prev_;
+	bool started_ = false;
+	bool warned_ = false;
+};
 
 std::string host_name()
 {
@@ -451,6 +517,9 @@ int run(netmon_bpf *skel, const Options &opts)
 	if (!opts.json)
 		sleep_to_boundary(opts.interval_s);
 	collect_map(map_fd, prev, use_proc);
+	std::optional<InterfaceLog> interfaces;
+	if (!opts.out_dir.empty())
+		interfaces.emplace(opts.out_dir);
 	std::mt19937_64 rng(std::random_device{}());
 	const std::string host = host_name();
 	HourlyFiles files(opts.out_dir);
@@ -493,7 +562,8 @@ int run(netmon_bpf *skel, const Options &opts)
 		std::time_t ts = g_stop ? std::time(nullptr) : due;
 		std::FILE *out = opts.out_dir.empty() ? stdout : files.at(ts);
 		if (!out ||
-		    !print_json(out, ts, host, rows, opts, interval_s)) {
+		    !print_json(out, ts, host, rows, opts, interval_s) ||
+		    (interfaces && !interfaces->write(ts, host, interval_s))) {
 			std::fprintf(stderr, "netmon: write failed\n");
 			return 1;
 		}
