@@ -228,7 +228,8 @@ It installs `netmon` and a systemd service that reports every 10 seconds
 to `/var/lib/netmon/raw`. The raw files are kept as written; converting
 them to Parquet is a separate step. Nothing deletes old files yet. An idle
 Pi writes about 650 rows (120 KB) an hour, or 3 MB a day; busier Pis write
-more.
+more. The interface files add 360 rows (50 KB) an hour for each interface
+in use, such as `eth0` and `lo`.
 
 The service runs as root, but with only `CAP_BPF` and `CAP_PERFMON`, no
 network, and a read-only view of the system apart from its own folder
