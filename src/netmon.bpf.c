@@ -165,7 +165,7 @@ struct nfs_reader {
 	__u32 tgid;
 	__u32 uid;
 	char comm[NETMON_COMM_LEN];
-	__u32 pending; /* READs of these bytes in flight */
+	__u32 pending; /* READs of these bytes in flight; 0 once answered */
 	__u32 pad;
 };
 
@@ -174,8 +174,11 @@ struct nfs_reader {
  * rsize bytes, before the first reply. 16384 covers 2 GiB in flight at a
  * time with the usual 128 KiB rsize; past that, the LRU evicts the oldest,
  * whose replies are then counted in nfs_unmatched, as are those of a READ
- * started before netmon attached. LRU also ages out a READ whose reply
- * never came (a mount forced off).
+ * started before netmon attached, or whose start the kernel skipped.
+ * Answered entries stay, with pending 0, until the LRU reuses them: a reply
+ * can't delete its entry without racing another READ of the same bytes
+ * starting on another CPU. LRU also ages out a READ whose reply never came
+ * (a mount forced off).
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -231,6 +234,21 @@ int nfs_initiate_read(const struct netmon_nfs_initiate_read *r)
 	return 0;
 }
 
+/* Counts a reply no recorded READ is waiting for. */
+static __always_inline int unmatched(__u32 bytes)
+{
+	__u32 zero = 0;
+	struct netmon_nfs_unmatched *u =
+		bpf_map_lookup_elem(&nfs_unmatched, &zero);
+	/* Plain adds: the kernel runs one tracing program at a time per CPU,
+	 * with preemption off. */
+	if (u && bytes) {
+		u->replies++;
+		u->bytes += bytes;
+	}
+	return 0;
+}
+
 SEC("tracepoint/nfs/nfs_readpage_done")
 int nfs_readpage_done(const struct netmon_nfs_readpage_done *r)
 {
@@ -240,21 +258,15 @@ int nfs_readpage_done(const struct netmon_nfs_readpage_done *r)
 	key.dev = r->dev;
 	key.fhandle = r->fhandle;
 	struct nfs_reader *found = bpf_map_lookup_elem(&nfs_reads, &key);
-	if (!found) {
-		__u32 zero = 0;
-		struct netmon_nfs_unmatched *u =
-			bpf_map_lookup_elem(&nfs_unmatched, &zero);
-		if (u && r->res_count) {
-			/* Atomic even per CPU: the kernel may preempt. */
-			__sync_fetch_and_add(&u->replies, 1);
-			__sync_fetch_and_add(&u->bytes, r->res_count);
-		}
-		return 0;
-	}
+	if (!found)
+		return unmatched(r->res_count);
 	struct nfs_reader reader = *found;
-	__sync_fetch_and_add(&found->pending, (__u32)-1);
-	if (reader.pending <= 1)
-		bpf_map_delete_elem(&nfs_reads, &key);
+	/* Increments and decrements commute, so an entry revived meanwhile
+	 * by another READ's start keeps its count. */
+	if (__sync_fetch_and_add(&found->pending, (__u32)-1) == 0) {
+		__sync_fetch_and_add(&found->pending, 1); /* none in flight */
+		return unmatched(r->res_count);
+	}
 	if (r->res_count)
 		add_bytes(reader.tgid, reader.uid, reader.comm,
 			  NETMON_NFS_FETCHED, r->res_count, 0);

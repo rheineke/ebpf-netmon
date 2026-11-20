@@ -21,11 +21,13 @@ inline const std::vector<TracepointField> kSockMsgLength = {
 // The fields of the NFS tracepoints that netmon.bpf.c reads.
 inline const std::vector<TracepointField> kNfsInitiateRead = {
 	{"dev", offsetof(netmon_nfs_initiate_read, dev), 4},
+	{"fhandle", offsetof(netmon_nfs_initiate_read, fhandle), 4},
 	{"fileid", offsetof(netmon_nfs_initiate_read, fileid), 8},
 	{"offset", offsetof(netmon_nfs_initiate_read, offset), 8},
 };
 inline const std::vector<TracepointField> kNfsReadpageDone = {
 	{"dev", offsetof(netmon_nfs_readpage_done, dev), 4},
+	{"fhandle", offsetof(netmon_nfs_readpage_done, fhandle), 4},
 	{"fileid", offsetof(netmon_nfs_readpage_done, fileid), 8},
 	{"offset", offsetof(netmon_nfs_readpage_done, offset), 8},
 	{"arg_count", offsetof(netmon_nfs_readpage_done, arg_count), 4},

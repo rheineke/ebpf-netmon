@@ -483,8 +483,10 @@ public:
 	// started before the tracepoints attached find none either.
 	void report_unmatched()
 	{
-		std::vector<netmon_nfs_unmatched> cpus(
-			std::max(libbpf_num_possible_cpus(), 1));
+		int ncpus = libbpf_num_possible_cpus();
+		if (ncpus < 1)  // the kernel writes a value for each
+			return;
+		std::vector<netmon_nfs_unmatched> cpus(ncpus);
 		unsigned int zero = 0;
 		if (bpf_map_lookup_elem(unmatched_fd_, &zero, cpus.data()) != 0)
 			return;
@@ -498,9 +500,10 @@ public:
 		else if (sum.replies > unmatched_.replies)
 			std::fprintf(stderr,
 				     "netmon: %llu NFS READ replies (%llu "
-				     "bytes) found no recorded reader, too "
-				     "many READs in flight at once; their "
-				     "bytes are not counted as nfs_fetched\n",
+				     "bytes) found no recorded reader (over "
+				     "16384 READs in flight, or a start that "
+				     "was skipped); their bytes are not "
+				     "counted as nfs_fetched\n",
 				     sum.replies - unmatched_.replies,
 				     sum.bytes - unmatched_.bytes);
 		unmatched_ = sum;
@@ -508,9 +511,9 @@ public:
 
 	// Logs calls each probe lost since the last check. The kernel tracks
 	// only so many callers inside a kretprobe's function at once (10 on a
-	// 4-core Pi), and skips a BPF program that fires while another runs on
-	// the same CPU (from an interrupt, say). The bytes of either go
-	// uncounted.
+	// 4-core Pi), and skips every tracing program that fires on a CPU while
+	// a task there is in a BPF map system call, such as netmon's own reads
+	// of its maps. The bytes of either go uncounted.
 	void report_missed()
 	{
 		for (Probe &p : probes_) {
@@ -525,9 +528,9 @@ public:
 					std::fprintf(
 						stderr,
 						"netmon: %s skipped %llu calls "
-						"while another BPF program ran "
-						"on its CPU; their bytes are not "
-						"counted\n",
+						"made during a BPF map system "
+						"call on their CPU; their bytes "
+						"are not counted\n",
 						name,
 						static_cast<unsigned long long>(
 							prog.recursion_misses -
@@ -576,6 +579,9 @@ private:
 					 q.layout.group != p.layout.group))
 				continue;
 			q.refused = true;
+			if (q.link)
+				std::fprintf(stderr, "netmon: detached %s\n",
+					     bpf_program__section_name(q.prog));
 			bpf_link__destroy(q.link);
 			q.link = nullptr;
 		}

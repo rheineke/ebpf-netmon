@@ -17,7 +17,9 @@ $(BUILD):
 	mkdir -p $@
 
 $(BUILD)/netmon.bpf.o: src/netmon.bpf.c src/netmon.h | $(BUILD)
-	$(CLANG) -g -O2 -Wall -Werror -target bpf -D__TARGET_ARCH_$(ARCH) \
+	# v3 for atomics that return the old value (kernel 5.12+).
+	$(CLANG) -g -O2 -Wall -Werror -target bpf -mcpu=v3 \
+		-D__TARGET_ARCH_$(ARCH) \
 		-I/usr/include/$(MULTIARCH) -c $< -o $@
 
 $(BUILD)/netmon.skel.h: $(BUILD)/netmon.bpf.o

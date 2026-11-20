@@ -62,6 +62,19 @@ void test_nfs_layouts()
 	check(problems(kReadpageDone, kNfsReadpageDone).empty(),
 	      "nfs_readpage_done matches the struct netmon.bpf.c reads");
 
+	// fhandle is part of the key netmon.bpf.c builds from both records.
+	for (const char *fields : {kInitiateRead, kReadpageDone}) {
+		std::string moved(fields);
+		moved.replace(moved.find("offset:12"), 9, "offset:44");
+		const auto &expected = fields == kInitiateRead
+					       ? kNfsInitiateRead
+					       : kNfsReadpageDone;
+		check(problems(moved.c_str(), expected)
+				      .find("fhandle at offset 44") !=
+			      std::string::npos,
+		      "a moved fhandle is reported");
+	}
+
 	// An older kernel's nfs_readpage_done, with one count for both.
 	std::string old(kReadpageDone);
 	old.replace(old.find("arg_count"), 9, "count");

@@ -421,6 +421,16 @@ def check_new_column():
             table = to_iceberg.open_table(warehouse, uri)
             return [f.name for f in table.schema().fields]
 
+        # add_columns reports its commit, for the run marker. On a copy of
+        # the old table, so maintenance below still finds the column missing.
+        copy = catalog.create_table(
+            "netmon.traffic_copy", schema=old, partition_spec=to_iceberg.SPEC
+        )
+        commits = []
+        to_iceberg.add_columns(copy, on_commit=commits.append)
+        check("the new column's commit is reported", commits, [copy])
+        catalog.drop_table("netmon.traffic_copy")
+
         behind = table.metadata.last_updated_ms / 1000 - 120
         with mock.patch("time.time", return_value=behind):
             refused = refuses(to_iceberg.add_columns, table)
