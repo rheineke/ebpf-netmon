@@ -72,7 +72,9 @@ void test_nfs_layouts()
 		check(problems(moved.c_str(), expected)
 				      .find("fhandle at offset 44") !=
 			      std::string::npos,
-		      "a moved fhandle is reported");
+		      fields == kInitiateRead
+			      ? "a moved fhandle is reported (initiate_read)"
+			      : "a moved fhandle is reported (readpage_done)");
 	}
 
 	// An older kernel's nfs_readpage_done, with one count for both.

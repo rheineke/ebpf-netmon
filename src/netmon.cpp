@@ -373,7 +373,8 @@ bool is_tracepoint(bpf_program *prog)
 class Probes {
 public:
 	explicit Probes(netmon_bpf *skel)
-	    : unmatched_fd_(bpf_map__fd(skel->maps.nfs_unmatched))
+	    : unmatched_fd_(bpf_map__fd(skel->maps.nfs_unmatched)),
+	      nfs_reads_max_(bpf_map__max_entries(skel->maps.nfs_reads))
 	{
 		bpf_program *prog;
 		bpf_object__for_each_program(prog, skel->obj)
@@ -501,19 +502,21 @@ public:
 			std::fprintf(stderr,
 				     "netmon: %llu NFS READ replies (%llu "
 				     "bytes) found no recorded reader (over "
-				     "16384 READs in flight, or a start that "
-				     "was skipped); their bytes are not "
+				     "%u READs in flight, a start that was "
+				     "skipped, or identical READs "
+				     "overlapping); their bytes are not "
 				     "counted as nfs_fetched\n",
 				     sum.replies - unmatched_.replies,
-				     sum.bytes - unmatched_.bytes);
+				     sum.bytes - unmatched_.bytes,
+				     nfs_reads_max_);
 		unmatched_ = sum;
 	}
 
 	// Logs calls each probe lost since the last check. The kernel tracks
 	// only so many callers inside a kretprobe's function at once (10 on a
-	// 4-core Pi), and skips every tracing program that fires on a CPU while
-	// a task there is in a BPF map system call, such as netmon's own reads
-	// of its maps. The bytes of either go uncounted.
+	// 4-core Pi), and skips every kprobe and tracepoint program that fires
+	// on a CPU while a task there is in a BPF map system call, such as
+	// netmon's own reads of its maps. The bytes of either go uncounted.
 	void report_missed()
 	{
 		for (Probe &p : probes_) {
@@ -592,6 +595,7 @@ private:
 
 	std::vector<Probe> probes_;
 	int unmatched_fd_;
+	unsigned int nfs_reads_max_;
 	netmon_nfs_unmatched unmatched_{};
 	int quiet_reports_ = 0;  // reports before logging unmatched replies
 };

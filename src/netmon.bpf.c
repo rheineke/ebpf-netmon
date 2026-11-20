@@ -165,7 +165,7 @@ struct nfs_reader {
 	__u32 tgid;
 	__u32 uid;
 	char comm[NETMON_COMM_LEN];
-	__u32 pending; /* READs of these bytes in flight; 0 once answered */
+	__u32 pending; /* READs of these bytes in flight */
 	__u32 pad;
 };
 
@@ -174,11 +174,11 @@ struct nfs_reader {
  * rsize bytes, before the first reply. 16384 covers 2 GiB in flight at a
  * time with the usual 128 KiB rsize; past that, the LRU evicts the oldest,
  * whose replies are then counted in nfs_unmatched, as are those of a READ
- * started before netmon attached, or whose start the kernel skipped.
- * Answered entries stay, with pending 0, until the LRU reuses them: a reply
- * can't delete its entry without racing another READ of the same bytes
- * starting on another CPU. LRU also ages out a READ whose reply never came
- * (a mount forced off).
+ * started before netmon attached, or whose start the kernel skipped. The
+ * last reply deletes its entry: answered entries left in place would fill
+ * the map, and the LRU, which keeps what was looked up last, would then
+ * evict READs still in flight first. LRU also ages out a READ whose reply
+ * never came (a mount forced off).
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -261,12 +261,22 @@ int nfs_readpage_done(const struct netmon_nfs_readpage_done *r)
 	if (!found)
 		return unmatched(r->res_count);
 	struct nfs_reader reader = *found;
-	/* Increments and decrements commute, so an entry revived meanwhile
-	 * by another READ's start keeps its count. */
-	if (__sync_fetch_and_add(&found->pending, (__u32)-1) == 0) {
-		__sync_fetch_and_add(&found->pending, 1); /* none in flight */
+	__u32 old = __sync_fetch_and_add(&found->pending, (__u32)-1);
+	/* None in flight: undo, and say so. Another reply here meanwhile sees
+	 * the count wrap, and is charged; totals still match. */
+	if (old == 0) {
+		__sync_fetch_and_add(&found->pending, 1);
 		return unmatched(r->res_count);
 	}
+	/*
+	 * The delete is by key, so it can't wait for the count: a READ of the
+	 * same bytes started on another CPU just now loses its entry, and its
+	 * reply is counted in nfs_unmatched. Overlapping identical READs are
+	 * rare (O_DIRECT from several threads at once), and buffered reads
+	 * share the page cache instead.
+	 */
+	if (old == 1)
+		bpf_map_delete_elem(&nfs_reads, &key);
 	if (r->res_count)
 		add_bytes(reader.tgid, reader.uid, reader.comm,
 			  NETMON_NFS_FETCHED, r->res_count, 0);

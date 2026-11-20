@@ -70,22 +70,21 @@ counted again each time it slept, peeks counted twice, and so did an IPv6
 socket sending to an IPv4 address, which goes through both `udpv6_sendmsg`
 and `udp_sendmsg`. The smoke test checks each of these exactly.
 
-A kretprobe can track only so many calls in progress at once: 10 on a
-4-core Pi, across all processes. Each thread blocked inside the function
-holds one, so with ten NFS reads waiting on a slow NAS, the next one's bytes
-go uncounted. netmon reads the kernel's count of these and logs
-`netmon: kretprobe/nfs_file_read missed N calls`. The kernel also skips
-every tracing program that fires on a CPU while a task there is in a BPF
+A kretprobe can track only so many calls in progress at once: 10 on a 4-core
+Pi, across all processes. Each thread blocked inside the function holds one,
+so with ten NFS reads waiting on a slow NAS, the next one's bytes go
+uncounted. netmon reads the kernel's count of these and logs `netmon:
+kretprobe/nfs_file_read missed N calls`. The kernel also skips every kprobe
+and tracepoint program that fires on a CPU while a task there is in a BPF
 map system call, netmon's own reads of its maps included; netmon logs those
 too (`skipped N calls`). On a Pi 4 that's about a hundred calls a day, out
 of millions, but a program hammering BPF maps can make it thousands a
-second. Probes that can't
-attach, such as NFS before the `nfs` module loads at the first mount, are
-retried every minute. An NFS tracepoint whose layout differs from the one
-netmon was built for isn't attached, nor its partner, and netmon says so;
-the rest still count. While netmon runs, its NFS tracepoints hold the `nfs`
-module, so `modprobe -r nfs` fails until it stops (where NFS is built into
-the kernel, as on a Pi, this doesn't arise).
+second. Probes that can't attach, such as NFS before the `nfs` module loads
+at the first mount, are retried every minute. An NFS tracepoint whose layout
+differs from the one netmon was built for isn't attached, nor its partner,
+and netmon says so; the rest still count. While netmon runs, its NFS
+tracepoints hold the `nfs` module, so `modprobe -r nfs` fails until it stops
+(where NFS is built into the kernel, as on a Pi, this doesn't arise).
 
 ## Priority sampling
 
@@ -207,8 +206,9 @@ Retries keep the reader: the client resends a short read, or a call the
 server asked to repeat, without starting a new one. Only a pNFS read resent
 through the metadata server after a layout error is charged to the kernel
 thread that resends it. Concurrent `READ`s of the same bytes (threads or
-io_uring with `O_DIRECT`) are all counted, and charged to the last process
-to start one.
+io_uring with `O_DIRECT`) are counted, and charged to the last process to
+start one; rarely, when one starts on another CPU just as the last reply
+before it lands, its own reply is lost, and logged as below.
 
 netmon tracks 16384 `READ`s in flight at once. A single `O_DIRECT` or
 io_uring call can start one per `rsize` bytes (128 KiB on most mounts)
