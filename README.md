@@ -22,11 +22,12 @@ serves to Grafana's dashboard and alerts.
 ## netmon
 
 `netmon` prints the TCP and UDP bytes each process sent and received in the
-last interval, and the NFS file bytes it read and wrote, like `top`:
+last interval, the NFS file bytes it read and wrote, and those the NFS server
+sent for its reads, like `top`:
 
 ```
-     PID    UID COMM                TCP_TX    TCP_RX    UDP_TX    UDP_RX    NFS_RD    NFS_WR
-     850    999 Plex Media Serv         0B        0B      687B      1.1K     12.0M        0B
+     PID    UID COMM                TCP_TX    TCP_RX    UDP_TX    UDP_RX    NFS_RD    NFS_WR NFS_FETCH
+     850    999 Plex Media Serv         0B        0B      687B      1.1K     12.0M        0B      4.0M
 ```
 
 Options: `-i` interval in seconds (default 2), `-c` number of reports,
@@ -45,7 +46,8 @@ the clock is synchronized.
   MPTCP counts as TCP. `splice()` from a TCP socket skips them, so a
   kretprobe on `tcp_splice_read` counts it.
 - **NFS**: kretprobes on `nfs_file_read`, `nfs_file_splice_read` and
-  `nfs_file_write` (see NFS traffic below).
+  `nfs_file_write`, and the `nfs:nfs_initiate_read` and
+  `nfs:nfs_readpage_done` tracepoints (see NFS traffic below).
 
 It reads only the tracepoints' records and the functions' return values,
 never kernel structs. So it needs no CO-RE and no kernel BTF, which Raspberry
@@ -74,7 +76,9 @@ holds one, so with ten NFS reads waiting on a slow NAS, the next one's bytes
 go uncounted. netmon reads the kernel's count of these and logs
 `netmon: kretprobe/nfs_file_read missed N calls`. Probes that can't attach,
 such as NFS before the `nfs` module loads at the first mount, are retried
-every minute.
+every minute. Tracepoints have no such limit. An NFS tracepoint whose
+layout differs from the one netmon was built for isn't attached, and
+netmon says so; the rest still count.
 
 ## Priority sampling
 
@@ -178,6 +182,22 @@ to the process that read or wrote them, through `read()`,
 reads served from the page cache count too, and memory-mapped access does
 not.
 
+`NFS_FETCH` (`nfs_fetched` in files) is the file bytes the server sent for
+a process's reads: page-cache misses, readahead, memory-mapped and
+`O_DIRECT` reads, but not reads the page cache served. It is what the
+kernel counts as the mounts' server read bytes (the fifth number on the
+`bytes:` lines of `/proc/self/mountstats`), split by process: on a Pi 4 the
+sum matched it to the byte. Their RPC and TCP headers aren't in it; the
+replies, headers and all, are the `xprtiod` threads' `tcp_rx`. The client starts
+each `READ` call in the process that needs the pages
+(`nfs:nfs_initiate_read`), and the reply completes in a kernel thread
+(`nfs:nfs_readpage_done`), so netmon records which process asked under the
+file and offset both name, and charges it with the reply's bytes. A read
+the client retries from a kernel thread after an error is charged to that
+thread. Two processes reading the same bytes of a file with `O_DIRECT` at
+the same moment are charged as one, the later. Writes have no counterpart:
+the kernel's writeback, not the writer, sends most of them.
+
 To check it on a machine with an NFS mount (the directory is optional and
 must be writable):
 
@@ -199,7 +219,7 @@ that wide holds whole reports. The dashboard's rate panels assume the
 service's `-i 10`:
 
 ```json
-{"ts":1792666260,"host":"raspberrypi","interval_s":10,"pid":4309,"uid":0,"comm":"nfsd","tcp_tx":84,"tcp_rx":120,"udp_tx":0,"udp_rx":0,"nfs_read":0,"nfs_write":0,"scale":1}
+{"ts":1792666260,"host":"raspberrypi","interval_s":10,"pid":4309,"uid":0,"comm":"nfsd","tcp_tx":84,"tcp_rx":120,"udp_tx":0,"udp_rx":0,"nfs_read":0,"nfs_write":0,"nfs_fetched":0,"scale":1}
 ```
 
 Each report also appends what every network interface moved in its
@@ -419,8 +439,9 @@ scripts/install_grafana.sh
 ```
 
 Install the converter first: ClickHouse's views need its tables, and an
-upgrade that adds a table needs its next run (`install_converter.sh` runs
-it at once).
+upgrade that adds a table or a column (`nfs_fetched`) needs its next run
+(`install_converter.sh` runs it at once). Rows from a netmon without a
+counter are null there.
 
 ClickHouse listens on 127.0.0.1 only. It has two views of each table, the
 processes' rows (`traffic`) and the interfaces' (`interfaces`):

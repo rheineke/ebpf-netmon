@@ -38,6 +38,8 @@ ROOT = Path(__file__).resolve().parent.parent
 HOURS, ROWS = 4, 6  # per host, rows per hour
 COUNTERS = {"tcp_tx": 1, "tcp_rx": 2, "udp_tx": 3, "udp_rx": 4, "nfs_read": 5}
 COUNTERS["nfs_write"] = 6
+COUNTERS["nfs_fetched"] = 7  # but in OLD_HOUR
+OLD_HOUR = ("pi-b", 0)  # written by a netmon before nfs_fetched
 IFACE_COUNTERS = ("rx_bytes", "rx_packets", "tx_bytes", "tx_packets")
 SCALE = 2.0
 # Each report's interface rows: (interface, rx_bytes, rx_packets, tx_bytes,
@@ -109,7 +111,10 @@ def load(test_dir):
                     row = {"ts": int(hour.timestamp()) + 600 * i, "host": host}
                     row |= {"interval_s": 10, "pid": 100 + i % 2, "uid": i % 2}
                     row |= {"comm": f"proc{i % 2}", "scale": SCALE}
-                    f.write(json.dumps(row | COUNTERS) + "\n")
+                    row |= COUNTERS
+                    if (host, h) == OLD_HOUR:
+                        del row["nfs_fetched"]
+                    f.write(json.dumps(row) + "\n")
             with open(path.with_name(f"{hour:%H}.interfaces.jsonl"), "w") as f:
                 for i in range(ROWS):
                     for name, *counts in INTERFACES[host]:
@@ -225,11 +230,14 @@ def check(test_dir):
                     "Received by process": 6,
                     "NFS read by process": 5,
                     "NFS written by process": 6,
+                    "NFS fetched by process": 7,
                     "Network by user id": 10,
                 }[title]
                 * 2
                 * per_host
             )
+            if title == "NFS fetched by process":
+                want -= 7 * ROWS * SCALE  # null in OLD_HOUR
             check_eq(f"{title}: bytes", round(total), want)
             check_eq(f"{title}: buckets", len({r["time"] for r in rows}), HOURS)
         elif panel["type"] == "heatmap":
@@ -247,6 +255,8 @@ def check(test_dir):
             got = {k: round(float(v)) for k, v in rows[0].items()}
             check_eq(title, got["TCP received"], 2 * 2 * per_host)
             check_eq(f"{title}: NFS written", got["NFS written"], 6 * 2 * per_host)
+            fetched = 7 * (2 * per_host - ROWS * SCALE)  # null in OLD_HOUR
+            check_eq(f"{title}: NFS fetched", got["NFS fetched"], fetched)
         else:
             check_eq(f"{title}: rows", len(rows), 4)  # 2 hosts x 2 comms
             check_eq(f"{title}: pids", {r["pids"] for r in rows}, {1})

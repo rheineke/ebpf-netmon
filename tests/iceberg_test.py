@@ -19,7 +19,9 @@ import time
 from pathlib import Path
 from unittest import mock
 
+import pyarrow as pa
 from pyiceberg.exceptions import NoSuchTableError
+from pyiceberg.schema import Schema
 
 TOOLS = Path(__file__).resolve().parent.parent / "tools"
 sys.path.insert(0, str(TOOLS))
@@ -29,7 +31,7 @@ DAY = 86400
 NOW = dt.datetime(2026, 10, 22, 12, 30, tzinfo=dt.UTC)
 
 
-def write_hour(raw, host, start, rows, extra=""):
+def write_hour(raw, host, start, rows, extra="", fetched=None):
     path = raw / host / start.strftime("%Y-%m-%d") / start.strftime("%H.jsonl")
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
@@ -50,6 +52,8 @@ def write_hour(raw, host, start, rows, extra=""):
                 "nfs_write": 6,
                 "scale": 1,
             }
+            if fetched is not None:  # netmon writes it since nfs_fetched
+                row["nfs_fetched"] = fetched
             f.write(json.dumps(row) + "\n")
         f.write(extra)
 
@@ -385,6 +389,60 @@ def check_interfaces():
         )
 
 
+def check_new_column():
+    """A table made before nfs_fetched gets the column on the next load, as
+    an optional one with the schema's id, null for rows that lack it."""
+    old = Schema(*(f for f in to_iceberg.SCHEMA.fields if f.name != "nfs_fetched"))
+    old_arrow = pa.schema(
+        [f for f in to_iceberg.ARROW_SCHEMA if f.name != "nfs_fetched"]
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        raw, warehouse = Path(tmp) / "raw", Path(tmp) / "warehouse"
+        warehouse.mkdir()
+        catalog = to_iceberg.open_catalog(warehouse.resolve())
+        table = catalog.create_table(
+            to_iceberg.TABLE, schema=old, partition_spec=to_iceberg.SPEC
+        )
+        h9, h10 = NOW.replace(hour=9, minute=0), NOW.replace(hour=10, minute=0)
+        write_hour(raw, "pi-a", h9, 2)
+        # Loaded before the column: a data file without it.
+        rows = to_iceberg.read_rows(raw / "pi-a" / h9.strftime("%Y-%m-%d/%H.jsonl"))
+        table.append(pa.Table.from_pylist(rows, schema=old_arrow))
+
+        write_hour(raw, "pi-a", h10, 3, fetched=7)
+        write_hour(raw, "pi-b", h10, 4)  # an older netmon
+        commits = []
+        added = to_iceberg.convert(raw, warehouse, NOW, on_commit=commits.append)
+        check("rows added to the evolved table", added, 7)
+        check("on_commit after the new column and the load", len(commits), 2)
+        table = to_iceberg.open_table(warehouse)
+        field = table.schema().find_field("nfs_fetched")
+        check(
+            "nfs_fetched's id and optionality",
+            (field.field_id, field.required),
+            (14, False),
+        )
+        got = (
+            table.scan()
+            .to_arrow()
+            .sort_by([("host", "ascending"), ("ts", "ascending")])
+        )
+        check(
+            "nfs_fetched: null when not measured",
+            list(
+                zip(
+                    got["host"].to_pylist(), got["nfs_fetched"].to_pylist(), strict=True
+                )
+            ),
+            [("pi-a", None)] * 2 + [("pi-a", 7)] * 3 + [("pi-b", None)] * 4,
+        )
+        check(
+            "a table with every column isn't changed",
+            to_iceberg.add_columns(table),
+            False,
+        )
+
+
 def check_crash_recovery():
     """A run that dies mid-commit, after more commits than the table keeps
     metadata files of, is cleaned up by the next one: main() moves its run
@@ -416,6 +474,7 @@ def main():
     check_backlog_and_clock()
     check_skips()
     check_interfaces()
+    check_new_column()
     check_crash_recovery()
     with tempfile.TemporaryDirectory() as tmp:
         raw, warehouse = Path(tmp) / "raw", Path(tmp) / "warehouse"

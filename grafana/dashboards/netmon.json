@@ -76,7 +76,7 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "table",
-          "rawSql": "SELECT sum(tcp_tx * scale) AS `TCP sent`, sum(tcp_rx * scale) AS `TCP received`,\n  sum(udp_tx * scale) AS `UDP sent`, sum(udp_rx * scale) AS `UDP received`,\n  sum(nfs_read * scale) AS `NFS read`, sum(nfs_write * scale) AS `NFS written`\nFROM netmon.traffic_live WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)"
+          "rawSql": "SELECT sum(tcp_tx * scale) AS `TCP sent`, sum(tcp_rx * scale) AS `TCP received`,\n  sum(udp_tx * scale) AS `UDP sent`, sum(udp_rx * scale) AS `UDP received`,\n  sum(nfs_read * scale) AS `NFS read`, sum(nfs_write * scale) AS `NFS written`,\n  sum(nfs_fetched * scale) AS `NFS fetched`\nFROM netmon.traffic_live WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)"
         }
       ]
     },
@@ -445,6 +445,63 @@
       "interval": "10s"
     },
     {
+      "id": 10,
+      "type": "timeseries",
+      "title": "NFS fetched by process",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "netmon-clickhouse"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 38
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "netmon-clickhouse"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "queryType": "timeseries",
+          "rawSql": "WITH\n  -- Whole 10 s reports per bucket, or a 15 s bucket swings by a third.\n  intDiv($__interval_s + 9, 10) * 10 AS step,\n  top AS (\n  SELECT comm FROM netmon.traffic_live WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)\n  GROUP BY comm ORDER BY sum((nfs_fetched) * scale) DESC LIMIT 10\n)\nSELECT toStartOfInterval(toDateTime(ts), toIntervalSecond(step)) AS time, comm,\n  sum((nfs_fetched) * scale) / step AS bytes_per_s\nFROM netmon.traffic_live\nWHERE host IN (${host:singlequote}) AND $__timeFilter(ts) AND comm IN top\nGROUP BY time, comm ORDER BY time"
+        }
+      ],
+      "interval": "10s",
+      "description": "File bytes the NFS server sent for each process's reads: page-cache misses, readahead, memory-mapped and O_DIRECT reads. NFS read counts file bytes, cached or not. Empty before netmon counted it."
+    },
+    {
       "id": 7,
       "type": "timeseries",
       "title": "Network by user id",
@@ -456,7 +513,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 38
+        "y": 47
       },
       "fieldConfig": {
         "defaults": {
@@ -512,7 +569,7 @@
         "h": 10,
         "w": 24,
         "x": 0,
-        "y": 47
+        "y": 56
       },
       "fieldConfig": {
         "defaults": {
@@ -546,7 +603,7 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "table",
-          "rawSql": "SELECT host, comm, uniqExact(pid) AS pids,\n  sum((tcp_tx + udp_tx) * scale) AS sent, sum((tcp_rx + udp_rx) * scale) AS received,\n  sum(nfs_read * scale) AS nfs_read, sum(nfs_write * scale) AS nfs_written\nFROM netmon.traffic_live WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)\nGROUP BY host, comm ORDER BY sent + received + nfs_read + nfs_written DESC LIMIT 50"
+          "rawSql": "SELECT host, comm, uniqExact(pid) AS pids,\n  sum((tcp_tx + udp_tx) * scale) AS sent, sum((tcp_rx + udp_rx) * scale) AS received,\n  sum(nfs_read * scale) AS nfs_read, sum(nfs_write * scale) AS nfs_written,\n  sum(nfs_fetched * scale) AS nfs_fetched\nFROM netmon.traffic_live WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)\nGROUP BY host, comm ORDER BY sent + received + nfs_read + nfs_written DESC LIMIT 50"
         }
       ]
     }
