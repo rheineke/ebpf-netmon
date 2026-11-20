@@ -603,7 +603,7 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "table",
-          "rawSql": "SELECT host, comm, uniqExact(pid) AS pids,\n  sum((tcp_tx + udp_tx) * scale) AS sent, sum((tcp_rx + udp_rx) * scale) AS received,\n  sum(nfs_read * scale) AS nfs_read, sum(nfs_write * scale) AS nfs_written,\n  sum(nfs_fetched * scale) AS nfs_fetched\nFROM netmon.traffic_live WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)\nGROUP BY host, comm ORDER BY sent + received + nfs_read + nfs_written DESC LIMIT 50"
+          "rawSql": "SELECT host, comm, uniqExact(pid) AS pids,\n  sum((tcp_tx + udp_tx) * scale) AS sent, sum((tcp_rx + udp_rx) * scale) AS received,\n  sum(nfs_read * scale) AS nfs_read, sum(nfs_write * scale) AS nfs_written,\n  sum(nfs_fetched * scale) AS nfs_fetched\nFROM netmon.traffic_live WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)\nGROUP BY host, comm ORDER BY sent + received + greatest(nfs_read, ifNull(nfs_fetched, 0)) + nfs_written DESC LIMIT 50"
         }
       ]
     }

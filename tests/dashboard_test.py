@@ -38,8 +38,10 @@ ROOT = Path(__file__).resolve().parent.parent
 HOURS, ROWS = 4, 6  # per host, rows per hour
 COUNTERS = {"tcp_tx": 1, "tcp_rx": 2, "udp_tx": 3, "udp_rx": 4, "nfs_read": 5}
 COUNTERS["nfs_write"] = 6
-COUNTERS["nfs_fetched"] = 7  # but in OLD_HOUR
-OLD_HOUR = ("pi-b", 0)  # written by a netmon before nfs_fetched
+COUNTERS["nfs_fetched"] = 7  # but in OLD_HOURS
+# Hours a netmon before nfs_fetched wrote: one loaded into the table before
+# it had the column (load), one raw only until convert.
+OLD_HOURS = {("pi-b", 0), ("pi-b", HOURS - 1)}
 IFACE_COUNTERS = ("rx_bytes", "rx_packets", "tx_bytes", "tx_packets")
 SCALE = 2.0
 # Each report's interface rows: (interface, rx_bytes, rx_packets, tx_bytes,
@@ -86,6 +88,27 @@ def maintain(test_dir):
         print(kind.table, done)
 
 
+def old_table(test_dir, start):
+    """Makes netmon.traffic as a converter before nfs_fetched did, holding
+    pi-b's first hour, so ClickHouse reads a table that gained the column
+    later, with a data file that lacks it."""
+    sys.path.insert(0, str(ROOT / "tools"))
+    import pyarrow as pa
+    import to_iceberg
+    from pyiceberg.schema import Schema
+
+    later = set(to_iceberg.LATER_COUNTERS)
+    schema = Schema(*(f for f in to_iceberg.SCHEMA.fields if f.name not in later))
+    arrow = pa.schema([f for f in to_iceberg.ARROW_SCHEMA if f.name not in later])
+    warehouse = (test_dir / "warehouse").resolve()
+    warehouse.mkdir(parents=True, exist_ok=True)
+    table = to_iceberg.open_catalog(warehouse, CATALOG).create_table(
+        to_iceberg.TABLE, schema=schema, partition_spec=to_iceberg.SPEC
+    )
+    path = test_dir / "raw" / "pi-b" / f"{start:%Y-%m-%d}" / f"{start:%H}.jsonl"
+    table.append(pa.Table.from_pylist(to_iceberg.read_rows(path), schema=arrow))
+
+
 def load(test_dir):
     if CATALOG:  # a previous run's table, whose files are gone
         sys.path.insert(0, str(ROOT / "tools"))
@@ -112,7 +135,7 @@ def load(test_dir):
                     row |= {"interval_s": 10, "pid": 100 + i % 2, "uid": i % 2}
                     row |= {"comm": f"proc{i % 2}", "scale": SCALE}
                     row |= COUNTERS
-                    if (host, h) == OLD_HOUR:
+                    if (host, h) in OLD_HOURS:
                         del row["nfs_fetched"]
                     f.write(json.dumps(row) + "\n")
             with open(path.with_name(f"{hour:%H}.interfaces.jsonl"), "w") as f:
@@ -122,6 +145,7 @@ def load(test_dir):
                         row |= {"interval_s": 10, "interface": name}
                         row |= dict(zip(IFACE_COUNTERS, counts, strict=True))
                         f.write(json.dumps(row) + "\n")
+    old_table(test_dir, start)
     # Copies of pi-a's last hour, still only in raw files: a backup, which
     # must count once, and folders to skip, each with a row of its own.
     path = test_dir / "raw" / "pi-a" / f"{hour:%Y-%m-%d}" / f"{hour:%H}.jsonl"
@@ -197,6 +221,15 @@ def check(test_dir):
     dash = json.loads((ROOT / "grafana/dashboards/netmon.json").read_text())
     per_host = HOURS * ROWS * SCALE  # each counter's weight per host
     iceberg = query("SELECT count() AS n FROM netmon.traffic")[0]["n"]
+    nulls = "SELECT countIf(nfs_fetched IS NULL) AS n FROM netmon.traffic"
+    converted = 1 if int(iceberg) < 2 * HOURS * ROWS else 2  # of OLD_HOURS
+    check_eq(
+        "rows without nfs_fetched, in Iceberg",
+        int(query(nulls)[0]["n"]),
+        converted * ROWS,
+    )
+    nulls = nulls.replace("netmon.traffic", "netmon.traffic_live")
+    check_eq("rows without nfs_fetched, live", int(query(nulls)[0]["n"]), 2 * ROWS)
     # The live view would hide a stale table, so check it by itself too.
     if CATALOG:
         sql = "SELECT create_table_query AS q FROM system.tables"
@@ -237,7 +270,7 @@ def check(test_dir):
                 * per_host
             )
             if title == "NFS fetched by process":
-                want -= 7 * ROWS * SCALE  # null in OLD_HOUR
+                want -= 7 * len(OLD_HOURS) * ROWS * SCALE  # null there
             check_eq(f"{title}: bytes", round(total), want)
             check_eq(f"{title}: buckets", len({r["time"] for r in rows}), HOURS)
         elif panel["type"] == "heatmap":
@@ -255,7 +288,7 @@ def check(test_dir):
             got = {k: round(float(v)) for k, v in rows[0].items()}
             check_eq(title, got["TCP received"], 2 * 2 * per_host)
             check_eq(f"{title}: NFS written", got["NFS written"], 6 * 2 * per_host)
-            fetched = 7 * (2 * per_host - ROWS * SCALE)  # null in OLD_HOUR
+            fetched = 7 * (2 * per_host - len(OLD_HOURS) * ROWS * SCALE)
             check_eq(f"{title}: NFS fetched", got["NFS fetched"], fetched)
         else:
             check_eq(f"{title}: rows", len(rows), 4)  # 2 hosts x 2 comms

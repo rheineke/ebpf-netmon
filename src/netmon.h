@@ -60,3 +60,41 @@ struct netmon_nfs_readpage_done {
 	unsigned char eof;
 	int error; /* the RPC's status: 0, or -errno */
 };
+
+/*
+ * What both NFS records name a READ by: the key of netmon.bpf.c's map of
+ * READs in flight. fhandle is a hash of the file handle, which tells apart
+ * files that share a fileid.
+ */
+struct netmon_nfs_read_key {
+	unsigned long long fileid;
+	long long offset;
+	unsigned int dev;
+	unsigned int fhandle;
+};
+
+/*
+ * Whether a reply leaves the rest of its READ to a retry, which
+ * nfs_readpage_retry() sends without a new nfs_initiate_read: a short read,
+ * without an error or the end of the file, sent again from where it
+ * stopped. If so, sets *next to the retry's key.
+ */
+static inline int
+netmon_nfs_read_retry(const struct netmon_nfs_readpage_done *r,
+		      struct netmon_nfs_read_key *next)
+{
+	if (r->error < 0 || r->eof || !r->res_count ||
+	    r->res_count >= r->arg_count)
+		return 0;
+	next->fileid = r->fileid;
+	next->offset = r->offset + r->res_count;
+	next->dev = r->dev;
+	next->fhandle = r->fhandle;
+	return 1;
+}
+
+/* Replies netmon.bpf.c found no reader for, and their bytes, per CPU. */
+struct netmon_nfs_unmatched {
+	unsigned long long replies;
+	unsigned long long bytes;
+};

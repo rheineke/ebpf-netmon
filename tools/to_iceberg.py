@@ -317,17 +317,21 @@ def open_table(warehouse, catalog_uri=None, kind=TRAFFIC):
     return catalog.create_table(kind.table, schema=kind.schema, partition_spec=SPEC)
 
 
-def add_columns(table, kind=TRAFFIC):
+def add_columns(table, kind=TRAFFIC, on_commit=None):
     """Adds the columns of kind.schema that the table, made by an older
-    version, lacks. Returns whether it committed."""
+    version, lacks, and calls on_commit(table) after. Like every commit, not
+    with the clock behind (check_clock). Returns whether it committed."""
     have = {field.name for field in table.schema().fields}
     missing = [field for field in kind.schema.fields if field.name not in have]
     if not missing:
         return False
+    check_clock(table)
     with table.update_schema() as update:
         for field in missing:
             update.add_column(field.name, field.field_type)
     print(f"{kind.table}: added column(s) {', '.join(f.name for f in missing)}")
+    if on_commit:
+        on_commit(table)
     return True
 
 
@@ -512,8 +516,7 @@ def convert(
     this_hour = now.replace(minute=0, second=0, microsecond=0)
     oldest = this_hour - dt.timedelta(days=days)
     table = open_table(warehouse, catalog_uri, kind)
-    if add_columns(table, kind) and on_commit:
-        on_commit(table)
+    add_columns(table, kind, on_commit)
     counts = hour_counts(table, oldest)
     by_day, too_old, newest = {}, {}, 0  # day -> [(path, hour)]; path -> ctime
     for path in raw_files(raw, kind.suffix):
@@ -633,6 +636,7 @@ def maintain(
     now = now or dt.datetime.now(dt.UTC)
     table = open_table(warehouse, catalog_uri, kind)
     check_clock(table)
+    add_columns(table, kind, on_commit)  # compact() writes the new schema
     today = now.replace(hour=0, minute=0, second=0, microsecond=0)
     days = compact(table, today, on_commit, kind)
     snapshots = len(table.snapshots())

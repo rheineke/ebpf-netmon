@@ -74,11 +74,16 @@ A kretprobe can track only so many calls in progress at once: 10 on a
 4-core Pi, across all processes. Each thread blocked inside the function
 holds one, so with ten NFS reads waiting on a slow NAS, the next one's bytes
 go uncounted. netmon reads the kernel's count of these and logs
-`netmon: kretprobe/nfs_file_read missed N calls`. Probes that can't attach,
-such as NFS before the `nfs` module loads at the first mount, are retried
-every minute. Tracepoints have no such limit. An NFS tracepoint whose
-layout differs from the one netmon was built for isn't attached, and
-netmon says so; the rest still count.
+`netmon: kretprobe/nfs_file_read missed N calls`. The kernel also skips any
+of netmon's programs that fires while another BPF program runs on the same
+CPU, from an interrupt say; netmon logs those too (`skipped N calls`). On a
+Pi 4 that's about a hundred calls a day, out of millions. Probes that can't
+attach, such as NFS before the `nfs` module loads at the first mount, are
+retried every minute. An NFS tracepoint whose layout differs from the one
+netmon was built for isn't attached, nor its partner, and netmon says so;
+the rest still count. While netmon runs, its NFS tracepoints hold the `nfs`
+module, so `modprobe -r nfs` fails until it stops (where NFS is built into
+the kernel, as on a Pi, this doesn't arise).
 
 ## Priority sampling
 
@@ -172,8 +177,9 @@ counts for the server process match the bytes that actually arrived.
 ### NFS traffic
 
 The NFS client's wire bytes don't say which process asked for them. Replies
-arrive in kernel threads (`kworker/...-xprtiod`), so they show up as those
-threads' `tcp_rx`. Requests mostly leave from kernel threads too, but a
+arrive in kernel worker threads, so they show up as `kworker/...` rows'
+`tcp_rx`, named for whichever work queue the thread runs when netmon reads
+its name (`-rpciod`, `-xprtiod`, `-events_unbound`…). Requests mostly leave from kernel threads too, but a
 synchronous call (a `stat()`, an `open()`) is sent by the calling process,
 along with any requests queued behind it, so a process's `tcp_tx` can
 include some NFS request bytes. `NFS_RD` and `NFS_WR` charge the file bytes
@@ -188,15 +194,29 @@ a process's reads: page-cache misses, readahead, memory-mapped and
 kernel counts as the mounts' server read bytes (the fifth number on the
 `bytes:` lines of `/proc/self/mountstats`), split by process: on a Pi 4 the
 sum matched it to the byte. Their RPC and TCP headers aren't in it; the
-replies, headers and all, are the `xprtiod` threads' `tcp_rx`. The client starts
-each `READ` call in the process that needs the pages
+replies, headers and all, are the kernel worker threads' `tcp_rx`.
+
+The client starts each `READ` call in the process that needs the pages
 (`nfs:nfs_initiate_read`), and the reply completes in a kernel thread
 (`nfs:nfs_readpage_done`), so netmon records which process asked under the
-file and offset both name, and charges it with the reply's bytes. A read
-the client retries from a kernel thread after an error is charged to that
-thread. Two processes reading the same bytes of a file with `O_DIRECT` at
-the same moment are charged as one, the later. Writes have no counterpart:
-the kernel's writeback, not the writer, sends most of them.
+file handle and offset both name, and charges it with the reply's bytes.
+Retries keep the reader: the client resends a short read, or a call the
+server asked to repeat, without starting a new one. Only a pNFS read resent
+through the metadata server after a layout error is charged to the kernel
+thread that resends it. Concurrent `READ`s of the same bytes (threads or
+io_uring with `O_DIRECT`) are all counted, and charged to the last process
+to start one.
+
+netmon tracks 16384 `READ`s in flight at once. A single `O_DIRECT` or
+io_uring call can start one per `rsize` bytes (128 KiB on most mounts)
+before the first reply, so past 2 GiB in flight the oldest are forgotten,
+as are those started before netmon attached, and their replies' bytes go
+uncounted. netmon logs them:
+`netmon: N NFS READ replies (B bytes) found no recorded reader`. With those
+added, the counts again matched the server's to the byte on a Pi 4.
+
+Writes have no counterpart: the kernel's writeback, not the writer, sends
+most of them.
 
 To check it on a machine with an NFS mount (the directory is optional and
 must be writable):
@@ -441,7 +461,9 @@ scripts/install_grafana.sh
 Install the converter first: ClickHouse's views need its tables, and an
 upgrade that adds a table or a column (`nfs_fetched`) needs its next run
 (`install_converter.sh` runs it at once). Rows from a netmon without a
-counter are null there.
+counter are null there. Upgrade the converter before netmon on any Pi that
+feeds it, too: an older converter loads a newer netmon's rows without the
+counters it doesn't know, and those hours aren't loaded again.
 
 ClickHouse listens on 127.0.0.1 only. It has two views of each table, the
 processes' rows (`traffic`) and the interfaces' (`interfaces`):

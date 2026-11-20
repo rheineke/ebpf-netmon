@@ -35,13 +35,16 @@ struct {
 } traffic SEC(".maps");
 
 /*
- * Adds bytes to process tgid's counter, naming it uid and comm: the owner as
- * of now, as the process may have dropped privileges, or be a new one that
- * reused an exited one's pid.
+ * Adds bytes to process tgid's counter. A new entry is named uid and comm.
+ * With refresh, so is an existing one: the owner as of now, as the process
+ * may have dropped privileges, or be a new one that reused an exited one's
+ * pid. Without it, from a kernel thread, the names saved earlier don't
+ * replace newer ones.
  */
 static __always_inline int add_bytes(__u32 tgid, __u32 uid,
 				     const char comm[NETMON_COMM_LEN],
-				     enum netmon_counter counter, long bytes)
+				     enum netmon_counter counter, long bytes,
+				     int refresh)
 {
 	struct netmon_traffic *t = bpf_map_lookup_elem(&traffic, &tgid);
 	if (!t) {
@@ -52,7 +55,7 @@ static __always_inline int add_bytes(__u32 tgid, __u32 uid,
 		t = bpf_map_lookup_elem(&traffic, &tgid);
 		if (!t)
 			return 0;
-	} else {
+	} else if (refresh) {
 		t->uid = uid;
 		__builtin_memcpy(t->comm, comm, sizeof(t->comm));
 	}
@@ -69,8 +72,8 @@ static __always_inline int account(enum netmon_counter counter, long bytes)
 	char comm[NETMON_COMM_LEN];
 	bpf_get_current_comm(comm, sizeof(comm));
 	return add_bytes(bpf_get_current_pid_tgid() >> 32,
-			 (__u32)bpf_get_current_uid_gid(), comm, counter,
-			 bytes);
+			 (__u32)bpf_get_current_uid_gid(), comm, counter, bytes,
+			 1);
 }
 
 static __always_inline int account_sock(const struct netmon_sock_msg_length *m,
@@ -158,71 +161,105 @@ int BPF_KRETPROBE(nfs_file_write_ret, long ret)
  * (nfs_readpage_done), so the first records who asked, keyed by what both
  * records carry, and the second charges that process with the bytes sent.
  */
-struct nfs_read_key {
-	__u64 fileid;
-	__s64 offset;
-	__u32 dev;
-	__u32 pad; /* zeroed, as hash keys compare every byte */
-};
-
 struct nfs_reader {
 	__u32 tgid;
 	__u32 uid;
 	char comm[NETMON_COMM_LEN];
+	__u32 pending; /* READs of these bytes in flight */
+	__u32 pad;
 };
 
 /*
- * READs in flight. LRU, so one whose reply never comes (the mount was forced
- * off) ages out. Two processes reading the same bytes of a file at once
- * (O_DIRECT; buffered reads share the page cache) share one entry, and the
- * later one is charged.
+ * READs in flight: one O_DIRECT or io_uring call can start many, one per
+ * rsize bytes, before the first reply. 16384 covers 2 GiB in flight at a
+ * time with the usual 128 KiB rsize; past that, the LRU evicts the oldest,
+ * whose replies are then counted in nfs_unmatched, as are those of a READ
+ * started before netmon attached. LRU also ages out a READ whose reply
+ * never came (a mount forced off).
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
-	__uint(max_entries, 4096);
-	__type(key, struct nfs_read_key);
+	__uint(max_entries, 16384);
+	__type(key, struct netmon_nfs_read_key);
 	__type(value, struct nfs_reader);
 } nfs_reads SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct netmon_nfs_unmatched);
+} nfs_unmatched SEC(".maps");
+
+/*
+ * Records reader as the process to charge for a READ's reply. Concurrent
+ * READs of the same bytes (threads or io_uring with O_DIRECT; buffered
+ * reads share the page cache) share an entry, counting them, and are all
+ * charged to the last to start.
+ */
+static __always_inline void expect_reply(const struct netmon_nfs_read_key *key,
+					 struct nfs_reader *reader)
+{
+	struct nfs_reader *found = bpf_map_lookup_elem(&nfs_reads, key);
+	if (!found) {
+		reader->pending = 1;
+		if (!bpf_map_update_elem(&nfs_reads, key, reader, BPF_NOEXIST))
+			return;
+		found = bpf_map_lookup_elem(&nfs_reads, key); /* raced */
+		if (!found)
+			return;
+	}
+	found->tgid = reader->tgid;
+	found->uid = reader->uid;
+	__builtin_memcpy(found->comm, reader->comm, sizeof(found->comm));
+	__sync_fetch_and_add(&found->pending, 1);
+}
 
 SEC("tracepoint/nfs/nfs_initiate_read")
 int nfs_initiate_read(const struct netmon_nfs_initiate_read *r)
 {
-	struct nfs_read_key key = {};
+	struct netmon_nfs_read_key key = {};
 	key.fileid = r->fileid;
 	key.offset = r->offset;
 	key.dev = r->dev;
+	key.fhandle = r->fhandle;
 	struct nfs_reader reader = {};
 	reader.tgid = bpf_get_current_pid_tgid() >> 32;
 	reader.uid = (__u32)bpf_get_current_uid_gid();
 	bpf_get_current_comm(reader.comm, sizeof(reader.comm));
-	bpf_map_update_elem(&nfs_reads, &key, &reader, BPF_ANY);
+	expect_reply(&key, &reader);
 	return 0;
 }
 
 SEC("tracepoint/nfs/nfs_readpage_done")
 int nfs_readpage_done(const struct netmon_nfs_readpage_done *r)
 {
-	struct nfs_read_key key = {};
+	struct netmon_nfs_read_key key = {};
 	key.fileid = r->fileid;
 	key.offset = r->offset;
 	key.dev = r->dev;
+	key.fhandle = r->fhandle;
 	struct nfs_reader *found = bpf_map_lookup_elem(&nfs_reads, &key);
-	if (!found)
+	if (!found) {
+		__u32 zero = 0;
+		struct netmon_nfs_unmatched *u =
+			bpf_map_lookup_elem(&nfs_unmatched, &zero);
+		if (u && r->res_count) {
+			/* Atomic even per CPU: the kernel may preempt. */
+			__sync_fetch_and_add(&u->replies, 1);
+			__sync_fetch_and_add(&u->bytes, r->res_count);
+		}
 		return 0;
+	}
 	struct nfs_reader reader = *found;
-	bpf_map_delete_elem(&nfs_reads, &key);
+	__sync_fetch_and_add(&found->pending, (__u32)-1);
+	if (reader.pending <= 1)
+		bpf_map_delete_elem(&nfs_reads, &key);
 	if (r->res_count)
 		add_bytes(reader.tgid, reader.uid, reader.comm,
-			  NETMON_NFS_FETCHED, r->res_count);
-	/*
-	 * A short read without an error or the end of the file is sent again
-	 * for the rest, from where this one stopped, without a new
-	 * nfs_initiate_read (nfs_readpage_retry).
-	 */
-	if (r->error >= 0 && !r->eof && r->res_count &&
-	    r->res_count < r->arg_count) {
-		key.offset += r->res_count;
-		bpf_map_update_elem(&nfs_reads, &key, &reader, BPF_ANY);
-	}
+			  NETMON_NFS_FETCHED, r->res_count, 0);
+	struct netmon_nfs_read_key next = {};
+	if (netmon_nfs_read_retry(r, &next))
+		expect_reply(&next, &reader);
 	return 0;
 }

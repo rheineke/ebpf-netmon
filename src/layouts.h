@@ -40,6 +40,8 @@ struct TracepointLayout {
 	std::string category, event;
 	const std::vector<TracepointField> *fields = nullptr;
 	bool required = false;
+	// Tracepoints that count only together, refused together.
+	std::string group;
 };
 
 inline TracepointLayout layout_of(const std::string &section)
@@ -54,8 +56,39 @@ inline TracepointLayout layout_of(const std::string &section)
 		l.required = true;
 	} else if (l.event == "nfs_initiate_read") {
 		l.fields = &kNfsInitiateRead;
+		l.group = "nfs_fetched";
 	} else if (l.event == "nfs_readpage_done") {
 		l.fields = &kNfsReadpageDone;
+		l.group = "nfs_fetched";
 	}
 	return l;
+}
+
+enum class Readiness {
+	kMissing,  // not there yet: a module's appear when it loads
+	kReady,  // there, with the layout netmon.bpf.c reads
+	kRefused,  // there, with another layout: never attach it
+};
+
+// Whether an optional tracepoint under tracefs root can be attached, and
+// if refused, why, in problem. Decided once per try, so a tracepoint that
+// appears meanwhile is never attached unchecked.
+inline Readiness check_optional(const std::string &root,
+				const TracepointLayout &l, std::string &problem)
+{
+	problem.clear();
+	if (!tracepoint_exists(root, l.category, l.event))
+		return Readiness::kMissing;
+	if (!l.fields) {
+		problem = " netmon doesn't know its layout";
+		return Readiness::kRefused;
+	}
+	problem = check_tracepoint(root, l.category, l.event, *l.fields);
+	if (problem.empty())
+		return Readiness::kReady;
+	if (!tracepoint_exists(root, l.category, l.event)) {
+		problem.clear();  // gone meanwhile, the module unloading
+		return Readiness::kMissing;
+	}
+	return Readiness::kRefused;
 }
