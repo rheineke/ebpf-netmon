@@ -22,11 +22,12 @@ serves to Grafana's dashboard and alerts.
 ## netmon
 
 `netmon` prints the TCP and UDP bytes each process sent and received in the
-last interval, and the NFS file bytes it read and wrote, like `top`:
+last interval, the NFS file bytes it read and wrote, and those the NFS server
+sent for its reads, like `top`:
 
 ```
-     PID    UID COMM                TCP_TX    TCP_RX    UDP_TX    UDP_RX    NFS_RD    NFS_WR
-     850    999 Plex Media Serv         0B        0B      687B      1.1K     12.0M        0B
+     PID    UID COMM                TCP_TX    TCP_RX    UDP_TX    UDP_RX    NFS_RD    NFS_WR NFS_FETCH
+     850    999 Plex Media Serv         0B        0B      687B      1.1K     12.0M        0B      4.0M
 ```
 
 Options: `-i` interval in seconds (default 2), `-c` number of reports,
@@ -45,7 +46,8 @@ the clock is synchronized.
   MPTCP counts as TCP. `splice()` from a TCP socket skips them, so a
   kretprobe on `tcp_splice_read` counts it.
 - **NFS**: kretprobes on `nfs_file_read`, `nfs_file_splice_read` and
-  `nfs_file_write` (see NFS traffic below).
+  `nfs_file_write`, and the `nfs:nfs_initiate_read` and
+  `nfs:nfs_readpage_done` tracepoints (see NFS traffic below).
 
 It reads only the tracepoints' records and the functions' return values,
 never kernel structs. So it needs no CO-RE and no kernel BTF, which Raspberry
@@ -68,13 +70,21 @@ counted again each time it slept, peeks counted twice, and so did an IPv6
 socket sending to an IPv4 address, which goes through both `udpv6_sendmsg`
 and `udp_sendmsg`. The smoke test checks each of these exactly.
 
-A kretprobe can track only so many calls in progress at once: 10 on a
-4-core Pi, across all processes. Each thread blocked inside the function
-holds one, so with ten NFS reads waiting on a slow NAS, the next one's bytes
-go uncounted. netmon reads the kernel's count of these and logs
-`netmon: kretprobe/nfs_file_read missed N calls`. Probes that can't attach,
-such as NFS before the `nfs` module loads at the first mount, are retried
-every minute.
+A kretprobe can track only so many calls in progress at once: 10 on a 4-core
+Pi, across all processes. Each thread blocked inside the function holds one,
+so with ten NFS reads waiting on a slow NAS, the next one's bytes go
+uncounted. netmon reads the kernel's count of these and logs `netmon:
+kretprobe/nfs_file_read missed N calls`. The kernel also skips every kprobe
+and tracepoint program that fires on a CPU while a task there is in a BPF
+map system call, netmon's own reads of its maps included; netmon logs those
+too (`skipped N calls`). On a Pi 4 that's about a hundred calls a day, out
+of millions, but a program hammering BPF maps can make it thousands a
+second. Probes that can't attach, such as NFS before the `nfs` module loads
+at the first mount, are retried every minute. An NFS tracepoint whose layout
+differs from the one netmon was built for isn't attached, nor its partner,
+and netmon says so; the rest still count. While netmon runs, its NFS
+tracepoints hold the `nfs` module, so `modprobe -r nfs` fails until it stops
+(where NFS is built into the kernel, as on a Pi, this doesn't arise).
 
 ## Priority sampling
 
@@ -168,15 +178,51 @@ counts for the server process match the bytes that actually arrived.
 ### NFS traffic
 
 The NFS client's wire bytes don't say which process asked for them. Replies
-arrive in kernel threads (`kworker/...-xprtiod`), so they show up as those
-threads' `tcp_rx`. Requests mostly leave from kernel threads too, but a
-synchronous call (a `stat()`, an `open()`) is sent by the calling process,
-along with any requests queued behind it, so a process's `tcp_tx` can
-include some NFS request bytes. `NFS_RD` and `NFS_WR` charge the file bytes
-to the process that read or wrote them, through `read()`,
-`sendfile()`/`splice()` or `write()`. They count file bytes, not wire bytes:
-reads served from the page cache count too, and memory-mapped access does
-not.
+arrive in kernel worker threads, so they show up as `kworker/...` rows'
+`tcp_rx`, named for whichever work queue the thread runs when netmon reads
+its name (`-rpciod`, `-xprtiod`, `-events_unbound`…). Requests mostly leave
+from kernel threads too, but a synchronous call (a `stat()`, an `open()`) is
+sent by the calling process, along with any requests queued behind it, so a
+process's `tcp_tx` can include some NFS request bytes. `NFS_RD` and `NFS_WR`
+charge the file bytes to the process that read or wrote them, through
+`read()`, `sendfile()`/`splice()` or `write()`. They count file bytes, not
+wire bytes: reads served from the page cache count too, and memory-mapped
+access does not.
+
+`NFS_FETCH` (`nfs_fetched` in files) is the file bytes the server sent for
+a process's reads: page-cache misses, readahead, memory-mapped and
+`O_DIRECT` reads, but not reads the page cache served. It is what the
+kernel counts as the mounts' server read bytes (the fifth number on the
+`bytes:` lines of `/proc/self/mountstats`), split by process: on a Pi 4 the
+sum matched it to the byte, short of what netmon logged as lost (below).
+Their RPC and TCP headers aren't in it; the replies, headers and all, are
+the kernel worker threads' `tcp_rx`.
+
+The client starts each `READ` call in the process that needs the pages
+(`nfs:nfs_initiate_read`), and the reply completes in a kernel thread
+(`nfs:nfs_readpage_done`), so netmon records which process asked under the
+file handle and offset both name, and charges it with the reply's bytes.
+Retries keep the reader: the client resends a short read, or a call the
+server asked to repeat, without starting a new one. Only a pNFS read resent
+through the metadata server after a layout error is charged to the kernel
+thread that resends it. Concurrent `READ`s of the same bytes (threads or
+io_uring with `O_DIRECT`) are counted, and charged to the last process to
+start one; rarely, when one starts on another CPU just as the last reply
+before it lands, its own reply is lost, and logged as below.
+
+netmon tracks 16384 `READ`s in flight at once. A single `O_DIRECT` or
+io_uring call can start one per `rsize` bytes (128 KiB on most mounts)
+before the first reply, so past 2 GiB in flight the oldest are forgotten,
+and their replies' bytes go uncounted. So do those of a `READ` whose start
+the kernel skipped. netmon logs them:
+`netmon: N NFS READ replies (B bytes) found no recorded reader`. With those
+added, the counts matched the server's to the byte on a Pi 4, with 20,000
+in flight. A skipped `nfs_readpage_done` loses bytes netmon can't know; it
+shows only as `skipped N calls`. Replies to `READ`s started before netmon
+attached aren't logged: it waits two reports before it does.
+
+Writes have no counterpart: the kernel's writeback, not the writer, sends
+most of them.
 
 To check it on a machine with an NFS mount (the directory is optional and
 must be writable):
@@ -199,7 +245,7 @@ that wide holds whole reports. The dashboard's rate panels assume the
 service's `-i 10`:
 
 ```json
-{"ts":1792666260,"host":"raspberrypi","interval_s":10,"pid":4309,"uid":0,"comm":"nfsd","tcp_tx":84,"tcp_rx":120,"udp_tx":0,"udp_rx":0,"nfs_read":0,"nfs_write":0,"scale":1}
+{"ts":1792666260,"host":"raspberrypi","interval_s":10,"pid":4309,"uid":0,"comm":"nfsd","tcp_tx":84,"tcp_rx":120,"udp_tx":0,"udp_rx":0,"nfs_read":0,"nfs_write":0,"nfs_fetched":0,"scale":1}
 ```
 
 Each report also appends what every network interface moved in its
@@ -419,8 +465,11 @@ scripts/install_grafana.sh
 ```
 
 Install the converter first: ClickHouse's views need its tables, and an
-upgrade that adds a table needs its next run (`install_converter.sh` runs
-it at once).
+upgrade that adds a table or a column (`nfs_fetched`) needs its next run
+(`install_converter.sh` runs it at once). Rows from a netmon without a
+counter are null there. Upgrade the converter before netmon on any Pi that
+feeds it, too: an older converter loads a newer netmon's rows without the
+counters it doesn't know, and those hours aren't loaded again.
 
 ClickHouse listens on 127.0.0.1 only. It has two views of each table, the
 processes' rows (`traffic`) and the interfaces' (`interfaces`):

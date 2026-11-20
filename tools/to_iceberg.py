@@ -71,6 +71,9 @@ from pyiceberg.types import (
 
 TABLE = "netmon.traffic"
 COUNTERS = ["tcp_tx", "tcp_rx", "udp_tx", "udp_rx", "nfs_read", "nfs_write"]
+# Counters added once tables existed, which Iceberg adds only as optional
+# columns (add_columns): null for rows from a netmon without them.
+LATER_COUNTERS = ["nfs_fetched"]
 
 SCHEMA = Schema(
     NestedField(1, "ts", TimestamptzType(), required=True),
@@ -84,6 +87,10 @@ SCHEMA = Schema(
         for i, name in enumerate(COUNTERS)
     ),
     NestedField(13, "scale", DoubleType(), required=True),
+    *(
+        NestedField(14 + i, name, LongType(), required=False)
+        for i, name in enumerate(LATER_COUNTERS)
+    ),
 )
 SPEC = PartitionSpec(
     PartitionField(source_id=1, field_id=1000, transform=DayTransform(), name="day")
@@ -98,6 +105,7 @@ ARROW_SCHEMA = pa.schema(
         pa.field("comm", pa.string(), nullable=False),
         *(pa.field(name, pa.int64(), nullable=False) for name in COUNTERS),
         pa.field("scale", pa.float64(), nullable=False),
+        *(pa.field(name, pa.int64(), nullable=True) for name in LATER_COUNTERS),
     ]
 )
 # What each network interface moved in a report, headers and all.
@@ -139,8 +147,13 @@ class Kind:
 
 
 TRAFFIC = Kind(
-    TABLE, ".jsonl", SCHEMA, ARROW_SCHEMA, dict.fromkeys(COUNTERS, 0)
-)  # NFS counters came later
+    TABLE,
+    ".jsonl",
+    SCHEMA,
+    ARROW_SCHEMA,
+    # NFS counters came later; rows without the later ones are null there.
+    dict.fromkeys(COUNTERS, 0) | dict.fromkeys(LATER_COUNTERS),
+)
 INTERFACES = Kind(
     "netmon.interfaces", ".interfaces.jsonl", IFACE_SCHEMA, IFACE_ARROW_SCHEMA, {}
 )
@@ -304,6 +317,24 @@ def open_table(warehouse, catalog_uri=None, kind=TRAFFIC):
     return catalog.create_table(kind.table, schema=kind.schema, partition_spec=SPEC)
 
 
+def add_columns(table, kind=TRAFFIC, on_commit=None):
+    """Adds the columns of kind.schema that the table, made by an older
+    version, lacks, and calls on_commit(table) after. Like every commit, not
+    with the clock behind (check_clock). Returns whether it committed."""
+    have = {field.name for field in table.schema().fields}
+    missing = [field for field in kind.schema.fields if field.name not in have]
+    if not missing:
+        return False
+    check_clock(table)
+    with table.update_schema() as update:
+        for field in missing:
+            update.add_column(field.name, field.field_type)
+    print(f"{kind.table}: added column(s) {', '.join(f.name for f in missing)}")
+    if on_commit:
+        on_commit(table)
+    return True
+
+
 def hour_of(path, suffix=".jsonl"):
     """RAW/.../2026-10-22/11.jsonl -> 2026-10-22 11:00 UTC, or None. With
     another suffix, 11.interfaces.jsonl say, files without it are None."""
@@ -335,7 +366,9 @@ def check_types(row, schema=ARROW_SCHEMA):
     """Raises TypeError unless row's fields fit schema."""
     for field in schema:
         value = row[field.name]  # KeyError if missing
-        if field.name == "ts" or pa.types.is_integer(field.type):
+        if value is None and field.nullable:
+            ok = True
+        elif field.name == "ts" or pa.types.is_integer(field.type):
             bits = 32 if field.type == pa.int32() else 64
             ok = type(value) is int and -(2 ** (bits - 1)) <= value < 2 ** (bits - 1)
         elif pa.types.is_floating(field.type):
@@ -483,6 +516,7 @@ def convert(
     this_hour = now.replace(minute=0, second=0, microsecond=0)
     oldest = this_hour - dt.timedelta(days=days)
     table = open_table(warehouse, catalog_uri, kind)
+    add_columns(table, kind, on_commit)
     counts = hour_counts(table, oldest)
     by_day, too_old, newest = {}, {}, 0  # day -> [(path, hour)]; path -> ctime
     for path in raw_files(raw, kind.suffix):
@@ -602,6 +636,7 @@ def maintain(
     now = now or dt.datetime.now(dt.UTC)
     table = open_table(warehouse, catalog_uri, kind)
     check_clock(table)
+    add_columns(table, kind, on_commit)  # compact() writes the new schema
     today = now.replace(hour=0, minute=0, second=0, microsecond=0)
     days = compact(table, today, on_commit, kind)
     snapshots = len(table.snapshots())

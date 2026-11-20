@@ -202,15 +202,30 @@ jobs:
           # The service started before the mount loaded the nfs module, so
           # its NFS probes failed then; it retries them every minute.
           logged() { sudo journalctl -u netmon.service -o cat | grep -q "$1"; }
-          if logged 'could not attach kretprobe/nfs_file_read'; then
+          for probe in kretprobe/nfs_file_read tracepoint/nfs/nfs_initiate_read \
+            tracepoint/nfs/nfs_readpage_done; do
+            logged "could not attach $probe" || continue
             for _ in $(seq 45); do
-              logged 'attached kretprobe/nfs_file_read' && break
+              logged "attached $probe" && break
               sleep 2
             done
-            logged 'attached kretprobe/nfs_file_read' \
-              || { echo "FAIL: the service never attached its NFS probes"; exit 1; }
-            echo "ok  : the service attached its NFS probes on a retry"
+            logged "attached $probe" \
+              || { echo "FAIL: the service never attached $probe"; exit 1; }
+            echo "ok  : the service attached $probe on a retry"
+          done
+          if logged 'not attaching tracepoint/nfs'; then
+            echo "FAIL: this kernel's NFS tracepoints have another layout"; exit 1
           fi
+      # Many READs in flight: with a 4 KiB rsize, one 48 MiB O_DIRECT read
+      # starts 12288, near the 16384 netmon tracks.
+      - name: NFS READs in flight
+        run: |
+          sudo mkdir -p /mnt/nfstest4k
+          sudo mount -t nfs4 -o rsize=4096,nosharecache 127.0.0.1:/srv/nfstest /mnt/nfstest4k
+          head -c 50331648 /dev/urandom | sudo tee /srv/nfstest/inflight.bin >/dev/null
+          docker run --rm --privileged --pid=host -v /mnt/nfstest4k:/mnt/nfstest4k \
+            --entrypoint python3 ebpf-netmon:test \
+            tests/nfs_inflight_test.py /mnt/nfstest4k/inflight.bin
       # The same script a Pi runs, as a non-root user with sudo, so PATH
       # matches a normal Pi login.
       - name: Build script

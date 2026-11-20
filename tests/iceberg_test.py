@@ -19,7 +19,9 @@ import time
 from pathlib import Path
 from unittest import mock
 
+import pyarrow as pa
 from pyiceberg.exceptions import NoSuchTableError
+from pyiceberg.schema import Schema
 
 TOOLS = Path(__file__).resolve().parent.parent / "tools"
 sys.path.insert(0, str(TOOLS))
@@ -29,7 +31,7 @@ DAY = 86400
 NOW = dt.datetime(2026, 10, 22, 12, 30, tzinfo=dt.UTC)
 
 
-def write_hour(raw, host, start, rows, extra=""):
+def write_hour(raw, host, start, rows, extra="", fetched=None):
     path = raw / host / start.strftime("%Y-%m-%d") / start.strftime("%H.jsonl")
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
@@ -50,6 +52,8 @@ def write_hour(raw, host, start, rows, extra=""):
                 "nfs_write": 6,
                 "scale": 1,
             }
+            if fetched is not None:  # netmon writes it since nfs_fetched
+                row["nfs_fetched"] = fetched
             f.write(json.dumps(row) + "\n")
         f.write(extra)
 
@@ -385,6 +389,93 @@ def check_interfaces():
         )
 
 
+def check_new_column():
+    """A table made before nfs_fetched gets the column at the next run, load
+    or maintenance, as an optional one with the schema's id, null for rows
+    that lack it, but not with the clock behind."""
+    old = Schema(*(f for f in to_iceberg.SCHEMA.fields if f.name != "nfs_fetched"))
+    old_arrow = pa.schema(
+        [f for f in to_iceberg.ARROW_SCHEMA if f.name != "nfs_fetched"]
+    )
+    uri = os.environ.get("NETMON_TEST_CATALOG")  # else SQLite in the warehouse
+    with tempfile.TemporaryDirectory() as tmp:
+        raw, warehouse = Path(tmp) / "raw", Path(tmp) / "warehouse"
+        warehouse.mkdir()
+        catalog = to_iceberg.open_catalog(warehouse.resolve(), uri)
+        try:  # a previous run's table; its files are gone
+            catalog.drop_table(to_iceberg.TABLE)
+        except NoSuchTableError:
+            pass
+        table = catalog.create_table(
+            to_iceberg.TABLE, schema=old, partition_spec=to_iceberg.SPEC
+        )
+        # Two data files without the column, in a day maintenance compacts.
+        yesterday = NOW.replace(minute=0) - dt.timedelta(days=1)
+        for hour in (yesterday, yesterday + dt.timedelta(hours=1)):
+            write_hour(raw, "pi-a", hour, 2)
+            path = raw / "pi-a" / hour.strftime("%Y-%m-%d/%H.jsonl")
+            rows = to_iceberg.read_rows(path)
+            table.append(pa.Table.from_pylist(rows, schema=old_arrow))
+
+        def columns():
+            table = to_iceberg.open_table(warehouse, uri)
+            return [f.name for f in table.schema().fields]
+
+        # add_columns reports its commit, for the run marker. On a copy of
+        # the old table, so maintenance below still finds the column missing.
+        copy = catalog.create_table(
+            "netmon.traffic_copy", schema=old, partition_spec=to_iceberg.SPEC
+        )
+        commits = []
+        to_iceberg.add_columns(copy, on_commit=commits.append)
+        check("the new column's commit is reported", commits, [copy])
+        catalog.drop_table("netmon.traffic_copy")
+
+        behind = table.metadata.last_updated_ms / 1000 - 120
+        with mock.patch("time.time", return_value=behind):
+            refused = refuses(to_iceberg.add_columns, table)
+        check("no new column with the clock behind", refused, True)
+        check("  so none was added", "nfs_fetched" in columns(), False)
+
+        commits = []
+        to_iceberg.maintain(warehouse, NOW, catalog_uri=uri, on_commit=commits.append)
+        check("maintenance adds the column first", "nfs_fetched" in columns(), True)
+        table = to_iceberg.open_table(warehouse, uri)
+        field = table.schema().find_field("nfs_fetched")
+        check(
+            "  with the schema's id, optional",
+            (field.field_id, field.required),
+            (14, False),
+        )
+        check("  and compacts the old files", len(table.inspect.files()), 1)
+
+        write_hour(raw, "pi-a", NOW.replace(hour=10, minute=0), 3, fetched=7)
+        write_hour(raw, "pi-b", NOW.replace(hour=10, minute=0), 4)  # an older netmon
+        added = to_iceberg.convert(raw, warehouse, NOW, catalog_uri=uri)
+        check("rows added to the evolved table", added, 7)
+        got = to_iceberg.open_table(warehouse, uri).scan().to_arrow()
+        got = got.sort_by([("host", "ascending"), ("ts", "ascending")])
+        check(
+            "nfs_fetched: null when not measured",
+            list(
+                zip(
+                    got["host"].to_pylist(), got["nfs_fetched"].to_pylist(), strict=True
+                )
+            ),
+            [("pi-a", None)] * 4 + [("pi-a", 7)] * 3 + [("pi-b", None)] * 4,
+        )
+        table = to_iceberg.open_table(warehouse, uri)
+        check(
+            "a table with every column isn't changed",
+            to_iceberg.add_columns(table),
+            False,
+        )
+        if uri:
+            to_iceberg.open_catalog(warehouse.resolve(), uri).drop_table(
+                to_iceberg.TABLE
+            )
+
+
 def check_crash_recovery():
     """A run that dies mid-commit, after more commits than the table keeps
     metadata files of, is cleaned up by the next one: main() moves its run
@@ -416,6 +507,7 @@ def main():
     check_backlog_and_clock()
     check_skips()
     check_interfaces()
+    check_new_column()
     check_crash_recovery()
     with tempfile.TemporaryDirectory() as tmp:
         raw, warehouse = Path(tmp) / "raw", Path(tmp) / "warehouse"

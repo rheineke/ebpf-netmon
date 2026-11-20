@@ -26,6 +26,7 @@
 
 #include "capture.h"
 #include "interfaces.h"
+#include "layouts.h"
 #include "netmon.h"
 #include "netmon.skel.h"
 #include "priority_sample.h"
@@ -186,20 +187,22 @@ void print_table(const std::vector<Row> &rows, const Options &opts,
 	char ts[32];
 	std::strftime(ts, sizeof(ts), "%F %T", std::localtime(&now));
 	std::printf("\n%s  bytes in the last %ds\n", ts, interval_s);
-	std::printf("%8s %6s %-16s %9s %9s %9s %9s %9s %9s%s\n", "PID", "UID",
-		    "COMM", "TCP_TX", "TCP_RX", "UDP_TX", "UDP_RX", "NFS_RD",
-		    "NFS_WR", opts.sample ? "    SCALE" : "");
+	std::printf("%8s %6s %-16s %9s %9s %9s %9s %9s %9s %9s%s\n", "PID",
+		    "UID", "COMM", "TCP_TX", "TCP_RX", "UDP_TX", "UDP_RX",
+		    "NFS_RD", "NFS_WR", "NFS_FETCH",
+		    opts.sample ? "    SCALE" : "");
 	size_t n = rows_to_print(rows, opts);
 	for (size_t i = 0; i < n; ++i) {
 		const Row &r = rows[i];
-		std::printf("%8u %6u %-16s %9s %9s %9s %9s %9s %9s", r.pid,
+		std::printf("%8u %6u %-16s %9s %9s %9s %9s %9s %9s %9s", r.pid,
 			    r.uid, r.comm.c_str(),
 			    human(r.delta[NETMON_TCP_TX]).c_str(),
 			    human(r.delta[NETMON_TCP_RX]).c_str(),
 			    human(r.delta[NETMON_UDP_TX]).c_str(),
 			    human(r.delta[NETMON_UDP_RX]).c_str(),
 			    human(r.delta[NETMON_NFS_READ]).c_str(),
-			    human(r.delta[NETMON_NFS_WRITE]).c_str());
+			    human(r.delta[NETMON_NFS_WRITE]).c_str(),
+			    human(r.delta[NETMON_NFS_FETCHED]).c_str());
 		if (opts.sample)
 			std::printf(" %8.2f", r.scale);
 		std::printf("\n");
@@ -221,13 +224,14 @@ bool print_json(std::FILE *out, std::time_t ts, const std::string &host,
 			"\"pid\":%u,\"uid\":%u,"
 			"\"comm\":\"%s\",\"tcp_tx\":%llu,\"tcp_rx\":%llu,"
 			"\"udp_tx\":%llu,\"udp_rx\":%llu,\"nfs_read\":%llu,"
-			"\"nfs_write\":%llu,\"scale\":%.17g}\n",
+			"\"nfs_write\":%llu,\"nfs_fetched\":%llu,"
+			"\"scale\":%.17g}\n",
 			static_cast<long long>(ts), host.c_str(), interval_s,
 			r.pid, r.uid, json_escape(r.comm).c_str(),
 			r.delta[NETMON_TCP_TX], r.delta[NETMON_TCP_RX],
 			r.delta[NETMON_UDP_TX], r.delta[NETMON_UDP_RX],
 			r.delta[NETMON_NFS_READ], r.delta[NETMON_NFS_WRITE],
-			r.scale);
+			r.delta[NETMON_NFS_FETCHED], r.scale);
 	}
 	return std::fflush(out) == 0 && !std::ferror(out);
 }
@@ -347,14 +351,6 @@ constexpr int kCantCount = 3;
 
 int quiet_print(enum libbpf_print_level, const char *, va_list) { return 0; }
 
-// The fields of the sock tracepoints that netmon.bpf.c reads.
-const std::vector<TracepointField> kSockMsgLength = {
-	{"family", offsetof(netmon_sock_msg_length, family), 2},
-	{"protocol", offsetof(netmon_sock_msg_length, protocol), 2},
-	{"ret", offsetof(netmon_sock_msg_length, ret), 4},
-	{"flags", offsetof(netmon_sock_msg_length, flags), 4},
-};
-
 // The sock tracepoints need tracefs, which a container's own /sys lacks.
 // Without CAP_SYS_ADMIN, as under systemd (which mounts it), this fails
 // harmlessly.
@@ -370,16 +366,26 @@ bool is_tracepoint(bpf_program *prog)
 }
 
 // The sock tracepoints are required: without them there is nothing to
-// count but NFS. The kprobes are optional: each is attached on its own, so a
+// count but NFS. The rest are optional: each is attached on its own, so a
 // kernel missing one function still runs the rest, and retried, since NFS
-// functions appear only once the nfs module loads, at the first mount.
+// functions and tracepoints appear only once the nfs module loads, at the
+// first mount. An NFS tracepoint with another layout is never attached.
 class Probes {
 public:
 	explicit Probes(netmon_bpf *skel)
+	    : unmatched_fd_(bpf_map__fd(skel->maps.nfs_unmatched)),
+	      nfs_reads_max_(bpf_map__max_entries(skel->maps.nfs_reads))
 	{
 		bpf_program *prog;
 		bpf_object__for_each_program(prog, skel->obj)
-			probes_.push_back({prog});
+		{
+			Probe p{};
+			p.prog = prog;
+			if (is_tracepoint(prog))
+				p.layout = layout_of(
+					bpf_program__section_name(prog));
+			probes_.push_back(std::move(p));
+		}
 	}
 	Probes(const Probes &) = delete;
 	Probes &operator=(const Probes &) = delete;
@@ -396,19 +402,13 @@ public:
 		mount_tracefs();
 		const std::string root = tracefs_root();
 		for (Probe &p : probes_) {
-			if (!is_tracepoint(p.prog))
+			if (!is_tracepoint(p.prog) || !p.layout.required)
 				continue;
-			// "tracepoint/sock/sock_send_length"
 			std::string name = bpf_program__section_name(p.prog);
-			auto event = name.rfind('/');
-			auto category = name.rfind('/', event - 1);
 			std::string problem =
-				check_tracepoint(root,
-						 name.substr(category + 1,
-							     event - category -
-								     1),
-						 name.substr(event + 1),
-						 kSockMsgLength);
+				check_tracepoint(root, p.layout.category,
+						 p.layout.event,
+						 *p.layout.fields);
 			int status = kCantCount;
 			if (problem.empty()) {
 				p.link = bpf_program__attach(p.prog);
@@ -429,19 +429,36 @@ public:
 		return 0;
 	}
 
-	// Attaches the kprobes it can. Says why for those it can't the first
-	// time, and when a retry succeeds.
+	// Attaches the optional probes it can. Says why for those it can't the
+	// first time, and when a retry succeeds.
 	void attach_optional(bool retry)
 	{
 		libbpf_print_fn_t old_print = nullptr;
 		if (retry)  // libbpf would repeat its warnings every minute
 			old_print = libbpf_set_print(quiet_print);
+		const std::string root = tracefs_root();
 		for (Probe &p : probes_) {
-			if (p.link || is_tracepoint(p.prog))
+			if (p.link || p.refused ||
+			    (is_tracepoint(p.prog) && p.layout.required))
 				continue;
 			const char *name = bpf_program__section_name(p.prog);
-			p.link = bpf_program__attach(p.prog);
-			int err = errno;
+			int err = ENOENT;
+			std::string problem;
+			Readiness ready =
+				is_tracepoint(p.prog)
+					? check_optional(root, p.layout,
+							 problem)
+					: Readiness::kReady;
+			if (ready == Readiness::kRefused) {
+				refuse(p, problem);
+				continue;
+			}
+			if (ready == Readiness::kReady) {
+				p.link = bpf_program__attach(p.prog);
+				err = errno;
+				if (p.link && !p.layout.group.empty())
+					quiet_reports_ = 2;
+			}
 			if (p.link && retry)
 				std::fprintf(stderr, "netmon: attached %s\n",
 					     name);
@@ -451,23 +468,78 @@ public:
 					"netmon: could not attach %s: %s; "
 					"retrying every minute\n",
 					name,
-					err == ENOENT
-						? "no such function in this "
+					err != ENOENT ? std::strerror(err)
+					: is_tracepoint(p.prog)
+						? "no such tracepoint in this "
 						  "kernel yet"
-						: std::strerror(err));
+						: "no such function in this "
+						  "kernel yet");
 		}
 		if (retry)
 			libbpf_set_print(old_print);
 	}
 
-	// Logs kretprobes that lost calls since the last check. The kernel
-	// tracks only so many callers inside a function at once (10 on a
-	// 4-core Pi); the bytes of any more go uncounted.
+	// Logs NFS READ replies that found no recorded reader since the last
+	// check, after the first two reports: until then, replies to READs
+	// started before the tracepoints attached find none either.
+	void report_unmatched()
+	{
+		int ncpus = libbpf_num_possible_cpus();
+		if (ncpus < 1)  // the kernel writes a value for each
+			return;
+		std::vector<netmon_nfs_unmatched> cpus(ncpus);
+		unsigned int zero = 0;
+		if (bpf_map_lookup_elem(unmatched_fd_, &zero, cpus.data()) != 0)
+			return;
+		netmon_nfs_unmatched sum{};
+		for (const netmon_nfs_unmatched &c : cpus) {
+			sum.replies += c.replies;
+			sum.bytes += c.bytes;
+		}
+		if (quiet_reports_ > 0)
+			--quiet_reports_;
+		else if (sum.replies > unmatched_.replies)
+			std::fprintf(stderr,
+				     "netmon: %llu NFS READ replies (%llu "
+				     "bytes) found no recorded reader (over "
+				     "%u READs in flight, a start that was "
+				     "skipped, or identical READs "
+				     "overlapping); their bytes are not "
+				     "counted as nfs_fetched\n",
+				     sum.replies - unmatched_.replies,
+				     sum.bytes - unmatched_.bytes,
+				     nfs_reads_max_);
+		unmatched_ = sum;
+	}
+
+	// Logs calls each probe lost since the last check. The kernel tracks
+	// only so many callers inside a kretprobe's function at once (10 on a
+	// 4-core Pi), and skips every kprobe and tracepoint program that fires
+	// on a CPU while a task there is in a BPF map system call, such as
+	// netmon's own reads of its maps. The bytes of either go uncounted.
 	void report_missed()
 	{
 		for (Probe &p : probes_) {
 			if (!p.link)
 				continue;
+			const char *name = bpf_program__section_name(p.prog);
+			bpf_prog_info prog{};
+			__u32 prog_len = sizeof(prog);
+			if (bpf_prog_get_info_by_fd(bpf_program__fd(p.prog),
+						    &prog, &prog_len) == 0) {
+				if (prog.recursion_misses > p.skipped)
+					std::fprintf(
+						stderr,
+						"netmon: %s skipped %llu calls "
+						"made during a BPF map system "
+						"call on their CPU; their bytes "
+						"are not counted\n",
+						name,
+						static_cast<unsigned long long>(
+							prog.recursion_misses -
+							p.skipped));
+				p.skipped = prog.recursion_misses;
+			}
 			bpf_link_info info{};
 			__u32 len = sizeof(info);
 			if (bpf_link_get_info_by_fd(bpf_link__fd(p.link), &info,
@@ -483,8 +555,7 @@ public:
 					"netmon: %s missed %llu calls, too "
 					"many at once; their bytes are not "
 					"counted\n",
-					bpf_program__section_name(p.prog),
-					missed - p.missed);
+					name, missed - p.missed);
 			p.missed = missed;
 		}
 	}
@@ -493,10 +564,40 @@ private:
 	struct Probe {
 		bpf_program *prog;
 		bpf_link *link = nullptr;
-		unsigned long long missed = 0;
+		unsigned long long missed = 0;  // by a kretprobe
+		unsigned long long skipped = 0;  // recursion_misses
+		TracepointLayout layout;  // for tracepoints
+		bool refused = false;  // a tracepoint with another layout
 	};
 
+	// Never attaches p, with another layout than netmon.bpf.c reads, nor
+	// the rest of its group, which would count nothing without it.
+	void refuse(Probe &p, const std::string &problem)
+	{
+		std::fprintf(stderr, "netmon: not attaching %s:%s\n",
+			     bpf_program__section_name(p.prog),
+			     problem.c_str());
+		for (Probe &q : probes_) {
+			if (&q != &p && (p.layout.group.empty() ||
+					 q.layout.group != p.layout.group))
+				continue;
+			q.refused = true;
+			if (q.link)
+				std::fprintf(stderr, "netmon: detached %s\n",
+					     bpf_program__section_name(q.prog));
+			bpf_link__destroy(q.link);
+			q.link = nullptr;
+		}
+		if (!p.layout.group.empty())
+			std::fprintf(stderr, "netmon: not counting %s\n",
+				     p.layout.group.c_str());
+	}
+
 	std::vector<Probe> probes_;
+	int unmatched_fd_;
+	unsigned int nfs_reads_max_;
+	netmon_nfs_unmatched unmatched_{};
+	int quiet_reports_ = 0;  // reports before logging unmatched replies
 };
 
 int run(netmon_bpf *skel, const Options &opts)
@@ -537,6 +638,7 @@ int run(netmon_bpf *skel, const Options &opts)
 			last_retry = Clock::now();
 		}
 		probes.report_missed();
+		probes.report_unmatched();
 		if (clock_hold.hold(Clock::now() - started, g_stop,
 				    clock_synced)) {
 			if (!said_holding)

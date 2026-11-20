@@ -108,6 +108,10 @@ void test_check_tracepoint()
 	check(check_tracepoint(root, "sock", "sock_recv_length", kExpected)
 		      .empty(),
 	      "reads the format file under the tracefs root");
+	check(tracepoint_exists(root, "sock", "sock_recv_length") &&
+		      !tracepoint_exists(root, "nfs", "nfs_initiate_read") &&
+		      !tracepoint_exists("", "sock", "sock_recv_length"),
+	      "tells whether a tracepoint exists yet");
 	check(check_tracepoint("", "sock", "sock_recv_length", kExpected)
 			      .find("not mounted") != std::string::npos,
 	      "says when tracefs isn't mounted");

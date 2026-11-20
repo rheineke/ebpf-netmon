@@ -122,3 +122,14 @@ check_tracepoint(const std::string &root, const std::string &category,
 	std::ifstream format(path);
 	return check_format(format, expected);
 }
+
+// Whether the tracepoint category:event exists under tracefs root yet. A
+// module's tracepoints (nfs:*) appear only once it loads.
+inline bool tracepoint_exists(const std::string &root,
+			      const std::string &category,
+			      const std::string &event)
+{
+	struct stat st{};
+	std::string path = root + "/events/" + category + "/" + event;
+	return !root.empty() && stat(path.c_str(), &st) == 0;
+}
