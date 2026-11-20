@@ -202,14 +202,19 @@ jobs:
           # The service started before the mount loaded the nfs module, so
           # its NFS probes failed then; it retries them every minute.
           logged() { sudo journalctl -u netmon.service -o cat | grep -q "$1"; }
-          if logged 'could not attach kretprobe/nfs_file_read'; then
+          for probe in kretprobe/nfs_file_read tracepoint/nfs/nfs_initiate_read \
+            tracepoint/nfs/nfs_readpage_done; do
+            logged "could not attach $probe" || continue
             for _ in $(seq 45); do
-              logged 'attached kretprobe/nfs_file_read' && break
+              logged "attached $probe" && break
               sleep 2
             done
-            logged 'attached kretprobe/nfs_file_read' \
-              || { echo "FAIL: the service never attached its NFS probes"; exit 1; }
-            echo "ok  : the service attached its NFS probes on a retry"
+            logged "attached $probe" \
+              || { echo "FAIL: the service never attached $probe"; exit 1; }
+            echo "ok  : the service attached $probe on a retry"
+          done
+          if logged 'not attaching tracepoint/nfs'; then
+            echo "FAIL: this kernel's NFS tracepoints have another layout"; exit 1
           fi
       # The same script a Pi runs, as a non-root user with sudo, so PATH
       # matches a normal Pi login.

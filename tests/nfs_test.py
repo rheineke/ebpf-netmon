@@ -4,12 +4,17 @@ On a machine with an NFS mount, from the repo root:
 
   sudo python3 tests/nfs_test.py FILE_ON_NFS [WRITABLE_DIR_ON_NFS]
 
-Reads FILE_ON_NFS with read() and again with sendfile(), and if a writable
-directory is given, writes and deletes a scratch file there. Passes when
-netmon's nfs_read and nfs_write for this process match the bytes moved.
+Reads FILE_ON_NFS four times: with read() after dropping its cached pages,
+with sendfile() from the page cache, then memory-mapped and with O_DIRECT,
+each after dropping its pages again. If a writable directory is given, writes
+and deletes a scratch file there. Passes when netmon's nfs_read and nfs_write
+for this process match the file bytes it read and wrote (read() and
+sendfile(), not the mapped read), and nfs_fetched the bytes the server sent:
+the file once for each read but the cached one.
 """
 
 import json
+import mmap
 import os
 import socket
 import subprocess
@@ -24,12 +29,39 @@ if not os.path.exists(NETMON):
 WRITE_BYTES = 8 * 1024 * 1024
 
 
+def drop_cache(path):
+    """Drops the file's clean pages, so the next read goes to the server."""
+    with open(path, "rb") as f:
+        os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+
+
 def read_file(path):
     total = 0
     with open(path, "rb") as f:
         while chunk := f.read(1 << 20):
             total += len(chunk)
     return total
+
+
+def mmap_file(path):
+    """Touches every page: page faults read it, not read() (no nfs_read)."""
+    with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
+        sum(m[i] for i in range(0, len(m), mmap.PAGESIZE))
+        return len(m)
+
+
+def direct_read_file(path):
+    """O_DIRECT in 1 MiB requests, which ask for more than the file has left
+    at the end: the server sends only what there is."""
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+    try:
+        with mmap.mmap(-1, 1 << 20) as buf:  # page-aligned
+            total = 0
+            while n := os.preadv(fd, [buf], total):
+                total += n
+            return total
+    finally:
+        os.close(fd)
 
 
 def sendfile_file(path):
@@ -72,7 +104,16 @@ def main():
     )
     time.sleep(1.5)  # let the probes attach and the baseline read happen
 
-    want = {"nfs_read": read_file(sys.argv[1]) + sendfile_file(sys.argv[1])}
+    path = sys.argv[1]
+    drop_cache(path)
+    cold = read_file(path)
+    warm = sendfile_file(path)  # from the page cache: nothing fetched
+    drop_cache(path)
+    mapped = mmap_file(path)
+    drop_cache(path)
+    direct = direct_read_file(path)
+    # O_DIRECT reads are read() calls too; memory-mapped ones are not.
+    want = {"nfs_read": cold + warm + direct, "nfs_fetched": cold + mapped + direct}
     if len(sys.argv) == 3:
         want["nfs_write"] = write_file(sys.argv[2])
     print(f"moved: {want}", flush=True)

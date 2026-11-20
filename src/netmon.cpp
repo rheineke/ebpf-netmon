@@ -26,6 +26,7 @@
 
 #include "capture.h"
 #include "interfaces.h"
+#include "layouts.h"
 #include "netmon.h"
 #include "netmon.skel.h"
 #include "priority_sample.h"
@@ -186,20 +187,22 @@ void print_table(const std::vector<Row> &rows, const Options &opts,
 	char ts[32];
 	std::strftime(ts, sizeof(ts), "%F %T", std::localtime(&now));
 	std::printf("\n%s  bytes in the last %ds\n", ts, interval_s);
-	std::printf("%8s %6s %-16s %9s %9s %9s %9s %9s %9s%s\n", "PID", "UID",
-		    "COMM", "TCP_TX", "TCP_RX", "UDP_TX", "UDP_RX", "NFS_RD",
-		    "NFS_WR", opts.sample ? "    SCALE" : "");
+	std::printf("%8s %6s %-16s %9s %9s %9s %9s %9s %9s %9s%s\n", "PID",
+		    "UID", "COMM", "TCP_TX", "TCP_RX", "UDP_TX", "UDP_RX",
+		    "NFS_RD", "NFS_WR", "NFS_FETCH",
+		    opts.sample ? "    SCALE" : "");
 	size_t n = rows_to_print(rows, opts);
 	for (size_t i = 0; i < n; ++i) {
 		const Row &r = rows[i];
-		std::printf("%8u %6u %-16s %9s %9s %9s %9s %9s %9s", r.pid,
+		std::printf("%8u %6u %-16s %9s %9s %9s %9s %9s %9s %9s", r.pid,
 			    r.uid, r.comm.c_str(),
 			    human(r.delta[NETMON_TCP_TX]).c_str(),
 			    human(r.delta[NETMON_TCP_RX]).c_str(),
 			    human(r.delta[NETMON_UDP_TX]).c_str(),
 			    human(r.delta[NETMON_UDP_RX]).c_str(),
 			    human(r.delta[NETMON_NFS_READ]).c_str(),
-			    human(r.delta[NETMON_NFS_WRITE]).c_str());
+			    human(r.delta[NETMON_NFS_WRITE]).c_str(),
+			    human(r.delta[NETMON_NFS_FETCHED]).c_str());
 		if (opts.sample)
 			std::printf(" %8.2f", r.scale);
 		std::printf("\n");
@@ -221,13 +224,14 @@ bool print_json(std::FILE *out, std::time_t ts, const std::string &host,
 			"\"pid\":%u,\"uid\":%u,"
 			"\"comm\":\"%s\",\"tcp_tx\":%llu,\"tcp_rx\":%llu,"
 			"\"udp_tx\":%llu,\"udp_rx\":%llu,\"nfs_read\":%llu,"
-			"\"nfs_write\":%llu,\"scale\":%.17g}\n",
+			"\"nfs_write\":%llu,\"nfs_fetched\":%llu,"
+			"\"scale\":%.17g}\n",
 			static_cast<long long>(ts), host.c_str(), interval_s,
 			r.pid, r.uid, json_escape(r.comm).c_str(),
 			r.delta[NETMON_TCP_TX], r.delta[NETMON_TCP_RX],
 			r.delta[NETMON_UDP_TX], r.delta[NETMON_UDP_RX],
 			r.delta[NETMON_NFS_READ], r.delta[NETMON_NFS_WRITE],
-			r.scale);
+			r.delta[NETMON_NFS_FETCHED], r.scale);
 	}
 	return std::fflush(out) == 0 && !std::ferror(out);
 }
@@ -347,14 +351,6 @@ constexpr int kCantCount = 3;
 
 int quiet_print(enum libbpf_print_level, const char *, va_list) { return 0; }
 
-// The fields of the sock tracepoints that netmon.bpf.c reads.
-const std::vector<TracepointField> kSockMsgLength = {
-	{"family", offsetof(netmon_sock_msg_length, family), 2},
-	{"protocol", offsetof(netmon_sock_msg_length, protocol), 2},
-	{"ret", offsetof(netmon_sock_msg_length, ret), 4},
-	{"flags", offsetof(netmon_sock_msg_length, flags), 4},
-};
-
 // The sock tracepoints need tracefs, which a container's own /sys lacks.
 // Without CAP_SYS_ADMIN, as under systemd (which mounts it), this fails
 // harmlessly.
@@ -370,16 +366,24 @@ bool is_tracepoint(bpf_program *prog)
 }
 
 // The sock tracepoints are required: without them there is nothing to
-// count but NFS. The kprobes are optional: each is attached on its own, so a
+// count but NFS. The rest are optional: each is attached on its own, so a
 // kernel missing one function still runs the rest, and retried, since NFS
-// functions appear only once the nfs module loads, at the first mount.
+// functions and tracepoints appear only once the nfs module loads, at the
+// first mount. An NFS tracepoint with another layout is never attached.
 class Probes {
 public:
 	explicit Probes(netmon_bpf *skel)
 	{
 		bpf_program *prog;
 		bpf_object__for_each_program(prog, skel->obj)
-			probes_.push_back({prog});
+		{
+			Probe p{};
+			p.prog = prog;
+			if (is_tracepoint(prog))
+				p.layout = layout_of(
+					bpf_program__section_name(prog));
+			probes_.push_back(std::move(p));
+		}
 	}
 	Probes(const Probes &) = delete;
 	Probes &operator=(const Probes &) = delete;
@@ -396,19 +400,13 @@ public:
 		mount_tracefs();
 		const std::string root = tracefs_root();
 		for (Probe &p : probes_) {
-			if (!is_tracepoint(p.prog))
+			if (!is_tracepoint(p.prog) || !p.layout.required)
 				continue;
-			// "tracepoint/sock/sock_send_length"
 			std::string name = bpf_program__section_name(p.prog);
-			auto event = name.rfind('/');
-			auto category = name.rfind('/', event - 1);
 			std::string problem =
-				check_tracepoint(root,
-						 name.substr(category + 1,
-							     event - category -
-								     1),
-						 name.substr(event + 1),
-						 kSockMsgLength);
+				check_tracepoint(root, p.layout.category,
+						 p.layout.event,
+						 *p.layout.fields);
 			int status = kCantCount;
 			if (problem.empty()) {
 				p.link = bpf_program__attach(p.prog);
@@ -429,19 +427,29 @@ public:
 		return 0;
 	}
 
-	// Attaches the kprobes it can. Says why for those it can't the first
-	// time, and when a retry succeeds.
+	// Attaches the optional probes it can. Says why for those it can't the
+	// first time, and when a retry succeeds.
 	void attach_optional(bool retry)
 	{
 		libbpf_print_fn_t old_print = nullptr;
 		if (retry)  // libbpf would repeat its warnings every minute
 			old_print = libbpf_set_print(quiet_print);
+		const std::string root = tracefs_root();
 		for (Probe &p : probes_) {
-			if (p.link || is_tracepoint(p.prog))
+			if (p.link || p.refused ||
+			    (is_tracepoint(p.prog) && p.layout.required))
 				continue;
 			const char *name = bpf_program__section_name(p.prog);
-			p.link = bpf_program__attach(p.prog);
-			int err = errno;
+			int err = ENOENT;
+			if (is_tracepoint(p.prog) &&
+			    !check_layout(p, root, name))
+				continue;
+			if (!is_tracepoint(p.prog) ||
+			    tracepoint_exists(root, p.layout.category,
+					      p.layout.event)) {
+				p.link = bpf_program__attach(p.prog);
+				err = errno;
+			}
 			if (p.link && retry)
 				std::fprintf(stderr, "netmon: attached %s\n",
 					     name);
@@ -451,10 +459,12 @@ public:
 					"netmon: could not attach %s: %s; "
 					"retrying every minute\n",
 					name,
-					err == ENOENT
-						? "no such function in this "
+					err != ENOENT ? std::strerror(err)
+					: is_tracepoint(p.prog)
+						? "no such tracepoint in this "
 						  "kernel yet"
-						: std::strerror(err));
+						: "no such function in this "
+						  "kernel yet");
 		}
 		if (retry)
 			libbpf_set_print(old_print);
@@ -494,7 +504,29 @@ private:
 		bpf_program *prog;
 		bpf_link *link = nullptr;
 		unsigned long long missed = 0;
+		TracepointLayout layout;  // for tracepoints
+		bool refused = false;  // a tracepoint with another layout
 	};
+
+	// For an optional tracepoint that exists: whether its layout is the
+	// one netmon.bpf.c reads. If not, says why and never tries it again.
+	bool check_layout(Probe &p, const std::string &root, const char *name)
+	{
+		if (!tracepoint_exists(root, p.layout.category, p.layout.event))
+			return true;  // not yet; attaching says so
+		std::string problem =
+			p.layout.fields
+				? check_tracepoint(root, p.layout.category,
+						   p.layout.event,
+						   *p.layout.fields)
+				: " netmon doesn't know its layout";
+		if (problem.empty())
+			return true;
+		std::fprintf(stderr, "netmon: not attaching %s:%s\n", name,
+			     problem.c_str());
+		p.refused = true;
+		return false;
+	}
 
 	std::vector<Probe> probes_;
 };
