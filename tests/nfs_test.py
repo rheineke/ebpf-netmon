@@ -311,9 +311,8 @@ def main():
         sys.exit("FAIL: netmon disagrees with the NFS bytes moved")
     if "nfs_sent" in want:
         server = written_after - written_before
-        print(
-            f"nfs_sent of this test's processes {sent_by_test}, serverwritebytes {server}"
-        )
+        print(f"nfs_sent of the test's processes {sent_by_test}", end=", ")
+        print(f"serverwritebytes {server}")
         if sent_by_test != server:
             sys.exit("FAIL: nfs_sent disagrees with the kernel's count")
     print("PASS")
