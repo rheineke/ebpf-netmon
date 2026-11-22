@@ -44,6 +44,17 @@ jobs:
           scripts/install_clickhouse.sh /var/lib/netmon-test/warehouse \
             /var/lib/netmon-test/raw
           .venv/bin/python tests/dashboard_test.py check /var/lib/netmon-test
+          # A re-run that can't see a table, as with the share down, fails
+          # but keeps the table, which works again when the folder is back.
+          tables=/var/lib/netmon-test/warehouse/netmon
+          sudo mv $tables/interfaces $tables/interfaces.away
+          if scripts/install_clickhouse.sh /var/lib/netmon-test/warehouse \
+            /var/lib/netmon-test/raw; then
+            echo "FAIL: installed without the interfaces table" >&2
+            exit 1
+          fi
+          sudo mv $tables/interfaces.away $tables/interfaces
+          .venv/bin/python tests/dashboard_test.py check /var/lib/netmon-test
           sudo .venv/bin/python tests/dashboard_test.py convert /var/lib/netmon-test
           .venv/bin/python tests/dashboard_test.py check /var/lib/netmon-test
           sudo .venv/bin/python tests/dashboard_test.py maintain /var/lib/netmon-test

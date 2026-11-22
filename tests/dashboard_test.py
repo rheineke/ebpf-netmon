@@ -8,18 +8,21 @@
   uv run tests/dashboard_test.py stray DIR     # REST catalog only; again
 
 load writes four hours of known traffic from two hosts, ending in the
-last finished hour, with their interfaces' counters, to DIR/raw, converts
-the first three into DIR/warehouse, and then spoils one of them, which the
-live views must not open. The converter's own next run would load the fourth.
+last finished hour, with their interfaces' counters, to DIR/raw, and
+converts the first three into DIR/warehouse. It adds pi-a's first hour
+again, ten days earlier, in Iceberg only, and then spoils one of the
+converted raw files, which the live views must not open. The converter's
+own next run would load the fourth.
 check runs every panel of grafana/dashboards/netmon.json through
 clickhouse-client, as Grafana's user, with Grafana's macros filled in, and
 checks the totals, so the live view must add the last hour from the raw
 files. It also runs every alert rule's query, and the high-traffic rule's
 over rows made for its window too, which needs the dev dependencies (uv
-sync). convert loads that hour too, and maintain compacts
-the table and expires its old snapshots, as a month later; the totals must
-not change. stray adds a copy of the table's first metadata file, numbered
-after the rest, which only a catalog read ignores.
+sync), and checks that a time range reaches the Iceberg tables through the
+views, which then open only its days. convert loads that hour too, and
+maintain compacts the table and expires its old snapshots, as a month
+later; the totals must not change. stray adds a copy of the table's first
+metadata file, numbered after the rest, which only a catalog read ignores.
 
 With $NETMON_TEST_CATALOG (a SQLAlchemy URI), the table is in that catalog,
 and check also expects ClickHouse to read it through the REST catalog
@@ -56,6 +59,7 @@ INTERFACES = {
 for counts in INTERFACES.values():
     counts.append(("veth1a2b3c", 10_000, 9, 10_000, 9))
 COVERAGE = {"pi-a": 1.0, "pi-b": 0.5}
+OLD_DAYS = 10  # old_hour's offset: outside the live views' last two days
 START = None  # the first hour; load picks it, the others read it from DIR
 CATALOG = os.environ.get("NETMON_TEST_CATALOG")
 
@@ -162,6 +166,25 @@ def load(test_dir):
     odd.write_text(json.dumps(row) + "\n")
 
 
+def old_hour(test_dir):
+    """Loads pi-a's first hour again, OLD_DAYS earlier, into each table but
+    not RAW: a day the live views, which look for hours not loaded yet in the
+    last two, must not open."""
+    sys.path.insert(0, str(ROOT / "tools"))
+    import pyarrow as pa
+    import to_iceberg
+
+    day = test_dir / "raw" / "pi-a" / f"{START:%Y-%m-%d}"
+    for kind in to_iceberg.KINDS:
+        rows = to_iceberg.read_rows(day / f"{START:%H}{kind.suffix}", kind)
+        for row in rows:
+            row["ts"] -= dt.timedelta(days=OLD_DAYS)
+        table = to_iceberg.open_table(test_dir / "warehouse", CATALOG, kind)
+        table.append(pa.Table.from_pylist(rows, schema=kind.arrow))
+        count = test_dir / f"iceberg_rows.{kind.name}"
+        count.write_text(str(int(count.read_text()) + len(rows)))
+
+
 def spoil_converted(test_dir):
     """Appends garbage to an hour already in Iceberg. The live view must skip
     that file without opening it: over 100 bad lines would fail its query."""
@@ -221,8 +244,9 @@ def check(test_dir):
     dash = json.loads((ROOT / "grafana/dashboards/netmon.json").read_text())
     per_host = HOURS * ROWS * SCALE  # each counter's weight per host
     iceberg = query("SELECT count() AS n FROM netmon.traffic")[0]["n"]
+    old = ROWS  # old_hour's
     nulls = "SELECT countIf(nfs_fetched IS NULL) AS n FROM netmon.traffic"
-    converted = 1 if int(iceberg) < 2 * HOURS * ROWS else 2  # of OLD_HOURS
+    converted = 1 if int(iceberg) - old < 2 * HOURS * ROWS else 2  # of OLD_HOURS
     check_eq(
         "rows without nfs_fetched, in Iceberg",
         int(query(nulls)[0]["n"]),
@@ -230,22 +254,28 @@ def check(test_dir):
     )
     nulls = nulls.replace("netmon.traffic", "netmon.traffic_live")
     check_eq("rows without nfs_fetched, live", int(query(nulls)[0]["n"]), 2 * ROWS)
-    # The live view would hide a stale table, so check it by itself too.
+    # Through the REST catalog, or else the newest metadata file.
     if CATALOG:
-        sql = "SELECT create_table_query AS q FROM system.tables"
-        sql += " WHERE database = 'netmon' AND name = 'traffic'"
+        sql = "SELECT engine FROM system.databases WHERE name = 'netmon_lake'"
         check_eq(
-            "read through the REST catalog", "netmon_lake" in query(sql)[0]["q"], True
+            "read through the REST catalog", query(sql)[0]["engine"], "DataLakeCatalog"
         )
+    else:
+        sql = "SELECT name, engine FROM system.tables"
+        sql += " WHERE database = 'netmon_lake'"
+        got = {r["name"]: r["engine"] for r in query(sql)}
+        want = dict.fromkeys(("netmon.traffic", "netmon.interfaces"), "IcebergLocal")
+        check_eq("read as IcebergLocal tables", got, want)
+    # The live view would hide a stale table, so check it by itself too.
     want = int((test_dir / "iceberg_rows.traffic").read_text())
     check_eq("Iceberg rows, as the converter left them", int(iceberg), want)
     live = query("SELECT count() AS n FROM netmon.traffic_live")[0]["n"]
-    check_eq("live rows", int(live), HOURS * ROWS * 2)
+    check_eq("live rows", int(live), HOURS * ROWS * 2 + old)
     iceberg = query("SELECT count() AS n FROM netmon.interfaces")[0]["n"]
     want = int((test_dir / "iceberg_rows.interfaces").read_text())
     check_eq("Iceberg interface rows, as the converter left them", int(iceberg), want)
     live = query("SELECT count() AS n FROM netmon.interfaces_live")[0]["n"]
-    check_eq("live interface rows", int(live), HOURS * ROWS * 2 * 3)
+    check_eq("live interface rows", int(live), (HOURS * ROWS * 2 + old) * 3)
     hosts = [r["host"] for r in query(dash["templating"]["list"][0]["query"])]
     check_eq("host variable", hosts, ["pi-a", "pi-b"])
     for panel in dash["panels"]:
@@ -295,39 +325,108 @@ def check(test_dir):
             check_eq(f"{title}: pids", {r["pids"] for r in rows}, {1})
     check_bucket_rates(dash)
     check_alerts()
-    check_locked_down()
+    check_pruned()
+    check_locked_down(test_dir)
     print("PASS")
 
 
-def check_locked_down():
-    """Grafana's user can't reach files, URLs or its limits but by the views,
-    and can set the time limits Grafana's plugin asks for."""
+def profile_events(sql):
+    """Runs sql as Grafana's user; returns its profile events' totals."""
+    out = subprocess.run(
+        [
+            "clickhouse-client",
+            "--user",
+            "grafana",
+            "--print-profile-events",
+            "--profile-events-delay-ms=-1",
+            "-q",
+            sql,
+        ],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+    )
+    if out.returncode:
+        sys.exit(f"FAIL: {out.stderr.strip()}\n{sql}")
+    events = {}
+    for name, n in re.findall(r"\] (\w+): (\d+) \(increment\)", out.stderr):
+        events[name] = events.get(name, 0) + int(n)
+    return events
+
+
+def check_pruned():
+    """A query's time range reaches each Iceberg table through the views, so
+    a range with no rows opens none of its data files, and the live views
+    look for hours not loaded yet in the last two days only. A view that runs
+    as another user stops the range on ClickHouse 26.11 and later, which then
+    open every file of the table, so only the views of raw files may."""
+    sql = "SELECT name, extract(create_table_query, 'SQL SECURITY ([A-Z]+)')"
+    sql += " AS s FROM system.tables WHERE database = 'netmon'"
+    got = {r["name"]: r["s"] for r in query(sql)}
+    want = {}
+    for table in ("traffic", "interfaces"):
+        want |= {table: "INVOKER", f"{table}_live": "INVOKER"}
+        want[f"{table}_raw"] = "DEFINER"
+    check_eq("views' SQL SECURITY", got, want)
+    found = "IcebergMetadataReturnedObjectInfos"  # data files to read
+    for table in ("traffic", "interfaces"):
+        files = profile_events(f"SELECT max(ts) FROM netmon.{table}").get(found, 0)
+        check_eq(f"{table}: data files", files > 1, True)  # old_hour's day too
+        for view in (table, f"{table}_live", f"{table}_raw"):
+            sql = f"SELECT max(ts) FROM netmon.{view}"
+            if view != f"{table}_raw":
+                sql += " WHERE ts < '2000-01-01'"
+            events = profile_events(sql)
+            pruned = events.get("IcebergPartitionPrunedFiles", 0)
+            pruned += events.get("IcebergMinMaxIndexPrunedFiles", 0)
+            name = f"{view}, no rows in range"
+            if view == table:
+                check_eq(f"{name}: {files} files pruned", pruned, files)
+                check_eq(f"{name}: files read", events.get(found, 0), 0)
+            elif view.endswith("_live"):
+                # And each of its raw rows' two subqueries old_hour's file.
+                want = f"{files} + 2 files pruned"
+                check_eq(f"{name}: {want}", pruned >= files + 2, True)
+            else:
+                check_eq(f"{view}: old_hour's file pruned twice", pruned >= 2, True)
+
+
+def check_locked_down(test_dir):
+    """Grafana's user can't reach files, URLs or its limits but by the views
+    and the Iceberg tables, and can set the time limits Grafana's plugin
+    asks for."""
     denied, limited = "ACCESS_DENIED", "SETTING_CONSTRAINT_VIOLATION"
+    warehouse = test_dir.resolve() / "warehouse/netmon/traffic"
     probes = [
         ("SELECT count() FROM file('**/*.jsonl', 'LineAsString')", denied),
         ("INSERT INTO FUNCTION file('grafana.txt', 'LineAsString') SELECT 'x'", denied),
         ("SELECT * FROM url('http://127.0.0.1:8123/', 'LineAsString')", denied),
+        (f"SELECT count() FROM icebergLocal('{warehouse}')", denied),
         ("DROP VIEW netmon.traffic_live", denied),
         ("DROP VIEW netmon.interfaces_live", denied),
+        ("DROP VIEW netmon.traffic_raw", denied),
+        ("DROP TABLE netmon_lake.`netmon.traffic`", denied),
         ("SELECT 1 SETTINGS max_memory_usage = 0", limited),
         ("SELECT 1 SETTINGS max_execution_time = 0", limited),
         ("SELECT 1 SETTINGS max_execution_time = 600", limited),
     ]
-    if CATALOG:
-        probes.append(("SELECT count() FROM netmon_lake.`netmon.traffic`", denied))
-        probes.append(("SELECT count() FROM netmon_lake.`netmon.interfaces`", denied))
     for sql, error in probes:
         out = subprocess.run(
             ["clickhouse-client", "--user", "grafana", "-q", sql],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
         )
-        check_eq(f"refused: {sql}", f"({error})" in out.stderr, True)
+        # Nightlies refuse writes for readonly before checking grants.
+        refused = f"({error})" in out.stderr
+        refused |= sql.startswith("INSERT") and "(READONLY)" in out.stderr
+        check_eq(f"refused: {sql}", refused, True)
     # The plugin sends its query timeout plus 5 s: 64 for panels, 34 for alerts.
     for seconds in (64, 34):
         sql = "SELECT count() AS n FROM netmon.traffic_live"
         sql += f" SETTINGS max_execution_time = {seconds}"
-        check_eq(f"max_execution_time {seconds}", query(sql)[0]["n"], HOURS * ROWS * 2)
+        want = HOURS * ROWS * 2 + ROWS  # and old_hour's
+        check_eq(f"max_execution_time {seconds}", query(sql)[0]["n"], want)
 
 
 def check_high_traffic(title, sql, limit):
@@ -429,6 +528,7 @@ if __name__ == "__main__":
     START = dt.datetime.fromisoformat((test_dir / "start").read_text())
     if sys.argv[1] == "load":
         convert(test_dir, HOURS - 1)  # the last hour stays raw
+        old_hour(test_dir)
         spoil_converted(test_dir)
     elif sys.argv[1] == "convert":
         convert(test_dir, HOURS)
