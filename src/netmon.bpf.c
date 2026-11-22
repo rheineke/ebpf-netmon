@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: (MIT OR GPL-2.0-only)
 /*
  * Per-process TCP/UDP byte counts, NFS file bytes read and written, and the
- * NFS file bytes fetched from the server for each process's reads.
+ * NFS file bytes the server sent for each process's reads and took for its
+ * writes.
  *
  * Nothing here reads kernel structs, only tracepoint records, integer return
  * values and process ids, so this needs no CO-RE and no kernel BTF.
@@ -283,5 +284,148 @@ int nfs_readpage_done(const struct netmon_nfs_readpage_done *r)
 	struct netmon_nfs_read_key next = {};
 	if (netmon_nfs_read_retry(r, &next))
 		expect_reply(&next, &reader);
+	return 0;
+}
+
+/*
+ * File bytes the NFS server took for a process's writes. A write() fills
+ * the page cache, and the client sends the dirty pages later: mostly from a
+ * kernel thread (writeback), or on fsync() or close(), when the pages of
+ * several writers may go out together. So nfs_file_write records each
+ * write()'s process as the writer of the file's 1 MiB chunks it covers, and
+ * of the file; nfs_update_folio records the writer of a page dirtied
+ * through a mapping, whose position it doesn't tell, as the file's; and
+ * nfs_writeback_done charges each WRITE's reply to the chunk's last writer,
+ * or failing that, the file's. Writers of the same chunk between two
+ * WRITEs are charged as the last; a reply with neither recorded (pages
+ * dirtied before netmon attached) is counted in nfs_unmatched.
+ */
+struct nfs_writer {
+	__u32 tgid;
+	__u32 uid;
+	char comm[NETMON_COMM_LEN];
+};
+
+/*
+ * 16384 chunks: the last 16 GiB written. LRU, so the chunks written
+ * longest ago age out; lookups at each reply keep a file's alive.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 16384);
+	__type(key, struct netmon_nfs_write_key);
+	__type(value, struct nfs_writer);
+} nfs_writers SEC(".maps");
+
+/* A write() records at most this many chunks; the file's entry covers the
+ * rest. */
+#define NFS_WRITE_CHUNKS 64
+
+static __always_inline void current_writer(struct nfs_writer *w)
+{
+	w->tgid = bpf_get_current_pid_tgid() >> 32;
+	w->uid = (__u32)bpf_get_current_uid_gid();
+	bpf_get_current_comm(w->comm, sizeof(w->comm));
+}
+
+/* Records w as key's writer, unless it already is: a lookup is cheaper
+ * than an update, and a write() dirties many pages. */
+static __always_inline void set_writer(const struct netmon_nfs_write_key *key,
+				       const struct nfs_writer *w)
+{
+	struct nfs_writer *found = bpf_map_lookup_elem(&nfs_writers, key);
+	if (found && found->tgid == w->tgid && found->uid == w->uid)
+		return;
+	bpf_map_update_elem(&nfs_writers, key, w, BPF_ANY);
+}
+
+SEC("tracepoint/nfs/nfs_file_write")
+int nfs_file_write_start(const struct netmon_nfs_file_write *r)
+{
+	if (!r->count)
+		return 0;
+	struct nfs_writer w = {};
+	current_writer(&w);
+	struct netmon_nfs_write_key key = {};
+	key.fileid = r->fileid;
+	key.dev = r->dev;
+	key.fhandle = r->fhandle;
+	key.chunk = NETMON_NFS_WHOLE_FILE;
+	set_writer(&key, &w);
+	__u64 first = netmon_nfs_chunk(r->offset);
+	__u64 last = netmon_nfs_chunk(r->offset + (long long)(r->count - 1));
+	for (int i = 0; i < NFS_WRITE_CHUNKS; i++) {
+		if (first + i > last)
+			break;
+		key.chunk = first + i;
+		set_writer(&key, &w);
+	}
+	return 0;
+}
+
+SEC("tracepoint/nfs/nfs_update_folio")
+int nfs_update_folio(const struct netmon_nfs_update_folio *r)
+{
+	struct nfs_writer w = {};
+	current_writer(&w);
+	struct netmon_nfs_write_key key = {};
+	key.fileid = r->fileid;
+	key.dev = r->dev;
+	key.fhandle = r->fhandle;
+	key.chunk = NETMON_NFS_WHOLE_FILE;
+	set_writer(&key, &w);
+	return 0;
+}
+
+/* Counts the bytes of a WRITE reply no recorded writer is waiting for. */
+static __always_inline void unmatched_write(__u32 bytes, int first)
+{
+	__u32 zero = 0;
+	struct netmon_nfs_unmatched *u =
+		bpf_map_lookup_elem(&nfs_unmatched, &zero);
+	if (u) { /* plain adds, as in unmatched() */
+		u->write_replies += first;
+		u->write_bytes += bytes;
+	}
+}
+
+/*
+ * A WRITE covers at most wsize bytes (1 MiB at most on Linux), so two
+ * chunks; up to four parts allows for larger, the last taking the rest.
+ */
+#define NFS_REPLY_PARTS 4
+
+SEC("tracepoint/nfs/nfs_writeback_done")
+int nfs_writeback_done(const struct netmon_nfs_writeback_done *r)
+{
+	struct netmon_nfs_write_key key = {};
+	key.fileid = r->fileid;
+	key.dev = r->dev;
+	key.fhandle = r->fhandle;
+	long long offset = r->offset;
+	__u32 left = r->res_count; /* what mountstats counts as written */
+	int first_unmatched = 1;
+	for (int i = 0; i < NFS_REPLY_PARTS && left; i++) {
+		__u32 part = i == NFS_REPLY_PARTS - 1
+				     ? left
+				     : netmon_nfs_chunk_bytes(offset, left);
+		key.chunk = netmon_nfs_chunk(offset);
+		struct nfs_writer *found =
+			bpf_map_lookup_elem(&nfs_writers, &key);
+		if (!found) {
+			key.chunk = NETMON_NFS_WHOLE_FILE;
+			found = bpf_map_lookup_elem(&nfs_writers, &key);
+		}
+		if (found) {
+			struct nfs_writer w = *found;
+			add_bytes(w.tgid, w.uid, w.comm, NETMON_NFS_SENT, part,
+				  0);
+		} else {
+			unmatched_write(part, first_unmatched);
+			first_unmatched = 0;
+		}
+		offset += part;
+		left -= part;
+	}
 	return 0;
 }

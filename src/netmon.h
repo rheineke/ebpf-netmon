@@ -11,6 +11,7 @@ enum netmon_counter {
 	NETMON_NFS_READ, /* file bytes, not wire bytes; see netmon.bpf.c */
 	NETMON_NFS_WRITE,
 	NETMON_NFS_FETCHED, /* file bytes the NFS server sent; see netmon.bpf.c */
+	NETMON_NFS_SENT, /* file bytes the NFS server took; see netmon.bpf.c */
 	NETMON_NR_COUNTERS,
 };
 
@@ -93,8 +94,91 @@ netmon_nfs_read_retry(const struct netmon_nfs_readpage_done *r,
 	return 1;
 }
 
-/* Replies netmon.bpf.c found no reader for, and their bytes, per CPU. */
+/*
+ * The records of nfs:nfs_file_write, at the start of each write() to an NFS
+ * file (kernels after 6.15), nfs:nfs_update_folio, as a write() or a store through
+ * a mapping dirties a page, and nfs:nfs_writeback_done, as the server
+ * answers a WRITE. Checked against tracefs like the others.
+ */
+struct netmon_nfs_file_write {
+	unsigned long long common;
+	unsigned int dev;
+	unsigned int fhandle;
+	unsigned long long fileid;
+	unsigned long long version;
+	long long offset; /* the file position */
+	unsigned long long count; /* bytes to write */
+	int flags; /* IOCB_* */
+};
+
+struct netmon_nfs_update_folio {
+	unsigned long long common;
+	unsigned int dev;
+	unsigned int fhandle;
+	unsigned long long fileid;
+	unsigned long long version;
+	long long offset; /* in the page, not the file */
+	unsigned long long count;
+};
+
+struct netmon_nfs_writeback_done {
+	unsigned long long common;
+	unsigned int dev;
+	unsigned int fhandle;
+	unsigned long long fileid;
+	long long offset;
+	unsigned int arg_count; /* bytes sent */
+	unsigned int res_count; /* bytes the server took */
+	int error;
+	unsigned long long stable;
+	char verifier[8];
+};
+
+/*
+ * The key of netmon.bpf.c's map of NFS writers: a file's chunk of
+ * 1 << NETMON_NFS_CHUNK_SHIFT bytes, chunk = offset >> NETMON_NFS_CHUNK_SHIFT,
+ * or with chunk NETMON_NFS_WHOLE_FILE, the file.
+ */
+#define NETMON_NFS_CHUNK_SHIFT 20
+#define NETMON_NFS_WHOLE_FILE (~0ULL)
+
+struct netmon_nfs_write_key {
+	unsigned long long fileid;
+	unsigned long long chunk;
+	unsigned int dev;
+	unsigned int fhandle;
+};
+
+/* The chunk holding file position offset. */
+static inline unsigned long long netmon_nfs_chunk(long long offset)
+{
+	return offset < 0
+		       ? 0
+		       : (unsigned long long)offset >> NETMON_NFS_CHUNK_SHIFT;
+}
+
+/*
+ * How many of bytes, starting at file position offset, fall in offset's
+ * chunk: a WRITE's bytes past that belong to the next chunk.
+ */
+static inline unsigned int netmon_nfs_chunk_bytes(long long offset,
+						  unsigned int bytes)
+{
+	unsigned long long next = (netmon_nfs_chunk(offset) + 1)
+				  << NETMON_NFS_CHUNK_SHIFT;
+	unsigned long long left =
+		next - (unsigned long long)(offset < 0 ? 0 : offset);
+	return bytes < left ? bytes : (unsigned int)left;
+}
+
+/*
+ * NFS replies netmon.bpf.c found no process for, and their bytes, per CPU:
+ * READ replies with no recorded reader, WRITE replies with no recorded
+ * writer.
+ */
 struct netmon_nfs_unmatched {
 	unsigned long long replies;
 	unsigned long long bytes;
+	unsigned long long write_replies;
+	unsigned long long write_bytes;
 };

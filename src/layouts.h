@@ -35,6 +35,25 @@ inline const std::vector<TracepointField> kNfsReadpageDone = {
 	{"eof", offsetof(netmon_nfs_readpage_done, eof), 1},
 	{"error", offsetof(netmon_nfs_readpage_done, error), 4},
 };
+inline const std::vector<TracepointField> kNfsFileWrite = {
+	{"dev", offsetof(netmon_nfs_file_write, dev), 4},
+	{"fhandle", offsetof(netmon_nfs_file_write, fhandle), 4},
+	{"fileid", offsetof(netmon_nfs_file_write, fileid), 8},
+	{"offset", offsetof(netmon_nfs_file_write, offset), 8},
+	{"count", offsetof(netmon_nfs_file_write, count), 8},
+};
+inline const std::vector<TracepointField> kNfsUpdateFolio = {
+	{"dev", offsetof(netmon_nfs_update_folio, dev), 4},
+	{"fhandle", offsetof(netmon_nfs_update_folio, fhandle), 4},
+	{"fileid", offsetof(netmon_nfs_update_folio, fileid), 8},
+};
+inline const std::vector<TracepointField> kNfsWritebackDone = {
+	{"dev", offsetof(netmon_nfs_writeback_done, dev), 4},
+	{"fhandle", offsetof(netmon_nfs_writeback_done, fhandle), 4},
+	{"fileid", offsetof(netmon_nfs_writeback_done, fileid), 8},
+	{"offset", offsetof(netmon_nfs_writeback_done, offset), 8},
+	{"res_count", offsetof(netmon_nfs_writeback_done, res_count), 4},
+};
 
 // The layout netmon.bpf.c expects of the tracepoint a program's section
 // names ("tracepoint/sock/sock_send_length"), and whether netmon needs it.
@@ -44,6 +63,9 @@ struct TracepointLayout {
 	bool required = false;
 	// Tracepoints that count only together, refused together.
 	std::string group;
+	// A tracepoint of the same category without which this one counts
+	// nothing useful: until it exists, this one waits as if missing.
+	std::string needs;
 };
 
 inline TracepointLayout layout_of(const std::string &section)
@@ -62,6 +84,18 @@ inline TracepointLayout layout_of(const std::string &section)
 	} else if (l.event == "nfs_readpage_done") {
 		l.fields = &kNfsReadpageDone;
 		l.group = "nfs_fetched";
+	} else if (l.event == "nfs_file_write") {
+		l.fields = &kNfsFileWrite;
+		l.group = "nfs_sent";
+	} else if (l.event == "nfs_writeback_done") {
+		// Older kernels have it, but not nfs_file_write: every reply
+		// would find no writer.
+		l.fields = &kNfsWritebackDone;
+		l.group = "nfs_sent";
+		l.needs = "nfs_file_write";
+	} else if (l.event == "nfs_update_folio") {
+		l.fields = &kNfsUpdateFolio;
+		l.needs = "nfs_file_write";
 	}
 	return l;
 }
@@ -73,14 +107,20 @@ enum class Readiness {
 };
 
 // Whether an optional tracepoint under tracefs root can be attached, and
-// if refused, why, in problem. Decided once per try, so a tracepoint that
-// appears meanwhile is never attached unchecked.
+// if refused, why, in problem; if missing because the one it needs is,
+// which, in problem too. Decided once per try, so a tracepoint that appears
+// meanwhile is never attached unchecked.
 inline Readiness check_optional(const std::string &root,
 				const TracepointLayout &l, std::string &problem)
 {
 	problem.clear();
 	if (!tracepoint_exists(root, l.category, l.event))
 		return Readiness::kMissing;
+	if (!l.needs.empty() && !tracepoint_exists(root, l.category, l.needs)) {
+		problem = "it needs " + l.category + ":" + l.needs +
+			  ", which this kernel doesn't have yet";
+		return Readiness::kMissing;
+	}
 	if (!l.fields) {
 		problem = " netmon doesn't know its layout";
 		return Readiness::kRefused;
