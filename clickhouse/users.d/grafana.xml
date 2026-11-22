@@ -39,7 +39,6 @@
             <profile>default</profile>
             <quota>default</quota>
             <grants>
-                <query>GRANT SELECT ON netmon.*</query>
                 <!-- The Iceberg tables (install_clickhouse.sh). -->
                 <query>GRANT SELECT ON netmon_lake.`netmon.traffic`</query>
                 <query>GRANT SELECT ON netmon_lake.`netmon.interfaces`</query>

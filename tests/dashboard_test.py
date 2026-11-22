@@ -8,10 +8,11 @@
   uv run tests/dashboard_test.py stray DIR     # REST catalog only; again
 
 load writes four hours of known traffic from two hosts, ending in the
-last finished hour, with their interfaces' counters, to DIR/raw, converts
-the first three into DIR/warehouse, and then spoils one of them, which the
-live views must not open, and pi-a's first hour again, ten days earlier,
-in Iceberg only. The converter's own next run would load the fourth.
+last finished hour, with their interfaces' counters, to DIR/raw, and
+converts the first three into DIR/warehouse. It adds pi-a's first hour
+again, ten days earlier, in Iceberg only, and then spoils one of the
+converted raw files, which the live views must not open. The converter's
+own next run would load the fourth.
 check runs every panel of grafana/dashboards/netmon.json through
 clickhouse-client, as Grafana's user, with Grafana's macros filled in, and
 checks the totals, so the live view must add the last hour from the raw
@@ -19,10 +20,9 @@ files. It also runs every alert rule's query, and the high-traffic rule's
 over rows made for its window too, which needs the dev dependencies (uv
 sync), and checks that a time range reaches the Iceberg tables through the
 views, which then open only its days. convert loads that hour too, and
-maintain compacts
-the table and expires its old snapshots, as a month later; the totals must
-not change. stray adds a copy of the table's first metadata file, numbered
-after the rest, which only a catalog read ignores.
+maintain compacts the table and expires its old snapshots, as a month
+later; the totals must not change. stray adds a copy of the table's first
+metadata file, numbered after the rest, which only a catalog read ignores.
 
 With $NETMON_TEST_CATALOG (a SQLAlchemy URI), the table is in that catalog,
 and check also expects ClickHouse to read it through the REST catalog
@@ -384,10 +384,11 @@ def check_pruned():
                 check_eq(f"{name}: {files} files pruned", pruned, files)
                 check_eq(f"{name}: files read", events.get(found, 0), 0)
             elif view.endswith("_live"):
-                # Its raw rows' subqueries prune old_hour's day too.
-                check_eq(f"{name}: over {files} files pruned", pruned > files, True)
+                # And each of its raw rows' two subqueries old_hour's file.
+                want = f"{files} + 2 files pruned"
+                check_eq(f"{name}: {want}", pruned >= files + 2, True)
             else:
-                check_eq(f"{view}: old_hour's day pruned", pruned > 0, True)
+                check_eq(f"{view}: old_hour's file pruned twice", pruned >= 2, True)
 
 
 def check_locked_down(test_dir):
