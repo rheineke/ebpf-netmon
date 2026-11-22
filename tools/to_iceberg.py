@@ -73,7 +73,7 @@ TABLE = "netmon.traffic"
 COUNTERS = ["tcp_tx", "tcp_rx", "udp_tx", "udp_rx", "nfs_read", "nfs_write"]
 # Counters added once tables existed, which Iceberg adds only as optional
 # columns (add_columns): null for rows from a netmon without them.
-LATER_COUNTERS = ["nfs_fetched"]
+LATER_COUNTERS = ["nfs_fetched", "nfs_sent"]
 
 SCHEMA = Schema(
     NestedField(1, "ts", TimestamptzType(), required=True),

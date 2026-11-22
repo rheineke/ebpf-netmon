@@ -187,22 +187,23 @@ void print_table(const std::vector<Row> &rows, const Options &opts,
 	char ts[32];
 	std::strftime(ts, sizeof(ts), "%F %T", std::localtime(&now));
 	std::printf("\n%s  bytes in the last %ds\n", ts, interval_s);
-	std::printf("%8s %6s %-16s %9s %9s %9s %9s %9s %9s %9s%s\n", "PID",
+	std::printf("%8s %6s %-16s %9s %9s %9s %9s %9s %9s %9s %9s%s\n", "PID",
 		    "UID", "COMM", "TCP_TX", "TCP_RX", "UDP_TX", "UDP_RX",
-		    "NFS_RD", "NFS_WR", "NFS_FETCH",
+		    "NFS_RD", "NFS_WR", "NFS_FETCH", "NFS_SENT",
 		    opts.sample ? "    SCALE" : "");
 	size_t n = rows_to_print(rows, opts);
 	for (size_t i = 0; i < n; ++i) {
 		const Row &r = rows[i];
-		std::printf("%8u %6u %-16s %9s %9s %9s %9s %9s %9s %9s", r.pid,
-			    r.uid, r.comm.c_str(),
+		std::printf("%8u %6u %-16s %9s %9s %9s %9s %9s %9s %9s %9s",
+			    r.pid, r.uid, r.comm.c_str(),
 			    human(r.delta[NETMON_TCP_TX]).c_str(),
 			    human(r.delta[NETMON_TCP_RX]).c_str(),
 			    human(r.delta[NETMON_UDP_TX]).c_str(),
 			    human(r.delta[NETMON_UDP_RX]).c_str(),
 			    human(r.delta[NETMON_NFS_READ]).c_str(),
 			    human(r.delta[NETMON_NFS_WRITE]).c_str(),
-			    human(r.delta[NETMON_NFS_FETCHED]).c_str());
+			    human(r.delta[NETMON_NFS_FETCHED]).c_str(),
+			    human(r.delta[NETMON_NFS_SENT]).c_str());
 		if (opts.sample)
 			std::printf(" %8.2f", r.scale);
 		std::printf("\n");
@@ -210,29 +211,17 @@ void print_table(const std::vector<Row> &rows, const Options &opts,
 	std::fflush(stdout);
 }
 
-// Returns false if the write failed, e.g. the disk is full.
+// Returns false if the write failed, e.g. the disk is full. Without sent,
+// rows leave out nfs_sent, which netmon isn't counting: null, not 0.
 bool print_json(std::FILE *out, std::time_t ts, const std::string &host,
 		const std::vector<Row> &rows, const Options &opts,
-		int interval_s)
+		int interval_s, bool sent)
 {
 	size_t n = rows_to_print(rows, opts);
-	for (size_t i = 0; i < n; ++i) {
-		const Row &r = rows[i];
-		std::fprintf(
-			out,
-			"{\"ts\":%lld,\"host\":\"%s\",\"interval_s\":%d,"
-			"\"pid\":%u,\"uid\":%u,"
-			"\"comm\":\"%s\",\"tcp_tx\":%llu,\"tcp_rx\":%llu,"
-			"\"udp_tx\":%llu,\"udp_rx\":%llu,\"nfs_read\":%llu,"
-			"\"nfs_write\":%llu,\"nfs_fetched\":%llu,"
-			"\"scale\":%.17g}\n",
-			static_cast<long long>(ts), host.c_str(), interval_s,
-			r.pid, r.uid, json_escape(r.comm).c_str(),
-			r.delta[NETMON_TCP_TX], r.delta[NETMON_TCP_RX],
-			r.delta[NETMON_UDP_TX], r.delta[NETMON_UDP_RX],
-			r.delta[NETMON_NFS_READ], r.delta[NETMON_NFS_WRITE],
-			r.delta[NETMON_NFS_FETCHED], r.scale);
-	}
+	for (size_t i = 0; i < n; ++i)
+		std::fputs(json_row(ts, host, interval_s, rows[i], sent)
+				   .c_str(),
+			   out);
 	return std::fflush(out) == 0 && !std::ferror(out);
 }
 
@@ -374,7 +363,8 @@ class Probes {
 public:
 	explicit Probes(netmon_bpf *skel)
 	    : unmatched_fd_(bpf_map__fd(skel->maps.nfs_unmatched)),
-	      nfs_reads_max_(bpf_map__max_entries(skel->maps.nfs_reads))
+	      nfs_reads_max_(bpf_map__max_entries(skel->maps.nfs_reads)),
+	      nfs_writers_max_(bpf_map__max_entries(skel->maps.nfs_writers))
 	{
 		bpf_program *prog;
 		bpf_object__for_each_program(prog, skel->obj)
@@ -458,6 +448,8 @@ public:
 				err = errno;
 				if (p.link && !p.layout.group.empty())
 					quiet_reports_ = 2;
+				if (p.link && p.layout.group == "nfs_sent")
+					sent_since_ = Clock::now();
 			}
 			if (p.link && retry)
 				std::fprintf(stderr, "netmon: attached %s\n",
@@ -468,7 +460,8 @@ public:
 					"netmon: could not attach %s: %s; "
 					"retrying every minute\n",
 					name,
-					err != ENOENT ? std::strerror(err)
+					err != ENOENT      ? std::strerror(err)
+					: !problem.empty() ? problem.c_str()
 					: is_tracepoint(p.prog)
 						? "no such tracepoint in this "
 						  "kernel yet"
@@ -479,9 +472,10 @@ public:
 			libbpf_set_print(old_print);
 	}
 
-	// Logs NFS READ replies that found no recorded reader since the last
-	// check, after the first two reports: until then, replies to READs
-	// started before the tracepoints attached find none either.
+	// Logs NFS READ and WRITE replies that found no recorded reader or
+	// writer since the last check, after the first two reports: until then,
+	// replies to READs started before the tracepoints attached find none
+	// either. Pages written before then may go out much later.
 	void report_unmatched()
 	{
 		int ncpus = libbpf_num_possible_cpus();
@@ -495,21 +489,57 @@ public:
 		for (const netmon_nfs_unmatched &c : cpus) {
 			sum.replies += c.replies;
 			sum.bytes += c.bytes;
+			sum.write_replies += c.write_replies;
+			sum.write_bytes += c.write_bytes;
 		}
-		if (quiet_reports_ > 0)
+		// Pages written before netmon attached go out up to about 35 s
+		// later (writeback's 30 s, then its 5 s rounds).
+		bool quiet_writes =
+			Clock::now() - sent_since_ < std::chrono::minutes(1);
+		if (quiet_reports_ > 0) {
 			--quiet_reports_;
-		else if (sum.replies > unmatched_.replies)
-			std::fprintf(stderr,
-				     "netmon: %llu NFS READ replies (%llu "
-				     "bytes) found no recorded reader (over "
-				     "%u READs in flight, a start that was "
-				     "skipped, or identical READs "
-				     "overlapping); their bytes are not "
-				     "counted as nfs_fetched\n",
-				     sum.replies - unmatched_.replies,
-				     sum.bytes - unmatched_.bytes,
-				     nfs_reads_max_);
+		} else {
+			if (sum.replies > unmatched_.replies)
+				std::fprintf(
+					stderr,
+					"netmon: %llu NFS READ replies (%llu "
+					"bytes) found no recorded reader "
+					"(over %u READs in flight, a start "
+					"that was skipped, or identical READs "
+					"overlapping); their bytes are not "
+					"counted as nfs_fetched\n",
+					sum.replies - unmatched_.replies,
+					sum.bytes - unmatched_.bytes,
+					nfs_reads_max_);
+			if (sum.write_replies > unmatched_.write_replies &&
+			    !quiet_writes)
+				std::fprintf(
+					stderr,
+					"netmon: %llu NFS WRITE replies (%llu "
+					"bytes) found no recorded writer "
+					"(pages written before netmon "
+					"attached, a write that was skipped, "
+					"over %u MiBs written since, pNFS or "
+					"swap); "
+					"their bytes are not counted as "
+					"nfs_sent\n",
+					sum.write_replies -
+						unmatched_.write_replies,
+					sum.write_bytes -
+						unmatched_.write_bytes,
+					nfs_writers_max_);
+		}
 		unmatched_ = sum;
+	}
+
+	// Whether netmon counts nfs_sent: nfs_writeback_done is attached, which
+	// it is only with nfs_file_write there.
+	bool counts_sent() const
+	{
+		for (const Probe &p : probes_)
+			if (p.link && p.layout.event == "nfs_writeback_done")
+				return true;
+		return false;
 	}
 
 	// Logs calls each probe lost since the last check. The kernel tracks
@@ -596,6 +626,9 @@ private:
 	std::vector<Probe> probes_;
 	int unmatched_fd_;
 	unsigned int nfs_reads_max_;
+	unsigned int nfs_writers_max_;
+	using Clock = std::chrono::steady_clock;
+	Clock::time_point sent_since_{};  // when an nfs_sent probe attached
 	netmon_nfs_unmatched unmatched_{};
 	int quiet_reports_ = 0;  // reports before logging unmatched replies
 };
@@ -664,7 +697,8 @@ int run(netmon_bpf *skel, const Options &opts)
 		std::time_t ts = g_stop ? std::time(nullptr) : due;
 		std::FILE *out = opts.out_dir.empty() ? stdout : files.at(ts);
 		if (!out ||
-		    !print_json(out, ts, host, rows, opts, interval_s) ||
+		    !print_json(out, ts, host, rows, opts, interval_s,
+				probes.counts_sent()) ||
 		    (interfaces && !interfaces->write(ts, host, interval_s))) {
 			std::fprintf(stderr, "netmon: write failed\n");
 			return 1;

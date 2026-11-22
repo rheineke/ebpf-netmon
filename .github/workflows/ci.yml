@@ -200,6 +200,8 @@ jobs:
       # A loopback NFS export on the runner.
       - name: NFS test
         run: |
+          # nfs_sent needs nfs:nfs_file_write, which kernels 6.18 and later have.
+          echo "kernel $(uname -r)"
           sudo apt-get install -y -qq nfs-kernel-server
           sudo mkdir -p /srv/nfstest /mnt/nfstest
           echo "/srv/nfstest 127.0.0.1(rw,sync,no_subtree_check,no_root_squash)" \
@@ -214,7 +216,11 @@ jobs:
           # its NFS probes failed then; it retries them every minute.
           logged() { sudo journalctl -u netmon.service -o cat | grep -q "$1"; }
           for probe in kretprobe/nfs_file_read tracepoint/nfs/nfs_initiate_read \
-            tracepoint/nfs/nfs_readpage_done; do
+            tracepoint/nfs/nfs_readpage_done tracepoint/nfs/nfs_file_write \
+            tracepoint/nfs/nfs_writepage_setup \
+            tracepoint/nfs/nfs_initiate_write \
+            tracepoint/nfs/nfs_direct_write_schedule_iovec \
+            tracepoint/nfs/nfs_writeback_done; do
             logged "could not attach $probe" || continue
             for _ in $(seq 45); do
               logged "attached $probe" && break

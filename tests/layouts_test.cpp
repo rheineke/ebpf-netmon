@@ -1,6 +1,7 @@
 // Checks the record layouts netmon.bpf.c reads against the format files of a
 // Raspberry Pi kernel (6.18.60+rpt-rpi-v8), which tracepoints netmon needs,
-// when it attaches an optional one, and when an NFS READ is retried.
+// when it attaches an optional one, when an NFS READ is retried, and how a
+// WRITE's reply splits into chunks.
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -48,6 +49,57 @@ const char *kReadpageDone =
 	"\tfield:bool eof;\toffset:40;\tsize:1;\tsigned:0;\n"
 	"\tfield:int error;\toffset:44;\tsize:4;\tsigned:1;\n";
 
+// events/nfs/nfs_file_write/format
+const char *kFileWrite =
+	"\tfield:dev_t dev;\toffset:8;\tsize:4;\tsigned:0;\n"
+	"\tfield:u32 fhandle;\toffset:12;\tsize:4;\tsigned:0;\n"
+	"\tfield:u64 fileid;\toffset:16;\tsize:8;\tsigned:0;\n"
+	"\tfield:u64 version;\toffset:24;\tsize:8;\tsigned:0;\n"
+	"\tfield:loff_t offset;\toffset:32;\tsize:8;\tsigned:1;\n"
+	"\tfield:size_t count;\toffset:40;\tsize:8;\tsigned:0;\n"
+	"\tfield:int flags;\toffset:48;\tsize:4;\tsigned:1;\n";
+
+// events/nfs/nfs_writepage_setup/format
+const char *kWritepageSetup =
+	"\tfield:dev_t dev;\toffset:8;\tsize:4;\tsigned:0;\n"
+	"\tfield:u32 fhandle;\toffset:12;\tsize:4;\tsigned:0;\n"
+	"\tfield:u64 fileid;\toffset:16;\tsize:8;\tsigned:0;\n"
+	"\tfield:const struct nfs_page * req;\toffset:24;\tsize:8;\tsigned:0;\n"
+	"\tfield:loff_t offset;\toffset:32;\tsize:8;\tsigned:1;\n"
+	"\tfield:unsigned int count;\toffset:40;\tsize:4;\tsigned:0;\n"
+	"\tfield:unsigned long flags;\toffset:48;\tsize:8;\tsigned:0;\n";
+
+// events/nfs/nfs_direct_write_schedule_iovec/format
+const char *kDirectWrite =
+	"\tfield:dev_t dev;\toffset:8;\tsize:4;\tsigned:0;\n"
+	"\tfield:u64 fileid;\toffset:16;\tsize:8;\tsigned:0;\n"
+	"\tfield:u32 fhandle;\toffset:24;\tsize:4;\tsigned:0;\n"
+	"\tfield:loff_t offset;\toffset:32;\tsize:8;\tsigned:1;\n"
+	"\tfield:ssize_t count;\toffset:40;\tsize:8;\tsigned:1;\n"
+	"\tfield:ssize_t error;\toffset:48;\tsize:8;\tsigned:1;\n"
+	"\tfield:int flags;\toffset:56;\tsize:4;\tsigned:1;\n";
+
+// events/nfs/nfs_initiate_write/format
+const char *kInitiateWrite =
+	"\tfield:dev_t dev;\toffset:8;\tsize:4;\tsigned:0;\n"
+	"\tfield:u32 fhandle;\toffset:12;\tsize:4;\tsigned:0;\n"
+	"\tfield:u64 fileid;\toffset:16;\tsize:8;\tsigned:0;\n"
+	"\tfield:loff_t offset;\toffset:24;\tsize:8;\tsigned:1;\n"
+	"\tfield:u32 count;\toffset:32;\tsize:4;\tsigned:0;\n"
+	"\tfield:unsigned long stable;\toffset:40;\tsize:8;\tsigned:0;\n";
+
+// events/nfs/nfs_writeback_done/format
+const char *kWritebackDone =
+	"\tfield:dev_t dev;\toffset:8;\tsize:4;\tsigned:0;\n"
+	"\tfield:u32 fhandle;\toffset:12;\tsize:4;\tsigned:0;\n"
+	"\tfield:u64 fileid;\toffset:16;\tsize:8;\tsigned:0;\n"
+	"\tfield:loff_t offset;\toffset:24;\tsize:8;\tsigned:1;\n"
+	"\tfield:u32 arg_count;\toffset:32;\tsize:4;\tsigned:0;\n"
+	"\tfield:u32 res_count;\toffset:36;\tsize:4;\tsigned:0;\n"
+	"\tfield:int error;\toffset:40;\tsize:4;\tsigned:1;\n"
+	"\tfield:unsigned long stable;\toffset:48;\tsize:8;\tsigned:0;\n"
+	"\tfield:char verifier[8];\toffset:56;\tsize:8;\tsigned:0;\n";
+
 std::string problems(const char *fields,
 		     const std::vector<TracepointField> &expected)
 {
@@ -77,6 +129,24 @@ void test_nfs_layouts()
 			      : "a moved fhandle is reported (readpage_done)");
 	}
 
+	check(problems(kFileWrite, kNfsFileWrite).empty(),
+	      "nfs_file_write matches the struct netmon.bpf.c reads");
+	check(problems(kDirectWrite, kNfsDirectWrite).empty(),
+	      "nfs_direct_write_schedule_iovec matches the struct netmon.bpf.c "
+	      "reads");
+	check(problems(kWritepageSetup, kNfsWritepageSetup).empty(),
+	      "nfs_writepage_setup matches the struct netmon.bpf.c reads");
+	check(problems(kWritebackDone, kNfsWritebackDone).empty(),
+	      "nfs_writeback_done matches the struct netmon.bpf.c reads");
+	check(problems(kInitiateWrite, kNfsInitiateWrite).empty(),
+	      "nfs_initiate_write matches the struct netmon.bpf.c reads");
+	std::string narrow(kFileWrite);  // a 32-bit size_t
+	narrow.replace(narrow.find("size_t count;\toffset:40;\tsize:8"), 31,
+		       "size_t count;\toffset:40;\tsize:4");
+	check(problems(narrow.c_str(), kNfsFileWrite).find("count") !=
+		      std::string::npos,
+	      "a 4-byte count in nfs_file_write is reported");
+
 	// An older kernel's nfs_readpage_done, with one count for both.
 	std::string old(kReadpageDone);
 	old.replace(old.find("arg_count"), 9, "count");
@@ -98,11 +168,32 @@ void test_layout_of()
 	TracepointLayout done = layout_of("tracepoint/nfs/nfs_readpage_done");
 	check(done.fields == &kNfsReadpageDone && !done.required,
 	      "nfs_readpage_done is optional");
-	check(!layout_of("tracepoint/nfs/nfs_writeback_done").fields,
+	check(!layout_of("tracepoint/nfs/nfs_commit_done").fields,
 	      "a tracepoint netmon has no layout for has none");
 	check(init.group == "nfs_fetched" && done.group == init.group &&
 		      send.group.empty(),
 	      "the NFS tracepoints are refused together");
+	TracepointLayout write = layout_of("tracepoint/nfs/nfs_file_write");
+	TracepointLayout wb = layout_of("tracepoint/nfs/nfs_writeback_done");
+	TracepointLayout page = layout_of("tracepoint/nfs/nfs_writepage_setup");
+	TracepointLayout direct =
+		layout_of("tracepoint/nfs/nfs_direct_write_schedule_iovec");
+	TracepointLayout iw = layout_of("tracepoint/nfs/nfs_initiate_write");
+	check(iw.fields == &kNfsInitiateWrite && !iw.required &&
+		      iw.group == "nfs_sent" && iw.needs == "nfs_file_write",
+	      "nfs_initiate_write counts with the other write tracepoints");
+	check(write.fields == &kNfsFileWrite &&
+		      wb.fields == &kNfsWritebackDone &&
+		      page.fields == &kNfsWritepageSetup &&
+		      direct.fields == &kNfsDirectWrite && !write.required &&
+		      !wb.required && !page.required && !direct.required,
+	      "the NFS write tracepoints are optional");
+	check(write.group == "nfs_sent" && wb.group == write.group &&
+		      page.group == write.group && direct.group == write.group,
+	      "the NFS write tracepoints are refused together");
+	check(wb.needs == "nfs_file_write" && page.needs == "nfs_file_write" &&
+		      direct.needs == "nfs_file_write" && write.needs.empty(),
+	      "the others wait for nfs_file_write");
 }
 
 void test_check_optional()
@@ -139,6 +230,20 @@ void test_check_optional()
 	unknown.fields = nullptr;
 	check(check_optional(root, unknown, problem) == Readiness::kRefused,
 	      "one whose layout netmon doesn't know is refused");
+
+	// An older kernel: nfs_writeback_done, but no nfs_file_write.
+	TracepointLayout wb = layout_of("tracepoint/nfs/nfs_writeback_done");
+	std::filesystem::path wb_dir = root / "events/nfs/nfs_writeback_done";
+	std::filesystem::create_directories(wb_dir);
+	std::ofstream(wb_dir / "format") << kCommon << kWritebackDone;
+	check(check_optional(root, wb, problem) == Readiness::kMissing &&
+		      problem.find("nfs:nfs_file_write") != std::string::npos,
+	      "one whose needed tracepoint is missing waits, saying which");
+	std::filesystem::path fw_dir = root / "events/nfs/nfs_file_write";
+	std::filesystem::create_directories(fw_dir);
+	std::ofstream(fw_dir / "format") << kCommon << kFileWrite;
+	check(check_optional(root, wb, problem) == Readiness::kReady,
+	      "and is ready once it appears");
 	std::filesystem::remove_all(root);
 }
 
@@ -177,6 +282,100 @@ void test_read_retry()
 	      "isn't");
 }
 
+void test_write_resend()
+{
+	netmon_nfs_writeback_done r{};
+	r.fileid = 7;
+	r.dev = 3;
+	r.fhandle = 9;
+	r.offset = 1 << 20;
+	r.arg_count = 524288;
+	r.res_count = 131072;
+	r.stable = 2;  // FILE_SYNC
+	netmon_nfs_direct_key next{};
+	check(netmon_nfs_write_resend(&r, &next) == 1 &&
+		      next.offset == (1 << 20) + 131072 &&
+		      next.count == 524288 - 131072 && next.fileid == 7 &&
+		      next.dev == 3 && next.fhandle == 9,
+	      "a short stable WRITE is resent from where it stopped");
+	r.stable = 0;  // UNSTABLE
+	check(netmon_nfs_write_resend(&r, &next) == 1 &&
+		      next.offset == (1 << 20) && next.count == 524288,
+	      "a short UNSTABLE WRITE is resent whole");
+	r.res_count = r.arg_count;
+	check(!netmon_nfs_write_resend(&r, &next), "a full WRITE isn't");
+	r.res_count = 0;
+	check(!netmon_nfs_write_resend(&r, &next),
+	      "nor one the server took none of");
+	r.res_count = 4096;
+	r.error = -5;
+	check(!netmon_nfs_write_resend(&r, &next), "nor a failed one");
+}
+
+void test_direct_takes()
+{
+	const long long mib = 1LL << 20;
+	netmon_nfs_direct_pending p{};
+	p.fileid = 7;
+	p.dev = 3;
+	p.next = -1;
+	p.end = mib;  // the length asked for
+	netmon_nfs_initiate_write r{};
+	r.fileid = 7;
+	r.dev = 3;
+	r.fhandle = 99;  // a pNFS data server's
+	r.offset = 4 * mib;
+	r.count = 524288;
+	check(!netmon_nfs_direct_takes(&p, &r),
+	      "a WRITE before schedule_iovec gives the position isn't taken "
+	      "(the flush of the file's dirty pages)");
+	netmon_nfs_direct_start(&p, 4 * mib);
+	check(p.next == 4 * mib && p.end == 5 * mib,
+	      "schedule_iovec gives where the write() starts and ends");
+	netmon_nfs_direct_start(&p, 0);
+	check(p.next == 4 * mib && p.end == 5 * mib, "only once");
+	check(netmon_nfs_direct_takes(&p, &r),
+	      "the O_DIRECT write()'s first WRITE is taken");
+	r.offset = 4 * mib + 524288;
+	check(netmon_nfs_direct_takes(&p, &r),
+	      "a later one is too, past one netmon missed");
+	p.next = 5 * mib;  // its last WRITE started
+	r.offset = 4 * mib;
+	r.count = 4096;
+	check(!netmon_nfs_direct_takes(&p, &r),
+	      "a page laundered behind its last WRITE isn't");
+	p.next = 4 * mib;
+	r.offset = 4 * mib - 4096;
+	check(!netmon_nfs_direct_takes(&p, &r), "nor one before it starts");
+	r.offset = 4 * mib;
+	r.count = mib + 4096;
+	check(!netmon_nfs_direct_takes(&p, &r), "nor one past the length");
+	r.count = 4096;
+	r.fileid = 8;
+	check(!netmon_nfs_direct_takes(&p, &r), "nor another file's");
+	r.fileid = 7;
+	r.dev = 4;
+	check(!netmon_nfs_direct_takes(&p, &r), "nor another mount's");
+}
+
+void test_chunks()
+{
+	const long long mib = 1LL << 20;
+	check(netmon_nfs_chunk(0) == 0 && netmon_nfs_chunk(mib - 1) == 0 &&
+		      netmon_nfs_chunk(mib) == 1 &&
+		      netmon_nfs_chunk(5 * mib + 7) == 5 &&
+		      netmon_nfs_chunk(-1) == 0,
+	      "a position's chunk is its MiB");
+	check(netmon_nfs_chunk_bytes(0, 131072) == 131072 &&
+		      netmon_nfs_chunk_bytes(mib - 131072, 131072) == 131072,
+	      "a WRITE inside one chunk stays whole");
+	check(netmon_nfs_chunk_bytes(mib - 4096, 131072) == 4096 &&
+		      netmon_nfs_chunk_bytes(mib, 131072) == 131072,
+	      "a WRITE across a chunk's end splits there");
+	check(netmon_nfs_chunk_bytes(3 * mib, 4u << 20) == mib,
+	      "a WRITE longer than a chunk takes a chunk at a time");
+}
+
 }  // namespace
 
 int main()
@@ -185,6 +384,9 @@ int main()
 	test_layout_of();
 	test_check_optional();
 	test_read_retry();
+	test_write_resend();
+	test_direct_takes();
+	test_chunks();
 	if (failures)
 		std::printf("%d failed\n", failures);
 	return failures ? 1 : 0;

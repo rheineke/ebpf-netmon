@@ -162,10 +162,31 @@ void test_clock_hold()
 	      "reports at once when stopping");
 }
 
+void test_json_row()
+{
+	Row r{};
+	r.pid = 42;
+	r.uid = 1000;
+	r.comm = "dd";
+	r.delta[NETMON_NFS_SENT] = 1234;
+	r.delta[NETMON_NFS_FETCHED] = 7;
+	r.scale = 1;
+	std::string with = json_row(1792666260, "pi", 10, r, true);
+	std::string without = json_row(1792666260, "pi", 10, r, false);
+	check(with.find("\"nfs_fetched\":7,\"nfs_sent\":1234,\"scale\":1}") !=
+		      std::string::npos,
+	      "a row has nfs_sent when netmon counts it");
+	check(without.find("nfs_sent") == std::string::npos &&
+		      without.find("\"nfs_fetched\":7,\"scale\":1}") !=
+			      std::string::npos,
+	      "and leaves it out, for null, when it doesn't");
+}
+
 }  // namespace
 
 int main()
 {
+	test_json_row();
 	test_deltas();
 	test_walk_restart();
 	test_interval_seconds();

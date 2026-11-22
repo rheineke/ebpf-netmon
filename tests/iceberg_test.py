@@ -31,7 +31,7 @@ DAY = 86400
 NOW = dt.datetime(2026, 10, 22, 12, 30, tzinfo=dt.UTC)
 
 
-def write_hour(raw, host, start, rows, extra="", fetched=None):
+def write_hour(raw, host, start, rows, extra="", fetched=None, sent=None):
     path = raw / host / start.strftime("%Y-%m-%d") / start.strftime("%H.jsonl")
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
@@ -54,6 +54,8 @@ def write_hour(raw, host, start, rows, extra="", fetched=None):
             }
             if fetched is not None:  # netmon writes it since nfs_fetched
                 row["nfs_fetched"] = fetched
+            if sent is not None:  # and this since nfs_sent
+                row["nfs_sent"] = sent
             f.write(json.dumps(row) + "\n")
         f.write(extra)
 
@@ -390,13 +392,12 @@ def check_interfaces():
 
 
 def check_new_column():
-    """A table made before nfs_fetched gets the column at the next run, load
-    or maintenance, as an optional one with the schema's id, null for rows
-    that lack it, but not with the clock behind."""
-    old = Schema(*(f for f in to_iceberg.SCHEMA.fields if f.name != "nfs_fetched"))
-    old_arrow = pa.schema(
-        [f for f in to_iceberg.ARROW_SCHEMA if f.name != "nfs_fetched"]
-    )
+    """A table made before nfs_fetched and nfs_sent gets the columns at the
+    next run, load or maintenance, as optional ones with the schema's ids, null
+    for rows that lack them, but not with the clock behind."""
+    later = set(to_iceberg.LATER_COUNTERS)
+    old = Schema(*(f for f in to_iceberg.SCHEMA.fields if f.name not in later))
+    old_arrow = pa.schema([f for f in to_iceberg.ARROW_SCHEMA if f.name not in later])
     uri = os.environ.get("NETMON_TEST_CATALOG")  # else SQLite in the warehouse
     with tempfile.TemporaryDirectory() as tmp:
         raw, warehouse = Path(tmp) / "raw", Path(tmp) / "warehouse"
@@ -439,17 +440,17 @@ def check_new_column():
 
         commits = []
         to_iceberg.maintain(warehouse, NOW, catalog_uri=uri, on_commit=commits.append)
-        check("maintenance adds the column first", "nfs_fetched" in columns(), True)
+        check("maintenance adds the columns first", later <= set(columns()), True)
         table = to_iceberg.open_table(warehouse, uri)
-        field = table.schema().find_field("nfs_fetched")
+        fields = [table.schema().find_field(name) for name in to_iceberg.LATER_COUNTERS]
         check(
-            "  with the schema's id, optional",
-            (field.field_id, field.required),
-            (14, False),
+            "  with the schema's ids, optional",
+            [(f.name, f.field_id, f.required) for f in fields],
+            [("nfs_fetched", 14, False), ("nfs_sent", 15, False)],
         )
         check("  and compacts the old files", len(table.inspect.files()), 1)
 
-        write_hour(raw, "pi-a", NOW.replace(hour=10, minute=0), 3, fetched=7)
+        write_hour(raw, "pi-a", NOW.replace(hour=10, minute=0), 3, fetched=7, sent=8)
         write_hour(raw, "pi-b", NOW.replace(hour=10, minute=0), 4)  # an older netmon
         added = to_iceberg.convert(raw, warehouse, NOW, catalog_uri=uri)
         check("rows added to the evolved table", added, 7)
@@ -463,6 +464,11 @@ def check_new_column():
                 )
             ),
             [("pi-a", None)] * 4 + [("pi-a", 7)] * 3 + [("pi-b", None)] * 4,
+        )
+        check(
+            "nfs_sent: null when not measured",
+            got["nfs_sent"].to_pylist(),
+            [None] * 4 + [8] * 3 + [None] * 4,
         )
         table = to_iceberg.open_table(warehouse, uri)
         check(

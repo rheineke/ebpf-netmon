@@ -35,6 +35,44 @@ inline const std::vector<TracepointField> kNfsReadpageDone = {
 	{"eof", offsetof(netmon_nfs_readpage_done, eof), 1},
 	{"error", offsetof(netmon_nfs_readpage_done, error), 4},
 };
+inline const std::vector<TracepointField> kNfsFileWrite = {
+	{"dev", offsetof(netmon_nfs_file_write, dev), 4},
+	{"fhandle", offsetof(netmon_nfs_file_write, fhandle), 4},
+	{"fileid", offsetof(netmon_nfs_file_write, fileid), 8},
+	{"offset", offsetof(netmon_nfs_file_write, offset), 8},
+	{"count", offsetof(netmon_nfs_file_write, count), 8},
+	{"flags", offsetof(netmon_nfs_file_write, flags), 4},
+};
+inline const std::vector<TracepointField> kNfsWritepageSetup = {
+	{"dev", offsetof(netmon_nfs_writepage_setup, dev), 4},
+	{"fhandle", offsetof(netmon_nfs_writepage_setup, fhandle), 4},
+	{"fileid", offsetof(netmon_nfs_writepage_setup, fileid), 8},
+	{"offset", offsetof(netmon_nfs_writepage_setup, offset), 8},
+	{"count", offsetof(netmon_nfs_writepage_setup, count), 4},
+};
+inline const std::vector<TracepointField> kNfsDirectWrite = {
+	{"dev", offsetof(netmon_nfs_direct_write, dev), 4},
+	{"fileid", offsetof(netmon_nfs_direct_write, fileid), 8},
+	{"fhandle", offsetof(netmon_nfs_direct_write, fhandle), 4},
+	{"offset", offsetof(netmon_nfs_direct_write, offset), 8},
+};
+inline const std::vector<TracepointField> kNfsWritebackDone = {
+	{"dev", offsetof(netmon_nfs_writeback_done, dev), 4},
+	{"fhandle", offsetof(netmon_nfs_writeback_done, fhandle), 4},
+	{"fileid", offsetof(netmon_nfs_writeback_done, fileid), 8},
+	{"offset", offsetof(netmon_nfs_writeback_done, offset), 8},
+	{"arg_count", offsetof(netmon_nfs_writeback_done, arg_count), 4},
+	{"res_count", offsetof(netmon_nfs_writeback_done, res_count), 4},
+	{"error", offsetof(netmon_nfs_writeback_done, error), 4},
+	{"stable", offsetof(netmon_nfs_writeback_done, stable), 8},
+};
+inline const std::vector<TracepointField> kNfsInitiateWrite = {
+	{"dev", offsetof(netmon_nfs_initiate_write, dev), 4},
+	{"fhandle", offsetof(netmon_nfs_initiate_write, fhandle), 4},
+	{"fileid", offsetof(netmon_nfs_initiate_write, fileid), 8},
+	{"offset", offsetof(netmon_nfs_initiate_write, offset), 8},
+	{"count", offsetof(netmon_nfs_initiate_write, count), 4},
+};
 
 // The layout netmon.bpf.c expects of the tracepoint a program's section
 // names ("tracepoint/sock/sock_send_length"), and whether netmon needs it.
@@ -44,6 +82,9 @@ struct TracepointLayout {
 	bool required = false;
 	// Tracepoints that count only together, refused together.
 	std::string group;
+	// A tracepoint of the same category without which this one counts
+	// nothing useful: until it exists, this one waits as if missing.
+	std::string needs;
 };
 
 inline TracepointLayout layout_of(const std::string &section)
@@ -62,6 +103,27 @@ inline TracepointLayout layout_of(const std::string &section)
 	} else if (l.event == "nfs_readpage_done") {
 		l.fields = &kNfsReadpageDone;
 		l.group = "nfs_fetched";
+	} else if (l.event == "nfs_file_write") {
+		l.fields = &kNfsFileWrite;
+		l.group = "nfs_sent";
+	} else if (l.event == "nfs_direct_write_schedule_iovec") {
+		l.fields = &kNfsDirectWrite;
+		l.group = "nfs_sent";
+		l.needs = "nfs_file_write";
+	} else if (l.event == "nfs_initiate_write") {
+		l.fields = &kNfsInitiateWrite;
+		l.group = "nfs_sent";
+		l.needs = "nfs_file_write";
+	} else if (l.event == "nfs_writepage_setup") {
+		l.fields = &kNfsWritepageSetup;
+		l.group = "nfs_sent";
+		l.needs = "nfs_file_write";
+	} else if (l.event == "nfs_writeback_done") {
+		// Kernels before 6.18 have it, but not nfs_file_write: every
+		// reply would find no writer.
+		l.fields = &kNfsWritebackDone;
+		l.group = "nfs_sent";
+		l.needs = "nfs_file_write";
 	}
 	return l;
 }
@@ -73,14 +135,20 @@ enum class Readiness {
 };
 
 // Whether an optional tracepoint under tracefs root can be attached, and
-// if refused, why, in problem. Decided once per try, so a tracepoint that
-// appears meanwhile is never attached unchecked.
+// if refused, why, in problem; if missing because the one it needs is,
+// which, in problem too. Decided once per try, so a tracepoint that appears
+// meanwhile is never attached unchecked.
 inline Readiness check_optional(const std::string &root,
 				const TracepointLayout &l, std::string &problem)
 {
 	problem.clear();
 	if (!tracepoint_exists(root, l.category, l.event))
 		return Readiness::kMissing;
+	if (!l.needs.empty() && !tracepoint_exists(root, l.category, l.needs)) {
+		problem = "it needs " + l.category + ":" + l.needs +
+			  ", which this kernel doesn't have yet";
+		return Readiness::kMissing;
+	}
 	if (!l.fields) {
 		problem = " netmon doesn't know its layout";
 		return Readiness::kRefused;

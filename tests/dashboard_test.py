@@ -42,8 +42,9 @@ HOURS, ROWS = 4, 6  # per host, rows per hour
 COUNTERS = {"tcp_tx": 1, "tcp_rx": 2, "udp_tx": 3, "udp_rx": 4, "nfs_read": 5}
 COUNTERS["nfs_write"] = 6
 COUNTERS["nfs_fetched"] = 7  # but in OLD_HOURS
-# Hours a netmon before nfs_fetched wrote: one loaded into the table before
-# it had the column (load), one raw only until convert.
+COUNTERS["nfs_sent"] = 8  # nor this
+# Hours a netmon before nfs_fetched and nfs_sent wrote: one loaded into the
+# table before it had the columns (load), one raw only until convert.
 OLD_HOURS = {("pi-b", 0), ("pi-b", HOURS - 1)}
 IFACE_COUNTERS = ("rx_bytes", "rx_packets", "tx_bytes", "tx_packets")
 SCALE = 2.0
@@ -140,7 +141,7 @@ def load(test_dir):
                     row |= {"comm": f"proc{i % 2}", "scale": SCALE}
                     row |= COUNTERS
                     if (host, h) in OLD_HOURS:
-                        del row["nfs_fetched"]
+                        del row["nfs_fetched"], row["nfs_sent"]
                     f.write(json.dumps(row) + "\n")
             with open(path.with_name(f"{hour:%H}.interfaces.jsonl"), "w") as f:
                 for i in range(ROWS):
@@ -254,6 +255,8 @@ def check(test_dir):
     )
     nulls = nulls.replace("netmon.traffic", "netmon.traffic_live")
     check_eq("rows without nfs_fetched, live", int(query(nulls)[0]["n"]), 2 * ROWS)
+    nulls = "SELECT countIf(nfs_sent IS NULL) AS n FROM netmon.traffic_live"
+    check_eq("rows without nfs_sent, live", int(query(nulls)[0]["n"]), 2 * ROWS)
     # Through the REST catalog, or else the newest metadata file.
     if CATALOG:
         sql = "SELECT engine FROM system.databases WHERE name = 'netmon_lake'"
@@ -294,13 +297,16 @@ def check(test_dir):
                     "NFS read by process": 5,
                     "NFS written by process": 6,
                     "NFS fetched by process": 7,
+                    "NFS sent by process": 8,
                     "Network by user id": 10,
                 }[title]
                 * 2
                 * per_host
             )
-            if title == "NFS fetched by process":
-                want -= 7 * len(OLD_HOURS) * ROWS * SCALE  # null there
+            later = {"NFS fetched by process": "nfs_fetched"}
+            later["NFS sent by process"] = "nfs_sent"
+            if title in later:  # null in OLD_HOURS
+                want -= COUNTERS[later[title]] * len(OLD_HOURS) * ROWS * SCALE
             check_eq(f"{title}: bytes", round(total), want)
             check_eq(f"{title}: buckets", len({r["time"] for r in rows}), HOURS)
         elif panel["type"] == "heatmap":
@@ -320,6 +326,7 @@ def check(test_dir):
             check_eq(f"{title}: NFS written", got["NFS written"], 6 * 2 * per_host)
             fetched = 7 * (2 * per_host - len(OLD_HOURS) * ROWS * SCALE)
             check_eq(f"{title}: NFS fetched", got["NFS fetched"], fetched)
+            check_eq(f"{title}: NFS sent", got["NFS sent"], fetched // 7 * 8)
         else:
             check_eq(f"{title}: rows", len(rows), 4)  # 2 hosts x 2 comms
             check_eq(f"{title}: pids", {r["pids"] for r in rows}, {1})
