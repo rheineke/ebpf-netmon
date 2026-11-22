@@ -46,8 +46,11 @@ the clock is synchronized.
   MPTCP counts as TCP. `splice()` from a TCP socket skips them, so a
   kretprobe on `tcp_splice_read` counts it.
 - **NFS**: kretprobes on `nfs_file_read`, `nfs_file_splice_read` and
-  `nfs_file_write`, and the `nfs:nfs_initiate_read` and
-  `nfs:nfs_readpage_done` tracepoints (see NFS traffic below).
+  `nfs_file_write`, and the `nfs:` tracepoints `nfs_initiate_read` and
+  `nfs_readpage_done` for reads, and `nfs_file_write`,
+  `nfs_writepage_setup`, `nfs_direct_write_schedule_iovec`,
+  `nfs_initiate_write` and `nfs_writeback_done` for writes (see NFS
+  traffic below).
 
 It reads only the tracepoints' records and the functions' return values,
 never kernel structs. So it needs no CO-RE and no kernel BTF, which Raspberry
@@ -233,15 +236,17 @@ mapping) as the last writer of the file's MiB at the page's position, an
 `O_APPEND` write's true one, and charges each `WRITE`'s reply
 (`nfs:nfs_writeback_done`) to the last writer of the MiB it covers.
 Processes writing the same MiB between two `WRITE`s are charged as the last
-one, and a MiB's writer stays its writer until another writes it. `O_DIRECT`
-writes are sent at once, placed by `nfs:nfs_direct_write_schedule_iovec`
-after the kernel sends the file's dirty pages, at the length the `write()`
-asked for; past 64 MiB in one `write()`, the rest goes to each MiB's
-earlier writer, else the file's last writer (`nfs:nfs_file_write`). A file
-already in `O_DIRECT` mode (an `O_DIRECT` read or write, and no buffered one
-since) isn't flushed first: pages stored through a mapping in the write's
-range go out after it, charged to the `O_DIRECT` writer. Pages written
-before netmon attached go to the file's next writer, if it has one.
+one, and a MiB's writer stays its writer until another writes it. An
+`O_DIRECT` `write()` sends its own `WRITE`s at once, from its thread, each
+starting where the last ended from the position
+`nfs:nfs_direct_write_schedule_iovec` gives; netmon records each
+(`nfs:nfs_initiate_write`) as that process's and charges its reply to it,
+as for reads. Dirty pages the kernel sends from the same thread meanwhile,
+another process's stored through a mapping, keep their MiB's writer. A
+`WRITE` the kernel resends from a workqueue, after the server restarted
+before the `COMMIT`, goes to the MiB's writer, else the file's last writer
+(`nfs:nfs_file_write`). Pages written before netmon attached go to the
+file's next writer, if it has one.
 On a Pi 4 the counts matched the kernel's to the byte, for `write()` with
 `fsync()`, writeback, a mapping, `O_DIRECT`, an `O_APPEND` write and two
 writers of one file, and for a minute of the NAS share.

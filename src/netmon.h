@@ -142,10 +142,108 @@ struct netmon_nfs_writeback_done {
 	long long offset;
 	unsigned int arg_count; /* bytes sent */
 	unsigned int res_count; /* bytes the server took */
-	int error;
-	unsigned long long stable;
+	int error; /* the RPC's status: 0, or -errno */
+	unsigned long long stable; /* how the server stored them; 0: UNSTABLE */
 	char verifier[8];
 };
+
+/*
+ * nfs:nfs_initiate_write, as the client starts a WRITE, laid out as
+ * nfs:nfs_initiate_read: in the thread that asked, for an O_DIRECT write().
+ */
+struct netmon_nfs_initiate_write {
+	unsigned long long common;
+	unsigned int dev;
+	unsigned int fhandle;
+	unsigned long long fileid;
+	long long offset;
+	unsigned int count; /* bytes to send */
+};
+
+/*
+ * An O_DIRECT write() of a thread, from nfs:nfs_file_write until its last
+ * WRITE starts or the write() returns. Its WRITEs start in order from the
+ * position nfs:nfs_direct_write_schedule_iovec gives (after O_APPEND), each
+ * where the last ended, before anything else the write() sends: dirty pages
+ * of the file the kernel launders afterwards, when the file is already in
+ * O_DIRECT mode, lie behind its last WRITE. A write() a file size limit
+ * cuts short starts fewer WRITEs than it asked for, and the entry ends when
+ * the write() returns.
+ */
+struct netmon_nfs_direct_pending {
+	unsigned long long fileid;
+	long long next; /* where its WRITEs so far end; -1 until known */
+	long long end; /* the length asked for, then where it ends */
+	unsigned int dev;
+	unsigned int pad;
+};
+
+/* Records where the write() starts, from nfs_direct_write_schedule_iovec. */
+static inline void netmon_nfs_direct_start(struct netmon_nfs_direct_pending *p,
+					   long long offset)
+{
+	if (p->next < 0) {
+		p->next = offset;
+		p->end += offset;
+	}
+}
+
+/*
+ * Whether a WRITE the thread starts is one of its O_DIRECT write()'s: it
+ * starts at or past where the last one ended, so a WRITE netmon missed costs
+ * only itself, and ends within the length asked for. The file is matched by
+ * dev and fileid: pNFS WRITEs name the data server's file handle.
+ */
+static inline int
+netmon_nfs_direct_takes(const struct netmon_nfs_direct_pending *p,
+			const struct netmon_nfs_initiate_write *r)
+{
+	return p->next >= 0 && p->fileid == r->fileid && p->dev == r->dev &&
+	       r->offset >= p->next &&
+	       r->offset + (long long)r->count <= p->end;
+}
+
+/*
+ * What nfs_initiate_write and nfs_writeback_done both name a WRITE by: the
+ * key of netmon.bpf.c's map of O_DIRECT WRITEs in flight. The count tells a
+ * page of the file another process dirtied, sent at the same offset from the
+ * same thread, from the O_DIRECT write's own WRITEs.
+ */
+struct netmon_nfs_direct_key {
+	unsigned long long fileid;
+	long long offset;
+	unsigned int count;
+	unsigned int dev;
+	unsigned int fhandle;
+	unsigned int pad;
+};
+
+/*
+ * Whether a WRITE's reply leaves the rest to a resend, which
+ * nfs_writeback_result() sends without a new nfs_initiate_write: a short
+ * write without an error. Unless the server stored it UNSTABLE, the resend
+ * goes from where it stopped; if UNSTABLE, all of it again, stably. Returns
+ * 1 and sets *next to the resend's key, else 0.
+ */
+static inline int
+netmon_nfs_write_resend(const struct netmon_nfs_writeback_done *r,
+			struct netmon_nfs_direct_key *next)
+{
+	if (r->error < 0 || !r->res_count || r->res_count >= r->arg_count)
+		return 0;
+	next->fileid = r->fileid;
+	next->dev = r->dev;
+	next->fhandle = r->fhandle;
+	next->pad = 0;
+	if (r->stable) {
+		next->offset = r->offset + r->res_count;
+		next->count = r->arg_count - r->res_count;
+	} else {
+		next->offset = r->offset;
+		next->count = r->arg_count;
+	}
+	return 1;
+}
 
 /*
  * The key of netmon.bpf.c's map of NFS writers: a file's chunk of

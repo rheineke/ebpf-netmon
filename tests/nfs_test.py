@@ -12,7 +12,9 @@ mapping then msync(), and O_DIRECT, then five that another process writes
 too: appended to with O_APPEND, stored to through a mapping, rewritten and
 appended to with O_DIRECT while the other's pages wait, and written, or
 stored to through a mapping, while the other's pages wait, both sent by this
-process's fsync(). It deletes them all. Passes when netmon's nfs_read and
+process's fsync(); and twice rewritten with O_DIRECT, once cut short by a file
+size limit, while the other's pages stored through a mapping wait in a file
+already in O_DIRECT mode. It deletes them all. Passes when netmon's nfs_read and
 nfs_write for this process match the file bytes it read and wrote (read(),
 sendfile() and write(), not the mapped ones), nfs_fetched the bytes the
 server sent, the file once for each read but the cached one, and nfs_sent the
@@ -28,6 +30,7 @@ nfs_sent, and the test says so and checks the rest.
 import json
 import mmap
 import os
+import resource
 import socket
 import subprocess
 import sys
@@ -166,7 +169,17 @@ def server_written(directory):
 
 
 OTHER_WRITER = """
-import os, sys
+import mmap, os, sys
+if sys.argv[3].startswith("map-hold:"):  # map-hold:START:END
+    start, end = (int(x) for x in sys.argv[3].split(":")[1:])
+    with open(sys.argv[1], "r+b") as f, mmap.mmap(f.fileno(), end) as m:
+        for i in range(start, end, mmap.PAGESIZE):
+            m[i] = 4
+        print("written", flush=True)
+        sys.stdin.readline()
+        m.flush()
+        os.fsync(f.fileno())
+    sys.exit()
 with open(sys.argv[1], "r+b" if sys.argv[3] == "hold-tail" else "wb") as f:
     if sys.argv[3] == "hold-tail":  # all but the first MiB
         f.seek(1 << 20)
@@ -308,6 +321,50 @@ def map_beside_another(directory):
     return mib + mmap.PAGESIZE, mib
 
 
+def direct_in_direct_mode(directory, cut_short):
+    """Rewrites with O_DIRECT a file already in O_DIRECT mode (an O_DIRECT
+    write and no buffered I/O since), in which another process stored
+    through a mapping and holds the pages dirty: the kernel doesn't send them
+    first. Without cut_short, the other's pages are in this process's MiB 0:
+    the kernel sends them after this process's WRITEs, from its thread. With
+    it, they are in MiBs 1-3, and this process, limited to 1 MiB files, asks
+    for 4 MiB and writes 1; the other's msync() sends them. Returns the bytes
+    this process wrote."""
+    path = scratch(directory, "direct_mode")
+    mib = 1 << 20
+    other = None
+    try:
+        with open(path, "wb") as f:
+            f.truncate(4 * mib)
+        fd = os.open(path, os.O_WRONLY | os.O_DIRECT)
+        try:
+            with mmap.mmap(-1, mmap.PAGESIZE) as page:
+                page.write(b"q" * mmap.PAGESIZE)
+                n = os.pwritev(fd, [page], 3 * mib)  # into O_DIRECT mode
+            span = f"{mib}:{4 * mib}" if cut_short else f"0:{mib}"
+            other = written_by_another(path, 0, then="map-hold:" + span)
+            with mmap.mmap(-1, 4 * mib) as buf:
+                buf.write(b"s" * (4 * mib))
+                if not cut_short:
+                    n += os.pwritev(fd, [memoryview(buf)[:mib]], 0)
+                    return n
+                soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+                resource.setrlimit(resource.RLIMIT_FSIZE, (mib, hard))
+                try:
+                    n += os.pwritev(fd, [buf], 0)
+                finally:
+                    resource.setrlimit(resource.RLIMIT_FSIZE, (soft, hard))
+                return n
+        finally:
+            os.close(fd)
+    finally:
+        if other:
+            other.stdin.write("done\n")
+            other.stdin.close()
+            other.wait()
+        os.unlink(path)
+
+
 def main():
     if len(sys.argv) not in (2, 3):
         sys.exit(__doc__)
@@ -355,6 +412,10 @@ def main():
         sent_beside, fetched_beside = map_beside_another(directory)
         want["nfs_fetched"] += fetched_beside
         want["nfs_sent"] += sent_beside
+        for cut_short in (False, True):
+            direct_mode = direct_in_direct_mode(directory, cut_short)
+            want["nfs_write"] += direct_mode
+            want["nfs_sent"] += direct_mode
     print(f"moved: {want}", flush=True)
 
     time.sleep(2)  # one more report after the last byte

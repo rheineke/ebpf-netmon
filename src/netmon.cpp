@@ -218,26 +218,10 @@ bool print_json(std::FILE *out, std::time_t ts, const std::string &host,
 		int interval_s, bool sent)
 {
 	size_t n = rows_to_print(rows, opts);
-	for (size_t i = 0; i < n; ++i) {
-		const Row &r = rows[i];
-		std::fprintf(
-			out,
-			"{\"ts\":%lld,\"host\":\"%s\",\"interval_s\":%d,"
-			"\"pid\":%u,\"uid\":%u,"
-			"\"comm\":\"%s\",\"tcp_tx\":%llu,\"tcp_rx\":%llu,"
-			"\"udp_tx\":%llu,\"udp_rx\":%llu,\"nfs_read\":%llu,"
-			"\"nfs_write\":%llu,\"nfs_fetched\":%llu,",
-			static_cast<long long>(ts), host.c_str(), interval_s,
-			r.pid, r.uid, json_escape(r.comm).c_str(),
-			r.delta[NETMON_TCP_TX], r.delta[NETMON_TCP_RX],
-			r.delta[NETMON_UDP_TX], r.delta[NETMON_UDP_RX],
-			r.delta[NETMON_NFS_READ], r.delta[NETMON_NFS_WRITE],
-			r.delta[NETMON_NFS_FETCHED]);
-		if (sent)
-			std::fprintf(out, "\"nfs_sent\":%llu,",
-				     r.delta[NETMON_NFS_SENT]);
-		std::fprintf(out, "\"scale\":%.17g}\n", r.scale);
-	}
+	for (size_t i = 0; i < n; ++i)
+		std::fputs(json_row(ts, host, interval_s, rows[i], sent)
+				   .c_str(),
+			   out);
 	return std::fflush(out) == 0 && !std::ferror(out);
 }
 

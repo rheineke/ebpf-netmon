@@ -148,9 +148,12 @@ int BPF_KRETPROBE(nfs_file_splice_read_ret, long ret)
 	return account(NETMON_NFS_READ, ret);
 }
 
+static __always_inline void end_direct(void);
+
 SEC("kretprobe/nfs_file_write")
 int BPF_KRETPROBE(nfs_file_write_ret, long ret)
 {
+	end_direct();
 	return account(NETMON_NFS_WRITE, ret);
 }
 
@@ -218,6 +221,11 @@ static __always_inline void expect_reply(const struct netmon_nfs_read_key *key,
 	__builtin_memcpy(found->comm, reader->comm, sizeof(found->comm));
 	__sync_fetch_and_add(&found->pending, 1);
 }
+
+/* As expect_reply, for an O_DIRECT WRITE in flight. */
+static __always_inline void
+expect_direct_reply(const struct netmon_nfs_direct_key *key,
+		    struct nfs_reader *writer);
 
 SEC("tracepoint/nfs/nfs_initiate_read")
 int nfs_initiate_read(const struct netmon_nfs_initiate_read *r)
@@ -297,18 +305,16 @@ int nfs_readpage_done(const struct netmon_nfs_readpage_done *r)
  * - nfs_writepage_setup, as a write() or a store through a mapping dirties
  *   a page, records the process as the writer of the page's MiB, at its
  *   file position (an O_APPEND write's true one);
- * - nfs_direct_write_schedule_iovec records an O_DIRECT write()'s MiBs, at
- *   its true position; its own count is still 0 there, so nfs_file_write
- *   keeps the length. The kernel has sent the file's dirty pages by then,
- *   unless the file is already in O_DIRECT mode (an O_DIRECT read or write
- *   and no buffered one since): then pages stored through a mapping in the
- *   write's range go out after it and are charged to the O_DIRECT writer;
  * - nfs_file_write records every write()'s process as the file's writer,
  *   the fallback for a MiB with none recorded (pages written before netmon
- *   attached, or past an O_DIRECT write's first 64 MiB).
+ *   attached).
+ * An O_DIRECT write() sends its own WRITEs, from its thread, and those are
+ * matched one by one instead, as READs are: nfs_initiate_write records each
+ * as the process's (nfs_direct_writes), and its reply is charged to it.
  * Writers of the same MiB between two WRITEs are charged as the last, and a
  * MiB's writer stays its writer until another writes it; a reply with no
- * writer recorded for the MiB or the file is counted in nfs_unmatched.
+ * writer recorded for the WRITE, the MiB or the file is counted in
+ * nfs_unmatched.
  */
 struct nfs_writer {
 	__u32 tgid;
@@ -327,7 +333,7 @@ struct {
 	__type(value, struct nfs_writer);
 } nfs_writers SEC(".maps");
 
-/* A page or an O_DIRECT write() records at most this many MiBs. */
+/* A page records at most this many MiBs. */
 #define NFS_WRITE_CHUNKS 64
 
 /*
@@ -337,28 +343,32 @@ struct {
  */
 #define NETMON_IOCB_DIRECT (1 << 17)
 
-/* An O_DIRECT write() between nfs_file_write and schedule_iovec. */
-struct nfs_direct_pending {
-	__u64 fileid;
-	__u64 len;
-	__u32 dev;
-	__u32 fhandle;
-};
-
 /*
- * O_DIRECT write()s by thread, from nfs_file_write to
- * nfs_direct_write_schedule_iovec in the same thread (an io_uring worker's
- * too). The length is the one asked for: a write() a file size limit cuts
- * short claims its whole range. One that fails between the two events
- * leaves its entry, used only for the same file, until the thread's next
- * O_DIRECT write() replaces it.
+ * O_DIRECT write()s by thread, an io_uring worker's too. One that fails
+ * before its WRITEs leaves its entry, used only for the same file, until
+ * the write() returns or the thread's next write() replaces it.
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__uint(max_entries, 1024);
 	__type(key, __u64);
-	__type(value, struct nfs_direct_pending);
+	__type(value, struct netmon_nfs_direct_pending);
 } nfs_direct_len SEC(".maps");
+
+/*
+ * O_DIRECT WRITEs in flight, as nfs_reads holds READs: one write() of
+ * 8 GiB starts 16384 of 512 KiB. Past that, the LRU evicts the oldest,
+ * whose replies go to the MiB's writer, else the file's (this one's).
+ * The reply deletes its entry. A WRITE the kernel sends again from a
+ * workqueue (its server restarted before the COMMIT) isn't recorded, and
+ * goes to the MiB's or file's writer too.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 16384);
+	__type(key, struct netmon_nfs_direct_key);
+	__type(value, struct nfs_reader);
+} nfs_direct_writes SEC(".maps");
 
 static __always_inline void current_writer(struct nfs_writer *w)
 {
@@ -396,6 +406,14 @@ static __always_inline void set_chunks(struct netmon_nfs_write_key *key,
 	}
 }
 
+/* Ends the thread's O_DIRECT write(), if any. */
+static __always_inline void end_direct(void)
+{
+	__u64 tid = bpf_get_current_pid_tgid();
+	if (bpf_map_lookup_elem(&nfs_direct_len, &tid))
+		bpf_map_delete_elem(&nfs_direct_len, &tid);
+}
+
 SEC("tracepoint/nfs/nfs_file_write")
 int nfs_file_write_start(const struct netmon_nfs_file_write *r)
 {
@@ -409,40 +427,85 @@ int nfs_file_write_start(const struct netmon_nfs_file_write *r)
 	key.fhandle = r->fhandle;
 	key.chunk = NETMON_NFS_WHOLE_FILE;
 	set_writer(&key, &w);
-	if (r->flags & NETMON_IOCB_DIRECT) {
-		__u64 tid = bpf_get_current_pid_tgid();
-		struct nfs_direct_pending p = {};
-		p.fileid = r->fileid;
-		p.len = r->count;
-		p.dev = r->dev;
-		p.fhandle = r->fhandle;
-		bpf_map_update_elem(&nfs_direct_len, &tid, &p, BPF_ANY);
+	if (!(r->flags & NETMON_IOCB_DIRECT)) {
+		end_direct(); /* one whose return was missed */
+		return 0;
 	}
+	__u64 tid = bpf_get_current_pid_tgid();
+	struct netmon_nfs_direct_pending p = {};
+	p.fileid = r->fileid;
+	p.next = -1;
+	p.end = (long long)r->count;
+	p.dev = r->dev;
+	bpf_map_update_elem(&nfs_direct_len, &tid, &p, BPF_ANY);
 	return 0;
 }
 
+/* Where the O_DIRECT write()'s first WRITE starts: its true position. */
 SEC("tracepoint/nfs/nfs_direct_write_schedule_iovec")
 int nfs_direct_write(const struct netmon_nfs_direct_write *r)
 {
 	__u64 tid = bpf_get_current_pid_tgid();
-	struct nfs_direct_pending *found =
+	struct netmon_nfs_direct_pending *p =
 		bpf_map_lookup_elem(&nfs_direct_len, &tid);
-	if (!found)
+	if (!p)
 		return 0; /* swap over NFS, or a write() before attach */
-	__u64 len = found->len;
-	int same = found->fileid == r->fileid && found->dev == r->dev &&
-		   found->fhandle == r->fhandle;
-	bpf_map_delete_elem(&nfs_direct_len, &tid);
-	if (!same)
-		return 0; /* left by a failed write() to another file */
-	struct nfs_writer w = {};
-	current_writer(&w);
-	struct netmon_nfs_write_key key = {};
+	if (p->fileid != r->fileid || p->dev != r->dev) {
+		bpf_map_delete_elem(&nfs_direct_len, &tid);
+		return 0;
+	}
+	netmon_nfs_direct_start(p, r->offset);
+	return 0;
+}
+
+/*
+ * Records a WRITE an O_DIRECT write() starts as its process's, keyed by the
+ * file handle the reply names. Others (pages laundered or flushed from the
+ * same thread) are left to the MiB's writer.
+ */
+SEC("tracepoint/nfs/nfs_initiate_write")
+int nfs_initiate_write(const struct netmon_nfs_initiate_write *r)
+{
+	__u64 tid = bpf_get_current_pid_tgid();
+	struct netmon_nfs_direct_pending *p =
+		bpf_map_lookup_elem(&nfs_direct_len, &tid);
+	if (!p || !netmon_nfs_direct_takes(p, r))
+		return 0;
+	p->next = r->offset + r->count;
+	if (p->next >= p->end)
+		bpf_map_delete_elem(&nfs_direct_len, &tid);
+	struct netmon_nfs_direct_key key = {};
 	key.fileid = r->fileid;
+	key.offset = r->offset;
+	key.count = r->count;
 	key.dev = r->dev;
 	key.fhandle = r->fhandle;
-	set_chunks(&key, &w, r->offset, len);
+	struct nfs_reader writer = {};
+	writer.tgid = tid >> 32;
+	writer.uid = (__u32)bpf_get_current_uid_gid();
+	bpf_get_current_comm(writer.comm, sizeof(writer.comm));
+	expect_direct_reply(&key, &writer);
 	return 0;
+}
+
+static __always_inline void
+expect_direct_reply(const struct netmon_nfs_direct_key *key,
+		    struct nfs_reader *writer)
+{
+	struct nfs_reader *found = bpf_map_lookup_elem(&nfs_direct_writes, key);
+	if (!found) {
+		writer->pending = 1;
+		if (!bpf_map_update_elem(&nfs_direct_writes, key, writer,
+					 BPF_NOEXIST))
+			return;
+		found = bpf_map_lookup_elem(&nfs_direct_writes, key);
+		if (!found)
+			return;
+	}
+	found->tgid = writer->tgid;
+	found->uid = writer->uid;
+	__builtin_memcpy(found->comm, writer->comm, sizeof(found->comm));
+	__sync_fetch_and_add(&found->pending, 1);
 }
 
 SEC("tracepoint/nfs/nfs_writepage_setup")
@@ -476,9 +539,45 @@ static __always_inline void unmatched_write(__u32 bytes, int first)
  */
 #define NFS_REPLY_PARTS 4
 
+/*
+ * Charges an O_DIRECT WRITE's reply to the process that started it, and
+ * keeps the entry for a resend of its rest. Returns whether it was one.
+ */
+static __always_inline int
+direct_reply(const struct netmon_nfs_writeback_done *r)
+{
+	struct netmon_nfs_direct_key key = {};
+	key.fileid = r->fileid;
+	key.offset = r->offset;
+	key.count = r->arg_count;
+	key.dev = r->dev;
+	key.fhandle = r->fhandle;
+	struct nfs_reader *found =
+		bpf_map_lookup_elem(&nfs_direct_writes, &key);
+	if (!found)
+		return 0;
+	struct nfs_reader writer = *found;
+	struct netmon_nfs_direct_key next = {};
+	int resend = netmon_nfs_write_resend(r, &next);
+	/* Resent whole: the same key, still in flight. */
+	if (!resend || next.offset != key.offset || next.count != key.count) {
+		__u32 old = __sync_fetch_and_add(&found->pending, (__u32)-1);
+		if (old <= 1)
+			bpf_map_delete_elem(&nfs_direct_writes, &key);
+		if (resend)
+			expect_direct_reply(&next, &writer);
+	}
+	if (r->res_count)
+		add_bytes(writer.tgid, writer.uid, writer.comm, NETMON_NFS_SENT,
+			  r->res_count, 0);
+	return 1;
+}
+
 SEC("tracepoint/nfs/nfs_writeback_done")
 int nfs_writeback_done(const struct netmon_nfs_writeback_done *r)
 {
+	if (direct_reply(r))
+		return 0;
 	struct netmon_nfs_write_key key = {};
 	key.fileid = r->fileid;
 	key.dev = r->dev;

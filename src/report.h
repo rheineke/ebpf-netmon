@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "capture.h"
 #include "netmon.h"
 
 struct Row {
@@ -121,3 +122,33 @@ private:
 	std::chrono::seconds limit_;
 	bool done_;
 };
+
+// One row of netmon -j, a JSON line. Without sent, it leaves out nfs_sent,
+// which netmon isn't counting: null in the warehouse, not 0.
+inline std::string json_row(std::time_t ts, const std::string &host,
+			    int interval_s, const Row &r, bool sent)
+{
+	char buf[512];
+	std::string line =
+		"{\"ts\":" + std::to_string(static_cast<long long>(ts)) +
+		",\"host\":\"" + host + "\"";
+	std::snprintf(buf, sizeof(buf),
+		      ",\"interval_s\":%d,\"pid\":%u,\"uid\":%u,\"comm\":\"",
+		      interval_s, r.pid, r.uid);
+	line += buf;
+	line += json_escape(r.comm);
+	std::snprintf(buf, sizeof(buf),
+		      "\",\"tcp_tx\":%llu,\"tcp_rx\":%llu,\"udp_tx\":%llu,"
+		      "\"udp_rx\":%llu,\"nfs_read\":%llu,\"nfs_write\":%llu,"
+		      "\"nfs_fetched\":%llu,",
+		      r.delta[NETMON_TCP_TX], r.delta[NETMON_TCP_RX],
+		      r.delta[NETMON_UDP_TX], r.delta[NETMON_UDP_RX],
+		      r.delta[NETMON_NFS_READ], r.delta[NETMON_NFS_WRITE],
+		      r.delta[NETMON_NFS_FETCHED]);
+	line += buf;
+	if (sent)
+		line += "\"nfs_sent\":" +
+			std::to_string(r.delta[NETMON_NFS_SENT]) + ",";
+	std::snprintf(buf, sizeof(buf), "\"scale\":%.17g}\n", r.scale);
+	return line + buf;
+}

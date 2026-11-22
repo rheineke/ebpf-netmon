@@ -218,6 +218,7 @@ jobs:
           for probe in kretprobe/nfs_file_read tracepoint/nfs/nfs_initiate_read \
             tracepoint/nfs/nfs_readpage_done tracepoint/nfs/nfs_file_write \
             tracepoint/nfs/nfs_writepage_setup \
+            tracepoint/nfs/nfs_initiate_write \
             tracepoint/nfs/nfs_direct_write_schedule_iovec \
             tracepoint/nfs/nfs_writeback_done; do
             logged "could not attach $probe" || continue

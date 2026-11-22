@@ -79,6 +79,15 @@ const char *kDirectWrite =
 	"\tfield:ssize_t error;\toffset:48;\tsize:8;\tsigned:1;\n"
 	"\tfield:int flags;\toffset:56;\tsize:4;\tsigned:1;\n";
 
+// events/nfs/nfs_initiate_write/format
+const char *kInitiateWrite =
+	"\tfield:dev_t dev;\toffset:8;\tsize:4;\tsigned:0;\n"
+	"\tfield:u32 fhandle;\toffset:12;\tsize:4;\tsigned:0;\n"
+	"\tfield:u64 fileid;\toffset:16;\tsize:8;\tsigned:0;\n"
+	"\tfield:loff_t offset;\toffset:24;\tsize:8;\tsigned:1;\n"
+	"\tfield:u32 count;\toffset:32;\tsize:4;\tsigned:0;\n"
+	"\tfield:unsigned long stable;\toffset:40;\tsize:8;\tsigned:0;\n";
+
 // events/nfs/nfs_writeback_done/format
 const char *kWritebackDone =
 	"\tfield:dev_t dev;\toffset:8;\tsize:4;\tsigned:0;\n"
@@ -129,6 +138,8 @@ void test_nfs_layouts()
 	      "nfs_writepage_setup matches the struct netmon.bpf.c reads");
 	check(problems(kWritebackDone, kNfsWritebackDone).empty(),
 	      "nfs_writeback_done matches the struct netmon.bpf.c reads");
+	check(problems(kInitiateWrite, kNfsInitiateWrite).empty(),
+	      "nfs_initiate_write matches the struct netmon.bpf.c reads");
 	std::string narrow(kFileWrite);  // a 32-bit size_t
 	narrow.replace(narrow.find("size_t count;\toffset:40;\tsize:8"), 31,
 		       "size_t count;\toffset:40;\tsize:4");
@@ -167,6 +178,10 @@ void test_layout_of()
 	TracepointLayout page = layout_of("tracepoint/nfs/nfs_writepage_setup");
 	TracepointLayout direct =
 		layout_of("tracepoint/nfs/nfs_direct_write_schedule_iovec");
+	TracepointLayout iw = layout_of("tracepoint/nfs/nfs_initiate_write");
+	check(iw.fields == &kNfsInitiateWrite && !iw.required &&
+		      iw.group == "nfs_sent" && iw.needs == "nfs_file_write",
+	      "nfs_initiate_write counts with the other write tracepoints");
 	check(write.fields == &kNfsFileWrite &&
 		      wb.fields == &kNfsWritebackDone &&
 		      page.fields == &kNfsWritepageSetup &&
@@ -267,6 +282,82 @@ void test_read_retry()
 	      "isn't");
 }
 
+void test_write_resend()
+{
+	netmon_nfs_writeback_done r{};
+	r.fileid = 7;
+	r.dev = 3;
+	r.fhandle = 9;
+	r.offset = 1 << 20;
+	r.arg_count = 524288;
+	r.res_count = 131072;
+	r.stable = 2;  // FILE_SYNC
+	netmon_nfs_direct_key next{};
+	check(netmon_nfs_write_resend(&r, &next) == 1 &&
+		      next.offset == (1 << 20) + 131072 &&
+		      next.count == 524288 - 131072 && next.fileid == 7 &&
+		      next.dev == 3 && next.fhandle == 9,
+	      "a short stable WRITE is resent from where it stopped");
+	r.stable = 0;  // UNSTABLE
+	check(netmon_nfs_write_resend(&r, &next) == 1 &&
+		      next.offset == (1 << 20) && next.count == 524288,
+	      "a short UNSTABLE WRITE is resent whole");
+	r.res_count = r.arg_count;
+	check(!netmon_nfs_write_resend(&r, &next), "a full WRITE isn't");
+	r.res_count = 0;
+	check(!netmon_nfs_write_resend(&r, &next),
+	      "nor one the server took none of");
+	r.res_count = 4096;
+	r.error = -5;
+	check(!netmon_nfs_write_resend(&r, &next), "nor a failed one");
+}
+
+void test_direct_takes()
+{
+	const long long mib = 1LL << 20;
+	netmon_nfs_direct_pending p{};
+	p.fileid = 7;
+	p.dev = 3;
+	p.next = -1;
+	p.end = mib;  // the length asked for
+	netmon_nfs_initiate_write r{};
+	r.fileid = 7;
+	r.dev = 3;
+	r.fhandle = 99;  // a pNFS data server's
+	r.offset = 4 * mib;
+	r.count = 524288;
+	check(!netmon_nfs_direct_takes(&p, &r),
+	      "a WRITE before schedule_iovec gives the position isn't taken "
+	      "(the flush of the file's dirty pages)");
+	netmon_nfs_direct_start(&p, 4 * mib);
+	check(p.next == 4 * mib && p.end == 5 * mib,
+	      "schedule_iovec gives where the write() starts and ends");
+	netmon_nfs_direct_start(&p, 0);
+	check(p.next == 4 * mib && p.end == 5 * mib, "only once");
+	check(netmon_nfs_direct_takes(&p, &r),
+	      "the O_DIRECT write()'s first WRITE is taken");
+	r.offset = 4 * mib + 524288;
+	check(netmon_nfs_direct_takes(&p, &r),
+	      "a later one is too, past one netmon missed");
+	p.next = 5 * mib;  // its last WRITE started
+	r.offset = 4 * mib;
+	r.count = 4096;
+	check(!netmon_nfs_direct_takes(&p, &r),
+	      "a page laundered behind its last WRITE isn't");
+	p.next = 4 * mib;
+	r.offset = 4 * mib - 4096;
+	check(!netmon_nfs_direct_takes(&p, &r), "nor one before it starts");
+	r.offset = 4 * mib;
+	r.count = mib + 4096;
+	check(!netmon_nfs_direct_takes(&p, &r), "nor one past the length");
+	r.count = 4096;
+	r.fileid = 8;
+	check(!netmon_nfs_direct_takes(&p, &r), "nor another file's");
+	r.fileid = 7;
+	r.dev = 4;
+	check(!netmon_nfs_direct_takes(&p, &r), "nor another mount's");
+}
+
 void test_chunks()
 {
 	const long long mib = 1LL << 20;
@@ -293,6 +384,8 @@ int main()
 	test_layout_of();
 	test_check_optional();
 	test_read_retry();
+	test_write_resend();
+	test_direct_takes();
 	test_chunks();
 	if (failures)
 		std::printf("%d failed\n", failures);

@@ -61,7 +61,17 @@ inline const std::vector<TracepointField> kNfsWritebackDone = {
 	{"fhandle", offsetof(netmon_nfs_writeback_done, fhandle), 4},
 	{"fileid", offsetof(netmon_nfs_writeback_done, fileid), 8},
 	{"offset", offsetof(netmon_nfs_writeback_done, offset), 8},
+	{"arg_count", offsetof(netmon_nfs_writeback_done, arg_count), 4},
 	{"res_count", offsetof(netmon_nfs_writeback_done, res_count), 4},
+	{"error", offsetof(netmon_nfs_writeback_done, error), 4},
+	{"stable", offsetof(netmon_nfs_writeback_done, stable), 8},
+};
+inline const std::vector<TracepointField> kNfsInitiateWrite = {
+	{"dev", offsetof(netmon_nfs_initiate_write, dev), 4},
+	{"fhandle", offsetof(netmon_nfs_initiate_write, fhandle), 4},
+	{"fileid", offsetof(netmon_nfs_initiate_write, fileid), 8},
+	{"offset", offsetof(netmon_nfs_initiate_write, offset), 8},
+	{"count", offsetof(netmon_nfs_initiate_write, count), 4},
 };
 
 // The layout netmon.bpf.c expects of the tracepoint a program's section
@@ -98,6 +108,10 @@ inline TracepointLayout layout_of(const std::string &section)
 		l.group = "nfs_sent";
 	} else if (l.event == "nfs_direct_write_schedule_iovec") {
 		l.fields = &kNfsDirectWrite;
+		l.group = "nfs_sent";
+		l.needs = "nfs_file_write";
+	} else if (l.event == "nfs_initiate_write") {
+		l.fields = &kNfsInitiateWrite;
 		l.group = "nfs_sent";
 		l.needs = "nfs_file_write";
 	} else if (l.event == "nfs_writepage_setup") {
