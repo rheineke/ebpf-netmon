@@ -298,7 +298,8 @@ int nfs_readpage_done(const struct netmon_nfs_readpage_done *r)
  *   a page, records the process as the writer of the page's MiB, at its
  *   file position (an O_APPEND write's true one);
  * - nfs_direct_write_schedule_iovec records an O_DIRECT write()'s MiBs, at
- *   its true position, after the kernel sent the file's dirty pages;
+ *   its true position, after the kernel sent the file's dirty pages; its
+ *   own count is still 0 there, so nfs_file_write keeps the length;
  * - nfs_file_write records every write()'s process as the file's writer,
  *   the fallback for a MiB with none recorded (pages written before netmon
  *   attached, or past an O_DIRECT write's first 64 MiB).
@@ -325,6 +326,26 @@ struct {
 
 /* A page or an O_DIRECT write() records at most this many MiBs. */
 #define NFS_WRITE_CHUNKS 64
+
+/*
+ * IOCB_DIRECT in kiocb.ki_flags (include/linux/fs.h, 6.18 and 7.0). Were
+ * it renumbered, O_DIRECT writes would go to the file's writer, and
+ * nfs_test's direct_after_another case would fail.
+ */
+#define NETMON_IOCB_DIRECT (1 << 17)
+
+/*
+ * An O_DIRECT write()'s length, by thread, from nfs_file_write to
+ * nfs_direct_write_schedule_iovec in the same thread (an io_uring worker's
+ * too). A write() that fails between them leaves its length for the
+ * thread's next O_DIRECT write() to replace.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 1024);
+	__type(key, __u64);
+	__type(value, __u64);
+} nfs_direct_len SEC(".maps");
 
 static __always_inline void current_writer(struct nfs_writer *w)
 {
@@ -375,21 +396,30 @@ int nfs_file_write_start(const struct netmon_nfs_file_write *r)
 	key.fhandle = r->fhandle;
 	key.chunk = NETMON_NFS_WHOLE_FILE;
 	set_writer(&key, &w);
+	if (r->flags & NETMON_IOCB_DIRECT) {
+		__u64 tid = bpf_get_current_pid_tgid();
+		__u64 len = r->count;
+		bpf_map_update_elem(&nfs_direct_len, &tid, &len, BPF_ANY);
+	}
 	return 0;
 }
 
 SEC("tracepoint/nfs/nfs_direct_write_schedule_iovec")
 int nfs_direct_write(const struct netmon_nfs_direct_write *r)
 {
-	if (r->count <= 0)
-		return 0;
+	__u64 tid = bpf_get_current_pid_tgid();
+	__u64 *found = bpf_map_lookup_elem(&nfs_direct_len, &tid);
+	if (!found)
+		return 0; /* swap over NFS, or a write() before attach */
+	__u64 len = *found;
+	bpf_map_delete_elem(&nfs_direct_len, &tid);
 	struct nfs_writer w = {};
 	current_writer(&w);
 	struct netmon_nfs_write_key key = {};
 	key.fileid = r->fileid;
 	key.dev = r->dev;
 	key.fhandle = r->fhandle;
-	set_chunks(&key, &w, r->offset, (unsigned long long)r->count);
+	set_chunks(&key, &w, r->offset, len);
 	return 0;
 }
 

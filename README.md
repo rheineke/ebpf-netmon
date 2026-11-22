@@ -248,9 +248,9 @@ Replies with no writer recorded for the MiB or the file, mostly pages
 written before netmon attached and sent later, are logged after its first
 minute: `netmon: N NFS WRITE
 replies (B bytes) found no recorded writer`. pNFS writes, which name the
-data server's file handle, and swap over NFS never have one. The write
-tracepoints but `nfs:nfs_writeback_done` are new in kernel 6.18 (the
-Raspberry Pi's kernel, and CI's 7.0); without them netmon doesn't count
+data server's file handle, and swap over NFS never have one.
+`nfs:nfs_file_write` and `nfs:nfs_writepage_setup` are new in kernel 6.18
+(the Raspberry Pi's kernel, and CI's 7.0); without them netmon doesn't count
 `NFS_SENT`, and leaves `nfs_sent` out of its files, so it is null.
 
 To check it on a machine with an NFS mount (the directory is optional and

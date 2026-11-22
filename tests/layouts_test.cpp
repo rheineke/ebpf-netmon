@@ -165,16 +165,19 @@ void test_layout_of()
 	TracepointLayout write = layout_of("tracepoint/nfs/nfs_file_write");
 	TracepointLayout wb = layout_of("tracepoint/nfs/nfs_writeback_done");
 	TracepointLayout page = layout_of("tracepoint/nfs/nfs_writepage_setup");
+	TracepointLayout direct =
+		layout_of("tracepoint/nfs/nfs_direct_write_schedule_iovec");
 	check(write.fields == &kNfsFileWrite &&
 		      wb.fields == &kNfsWritebackDone &&
-		      page.fields == &kNfsWritepageSetup && !write.required &&
-		      !wb.required && !page.required,
+		      page.fields == &kNfsWritepageSetup &&
+		      direct.fields == &kNfsDirectWrite && !write.required &&
+		      !wb.required && !page.required && !direct.required,
 	      "the NFS write tracepoints are optional");
 	check(write.group == "nfs_sent" && wb.group == write.group &&
-		      page.group == write.group,
+		      page.group == write.group && direct.group == write.group,
 	      "the NFS write tracepoints are refused together");
 	check(wb.needs == "nfs_file_write" && page.needs == "nfs_file_write" &&
-		      write.needs.empty(),
+		      direct.needs == "nfs_file_write" && write.needs.empty(),
 	      "the others wait for nfs_file_write");
 }
 

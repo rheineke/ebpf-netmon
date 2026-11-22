@@ -112,16 +112,14 @@ struct netmon_nfs_file_write {
 };
 
 /* nfs:nfs_direct_write_schedule_iovec, as an O_DIRECT write() starts its
- * WRITEs: fhandle follows fileid here. */
+ * WRITEs: fhandle follows fileid here. Its count is the bytes sent so far,
+ * 0 at this point, so netmon reads only up to offset. */
 struct netmon_nfs_direct_write {
 	unsigned long long common;
 	unsigned int dev;
 	unsigned long long fileid;
 	unsigned int fhandle;
-	long long offset;
-	long long count;
-	long long error;
-	int flags;
+	long long offset; /* the file position, after O_APPEND */
 };
 
 struct netmon_nfs_writepage_setup {

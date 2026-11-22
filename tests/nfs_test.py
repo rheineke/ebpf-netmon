@@ -8,10 +8,11 @@ Reads FILE_ON_NFS four times: with read() after dropping its cached pages,
 with sendfile() from the page cache, then memory-mapped and with O_DIRECT,
 each after dropping its pages again. If a writable directory is given, writes
 scratch files there three ways: write() then fsync(), stores through a
-mapping then msync(), and O_DIRECT, then three that another process writes
-too: appended to with O_APPEND, stored to through a mapping, and written
-while the other's pages wait, both sent by this process's fsync(). It
-deletes them all. Passes when netmon's
+mapping then msync(), and O_DIRECT, then five that another process writes
+too: appended to with O_APPEND, stored to through a mapping, rewritten with
+O_DIRECT, and written, or stored to through a mapping, while the other's
+pages wait, both sent by this process's fsync(). It deletes them all.
+Passes when netmon's
 nfs_read and nfs_write for this process match the file bytes it read and
 wrote (read(), sendfile() and write(), not the mapped ones), nfs_fetched the
 bytes the server sent, the file once for each read but the cached one, and
@@ -166,9 +167,8 @@ def server_written(directory):
 
 OTHER_WRITER = """
 import os, sys
-with open(sys.argv[1], "wb") as f:
+with open(sys.argv[1], "r+b" if sys.argv[3] == "hold-tail" else "wb") as f:
     if sys.argv[3] == "hold-tail":  # all but the first MiB
-        f.truncate(int(sys.argv[2]))
         f.seek(1 << 20)
         f.write(b"o" * (int(sys.argv[2]) - (1 << 20)))
     else:
@@ -251,25 +251,50 @@ def write_beside_another(directory):
     return WRITE_BYTES // 2
 
 
-def map_beside_another(directory):
-    """Stores through a mapping to the first MiB of a file whose other MiBs
-    another process wrote and holds dirty; this process's fsync() sends
-    both. Returns the bytes stored, which the faults first read in."""
-    path = scratch(directory, "map_beside")
-    mib = 1 << 20
+def direct_after_another(directory):
+    """Rewrites with O_DIRECT the MiBs another process wrote and sent: the
+    server's replies are this process's, not the MiBs' earlier writer's."""
+    path = scratch(directory, "direct_other")
     try:
-        other = written_by_another(path, 4 * mib, then="hold-tail")
-        with open(path, "r+b") as f, mmap.mmap(f.fileno(), mib) as m:
-            for i in range(0, mib, mmap.PAGESIZE):
-                m[i] = 3
-            m.flush()
-            os.fsync(f.fileno())
-        other.stdin.write("done\n")
-        other.stdin.close()
-        other.wait()
+        written_by_another(path, WRITE_BYTES)
+        fd = os.open(path, os.O_WRONLY | os.O_DIRECT)
+        try:
+            with mmap.mmap(-1, WRITE_BYTES) as buf:  # page-aligned
+                buf.write(b"r" * WRITE_BYTES)
+                return os.pwritev(fd, [buf], 0)
+        finally:
+            os.close(fd)
     finally:
         os.unlink(path)
-    return mib
+
+
+def map_beside_another(directory):
+    """Stores through a mapping to the first MiB of a file, whose next MiBs
+    another process writes and holds dirty meanwhile; this process's fsync()
+    sends both. It maps the file before the other writes, since an open()
+    or fstat() would send the other's pages first. Returns the bytes this
+    process sent (the first page twice) and those its faults read in."""
+    path = scratch(directory, "map_beside")
+    mib = 1 << 20
+    other = None
+    try:
+        with open(path, "w+b") as f:
+            f.truncate(mib)  # the faults read nothing past the first MiB
+            with mmap.mmap(f.fileno(), mib) as m:
+                m[0] = 3
+                m.flush()  # sent, so the other's open() sends nothing
+                other = written_by_another(path, 4 * mib, then="hold-tail")
+                for i in range(0, mib, mmap.PAGESIZE):
+                    m[i] = 3
+                m.flush()
+                os.fsync(f.fileno())
+    finally:
+        if other:
+            other.stdin.write("done\n")
+            other.stdin.close()
+            other.wait()
+        os.unlink(path)
+    return mib + mmap.PAGESIZE, mib
 
 
 def main():
@@ -313,9 +338,12 @@ def main():
         beside = write_beside_another(directory)
         want["nfs_write"] += beside
         want["nfs_sent"] += beside
-        mapped_beside = map_beside_another(directory)
-        want["nfs_fetched"] += mapped_beside
-        want["nfs_sent"] += mapped_beside
+        rewritten = direct_after_another(directory)
+        want["nfs_write"] += rewritten
+        want["nfs_sent"] += rewritten
+        sent_beside, fetched_beside = map_beside_another(directory)
+        want["nfs_fetched"] += fetched_beside
+        want["nfs_sent"] += sent_beside
     print(f"moved: {want}", flush=True)
 
     time.sleep(2)  # one more report after the last byte

@@ -55,7 +55,6 @@ inline const std::vector<TracepointField> kNfsDirectWrite = {
 	{"fileid", offsetof(netmon_nfs_direct_write, fileid), 8},
 	{"fhandle", offsetof(netmon_nfs_direct_write, fhandle), 4},
 	{"offset", offsetof(netmon_nfs_direct_write, offset), 8},
-	{"count", offsetof(netmon_nfs_direct_write, count), 8},
 };
 inline const std::vector<TracepointField> kNfsWritebackDone = {
 	{"dev", offsetof(netmon_nfs_writeback_done, dev), 4},
