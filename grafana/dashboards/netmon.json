@@ -76,7 +76,7 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "table",
-          "rawSql": "SELECT sum(tcp_tx * scale) AS `TCP sent`, sum(tcp_rx * scale) AS `TCP received`,\n  sum(udp_tx * scale) AS `UDP sent`, sum(udp_rx * scale) AS `UDP received`,\n  sum(nfs_read * scale) AS `NFS read`, sum(nfs_write * scale) AS `NFS written`,\n  sum(nfs_fetched * scale) AS `NFS fetched`\nFROM netmon.traffic_live WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)"
+          "rawSql": "SELECT sum(tcp_tx * scale) AS `TCP sent`, sum(tcp_rx * scale) AS `TCP received`,\n  sum(udp_tx * scale) AS `UDP sent`, sum(udp_rx * scale) AS `UDP received`,\n  sum(nfs_read * scale) AS `NFS read`, sum(nfs_write * scale) AS `NFS written`,\n  sum(nfs_fetched * scale) AS `NFS fetched`, sum(nfs_sent * scale) AS `NFS sent`\nFROM netmon.traffic_live WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)"
         }
       ]
     },
@@ -454,7 +454,7 @@
       },
       "gridPos": {
         "h": 9,
-        "w": 24,
+        "w": 12,
         "x": 0,
         "y": 38
       },
@@ -500,6 +500,63 @@
       ],
       "interval": "10s",
       "description": "File bytes the NFS server sent for each process's reads: page-cache misses, readahead, memory-mapped and O_DIRECT reads. NFS read counts file bytes, cached or not. Empty before netmon counted it."
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "NFS sent by process",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "netmon-clickhouse"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 38
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "netmon-clickhouse"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "queryType": "timeseries",
+          "rawSql": "WITH\n  -- Whole 10 s reports per bucket, or a 15 s bucket swings by a third.\n  intDiv($__interval_s + 9, 10) * 10 AS step,\n  top AS (\n  SELECT comm FROM netmon.traffic_live WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)\n  GROUP BY comm ORDER BY sum((nfs_sent) * scale) DESC LIMIT 10\n)\nSELECT toStartOfInterval(toDateTime(ts), toIntervalSecond(step)) AS time, comm,\n  sum((nfs_sent) * scale) / step AS bytes_per_s\nFROM netmon.traffic_live\nWHERE host IN (${host:singlequote}) AND $__timeFilter(ts) AND comm IN top\nGROUP BY time, comm ORDER BY time"
+        }
+      ],
+      "interval": "10s",
+      "description": "File bytes the NFS server took for each process's writes, which the client sends later, from writeback, fsync() or close(): each charged to the last process to write that MiB of the file. NFS written counts file bytes as written. Empty before netmon counted it."
     },
     {
       "id": 7,
@@ -603,7 +660,7 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "table",
-          "rawSql": "SELECT host, comm, uniqExact(pid) AS pids,\n  sum((tcp_tx + udp_tx) * scale) AS sent, sum((tcp_rx + udp_rx) * scale) AS received,\n  sum(nfs_read * scale) AS nfs_read, sum(nfs_write * scale) AS nfs_written,\n  sum(nfs_fetched * scale) AS nfs_fetched\nFROM netmon.traffic_live WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)\nGROUP BY host, comm ORDER BY sent + received + greatest(nfs_read, ifNull(nfs_fetched, 0)) + nfs_written DESC LIMIT 50"
+          "rawSql": "SELECT host, comm, uniqExact(pid) AS pids,\n  sum((tcp_tx + udp_tx) * scale) AS sent, sum((tcp_rx + udp_rx) * scale) AS received,\n  sum(nfs_read * scale) AS nfs_read, sum(nfs_write * scale) AS nfs_written,\n  sum(nfs_fetched * scale) AS nfs_fetched, sum(nfs_sent * scale) AS nfs_sent\nFROM netmon.traffic_live WHERE host IN (${host:singlequote}) AND $__timeFilter(ts)\nGROUP BY host, comm ORDER BY sent + received + greatest(nfs_read, ifNull(nfs_fetched, 0))\n  + greatest(nfs_written, ifNull(nfs_sent, 0)) DESC LIMIT 50"
         }
       ]
     }

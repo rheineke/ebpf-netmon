@@ -23,11 +23,11 @@ serves to Grafana's dashboard and alerts.
 
 `netmon` prints the TCP and UDP bytes each process sent and received in the
 last interval, the NFS file bytes it read and wrote, and those the NFS server
-sent for its reads, like `top`:
+sent for its reads and took for its writes, like `top`:
 
 ```
-     PID    UID COMM                TCP_TX    TCP_RX    UDP_TX    UDP_RX    NFS_RD    NFS_WR NFS_FETCH
-     850    999 Plex Media Serv         0B        0B      687B      1.1K     12.0M        0B      4.0M
+     PID    UID COMM                TCP_TX    TCP_RX    UDP_TX    UDP_RX    NFS_RD    NFS_WR NFS_FETCH  NFS_SENT
+     850    999 Plex Media Serv         0B        0B      687B      1.1K     12.0M        0B      4.0M        0B
 ```
 
 Options: `-i` interval in seconds (default 2), `-c` number of reports,
@@ -221,8 +221,29 @@ in flight. A skipped `nfs_readpage_done` loses bytes netmon can't know; it
 shows only as `skipped N calls`. Replies to `READ`s started before netmon
 attached aren't logged: it waits two reports before it does.
 
-Writes have no counterpart: the kernel's writeback, not the writer, sends
-most of them.
+`NFS_SENT` (`nfs_sent` in files) is the file bytes the server took for a
+process's writes: what the kernel counts as the mounts' server write bytes
+(the sixth number on the `bytes:` lines), split by process. A `write()` only
+fills the page cache; the client sends the dirty pages later, from a kernel
+thread (writeback, 30 s after a page was first dirtied, by default), or on
+`fsync()` or `close()`, and pages of several writers can go out in one
+`WRITE`. So netmon records each `write()`'s process (`nfs:nfs_file_write`)
+as the last writer of every MiB of the file it covers, and of the file, and
+charges each `WRITE`'s reply (`nfs:nfs_writeback_done`) to the last writer
+of the MiB it covers, or of the file. A store through a shared mapping
+(`nfs:nfs_update_folio`) records the file's writer only, since that
+tracepoint doesn't say where in the file. Processes writing the same MiB
+between two `WRITE`s are charged as the last one; one writing past 64 MiB
+in a single `write()` is the file's writer for the rest. `O_DIRECT` writes
+are sent at once, and count the same way. On a Pi 4 the counts matched the
+kernel's to the byte, for `write()` with `fsync()`, writeback, a mapping and
+`O_DIRECT`, and for a minute of the NAS share.
+
+netmon remembers the last 16384 MiB written. Replies with no recorded
+writer, mostly pages written before netmon attached and sent later, are
+logged: `netmon: N NFS WRITE replies (B bytes) found no recorded writer`.
+`nfs:nfs_file_write` is newer than kernel 6.15; without it, netmon doesn't
+count `NFS_SENT` (the Raspberry Pi kernel, 6.18, has it).
 
 To check it on a machine with an NFS mount (the directory is optional and
 must be writable):
@@ -231,7 +252,8 @@ must be writable):
 sudo python3 tests/nfs_test.py FILE_ON_NFS [DIR_ON_NFS]
 ```
 
-CI runs it against a loopback NFS export. On a Pi 4 it matched exactly for
+CI runs it against a loopback NFS export; on a kernel without
+`nfs:nfs_file_write` it skips `NFS_SENT`. On a Pi 4 it matched exactly for
 the Synology NAS (read-only) and a loopback export (read and write).
 
 ## Capture
@@ -245,7 +267,7 @@ that wide holds whole reports. The dashboard's rate panels assume the
 service's `-i 10`:
 
 ```json
-{"ts":1792666260,"host":"raspberrypi","interval_s":10,"pid":4309,"uid":0,"comm":"nfsd","tcp_tx":84,"tcp_rx":120,"udp_tx":0,"udp_rx":0,"nfs_read":0,"nfs_write":0,"nfs_fetched":0,"scale":1}
+{"ts":1792666260,"host":"raspberrypi","interval_s":10,"pid":4309,"uid":0,"comm":"nfsd","tcp_tx":84,"tcp_rx":120,"udp_tx":0,"udp_rx":0,"nfs_read":0,"nfs_write":0,"nfs_fetched":0,"nfs_sent":0,"scale":1}
 ```
 
 Each report also appends what every network interface moved in its
@@ -465,9 +487,10 @@ scripts/install_grafana.sh
 ```
 
 Install the converter first: ClickHouse's views need its tables, and an
-upgrade that adds a table or a column (`nfs_fetched`) needs its next run
-(`install_converter.sh` runs it at once). Rows from a netmon without a
-counter are null there. Upgrade the converter before netmon on any Pi that
+upgrade that adds a table or a column (`nfs_fetched`, `nfs_sent`) needs its
+next run (`install_converter.sh` runs it at once), then
+`install_clickhouse.sh` again. Rows from a netmon without a counter are
+null there. Upgrade the converter before netmon on any Pi that
 feeds it, too: an older converter loads a newer netmon's rows without the
 counters it doesn't know, and those hours aren't loaded again.
 

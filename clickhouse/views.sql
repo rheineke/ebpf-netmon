@@ -36,13 +36,14 @@ WITH
 SELECT DISTINCT toDateTime64(ts, 6, 'UTC') AS ts, host, interval_s, pid, uid,
     -- As the converter does: the kernel cuts names mid-character.
     toValidUTF8(comm) AS comm,
-    tcp_tx, tcp_rx, udp_tx, udp_rx, nfs_read, nfs_write, scale, nfs_fetched
+    tcp_tx, tcp_rx, udp_tx, udp_rx, nfs_read, nfs_write, scale, nfs_fetched,
+    nfs_sent
 FROM file(
     '@RAW@/**/*.jsonl', JSONEachRow,
     'ts UInt32, host String, interval_s Int32, pid Int64, uid Int64,
      comm String, tcp_tx Int64, tcp_rx Int64, udp_tx Int64, udp_rx Int64,
      nfs_read Int64, nfs_write Int64, scale Float64,
-     nfs_fetched Nullable(Int64)'
+     nfs_fetched Nullable(Int64), nfs_sent Nullable(Int64)'
 )
 WHERE hour >= toDate(now('UTC')) - 1
     -- HH.interfaces.jsonl: the interfaces' rows, below.
@@ -67,7 +68,7 @@ SETTINGS input_format_allow_errors_num = 100;
 CREATE OR REPLACE VIEW netmon.traffic_live
 SQL SECURITY INVOKER AS
 SELECT ts, host, interval_s, pid, uid, comm, tcp_tx, tcp_rx, udp_tx, udp_rx,
-    nfs_read, nfs_write, scale, nfs_fetched
+    nfs_read, nfs_write, scale, nfs_fetched, nfs_sent
 FROM netmon.traffic
 UNION ALL
 SELECT * FROM netmon.traffic_raw;

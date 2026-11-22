@@ -200,6 +200,8 @@ jobs:
       # A loopback NFS export on the runner.
       - name: NFS test
         run: |
+          # nfs_sent needs nfs:nfs_file_write, which kernels after 6.15 have.
+          echo "kernel $(uname -r)"
           sudo apt-get install -y -qq nfs-kernel-server
           sudo mkdir -p /srv/nfstest /mnt/nfstest
           echo "/srv/nfstest 127.0.0.1(rw,sync,no_subtree_check,no_root_squash)" \
