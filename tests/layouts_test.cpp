@@ -69,6 +69,16 @@ const char *kWritepageSetup =
 	"\tfield:unsigned int count;\toffset:40;\tsize:4;\tsigned:0;\n"
 	"\tfield:unsigned long flags;\toffset:48;\tsize:8;\tsigned:0;\n";
 
+// events/nfs/nfs_direct_write_schedule_iovec/format
+const char *kDirectWrite =
+	"\tfield:dev_t dev;\toffset:8;\tsize:4;\tsigned:0;\n"
+	"\tfield:u64 fileid;\toffset:16;\tsize:8;\tsigned:0;\n"
+	"\tfield:u32 fhandle;\toffset:24;\tsize:4;\tsigned:0;\n"
+	"\tfield:loff_t offset;\toffset:32;\tsize:8;\tsigned:1;\n"
+	"\tfield:ssize_t count;\toffset:40;\tsize:8;\tsigned:1;\n"
+	"\tfield:ssize_t error;\toffset:48;\tsize:8;\tsigned:1;\n"
+	"\tfield:int flags;\toffset:56;\tsize:4;\tsigned:1;\n";
+
 // events/nfs/nfs_writeback_done/format
 const char *kWritebackDone =
 	"\tfield:dev_t dev;\toffset:8;\tsize:4;\tsigned:0;\n"
@@ -112,6 +122,9 @@ void test_nfs_layouts()
 
 	check(problems(kFileWrite, kNfsFileWrite).empty(),
 	      "nfs_file_write matches the struct netmon.bpf.c reads");
+	check(problems(kDirectWrite, kNfsDirectWrite).empty(),
+	      "nfs_direct_write_schedule_iovec matches the struct netmon.bpf.c "
+	      "reads");
 	check(problems(kWritepageSetup, kNfsWritepageSetup).empty(),
 	      "nfs_writepage_setup matches the struct netmon.bpf.c reads");
 	check(problems(kWritebackDone, kNfsWritebackDone).empty(),

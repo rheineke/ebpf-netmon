@@ -297,11 +297,14 @@ int nfs_readpage_done(const struct netmon_nfs_readpage_done *r)
  * - nfs_writepage_setup, as a write() or a store through a mapping dirties
  *   a page, records the process as the writer of the page's MiB, at its
  *   file position (an O_APPEND write's true one);
- * - nfs_file_write records an O_DIRECT write()'s MiBs, which it sends at
- *   once, and every write()'s process as the file's writer, the fallback.
- * Writers of the same MiB between two WRITEs are charged as the last; a
- * reply with no writer recorded (pages written before netmon attached) is
- * counted in nfs_unmatched.
+ * - nfs_direct_write_schedule_iovec records an O_DIRECT write()'s MiBs, at
+ *   its true position, after the kernel sent the file's dirty pages;
+ * - nfs_file_write records every write()'s process as the file's writer,
+ *   the fallback for a MiB with none recorded (pages written before netmon
+ *   attached, or past an O_DIRECT write's first 64 MiB).
+ * Writers of the same MiB between two WRITEs are charged as the last, and a
+ * MiB's writer stays its writer until another writes it; a reply with no
+ * writer recorded for the MiB or the file is counted in nfs_unmatched.
  */
 struct nfs_writer {
 	__u32 tgid;
@@ -320,14 +323,8 @@ struct {
 	__type(value, struct nfs_writer);
 } nfs_writers SEC(".maps");
 
-/* A write() or page records at most this many MiBs; for an O_DIRECT
- * write(), the file's entry covers the rest. */
+/* A page or an O_DIRECT write() records at most this many MiBs. */
 #define NFS_WRITE_CHUNKS 64
-/* From the kernel's fs.h, as 6.18's format file prints them. An O_DIRECT
- * RWF_APPEND write's position isn't known yet: it is the file's writer
- * only. */
-#define IOCB_APPEND 0x10
-#define IOCB_DIRECT (1 << 17)
 
 static __always_inline void current_writer(struct nfs_writer *w)
 {
@@ -378,9 +375,21 @@ int nfs_file_write_start(const struct netmon_nfs_file_write *r)
 	key.fhandle = r->fhandle;
 	key.chunk = NETMON_NFS_WHOLE_FILE;
 	set_writer(&key, &w);
-	/* Buffered: nfs_writepage_setup places each page. */
-	if ((r->flags & IOCB_DIRECT) && !(r->flags & IOCB_APPEND))
-		set_chunks(&key, &w, r->offset, r->count);
+	return 0;
+}
+
+SEC("tracepoint/nfs/nfs_direct_write_schedule_iovec")
+int nfs_direct_write(const struct netmon_nfs_direct_write *r)
+{
+	if (r->count <= 0)
+		return 0;
+	struct nfs_writer w = {};
+	current_writer(&w);
+	struct netmon_nfs_write_key key = {};
+	key.fileid = r->fileid;
+	key.dev = r->dev;
+	key.fhandle = r->fhandle;
+	set_chunks(&key, &w, r->offset, (unsigned long long)r->count);
 	return 0;
 }
 

@@ -167,7 +167,12 @@ def server_written(directory):
 OTHER_WRITER = """
 import os, sys
 with open(sys.argv[1], "wb") as f:
-    f.write(b"o" * int(sys.argv[2]))
+    if sys.argv[3] == "hold-tail":  # all but the first MiB
+        f.truncate(int(sys.argv[2]))
+        f.seek(1 << 20)
+        f.write(b"o" * (int(sys.argv[2]) - (1 << 20)))
+    else:
+        f.write(b"o" * int(sys.argv[2]))
     if sys.argv[3] == "fsync":
         os.fsync(f.fileno())
     else:  # hold the pages dirty until told
@@ -246,6 +251,27 @@ def write_beside_another(directory):
     return WRITE_BYTES // 2
 
 
+def map_beside_another(directory):
+    """Stores through a mapping to the first MiB of a file whose other MiBs
+    another process wrote and holds dirty; this process's fsync() sends
+    both. Returns the bytes stored, which the faults first read in."""
+    path = scratch(directory, "map_beside")
+    mib = 1 << 20
+    try:
+        other = written_by_another(path, 4 * mib, then="hold-tail")
+        with open(path, "r+b") as f, mmap.mmap(f.fileno(), mib) as m:
+            for i in range(0, mib, mmap.PAGESIZE):
+                m[i] = 3
+            m.flush()
+            os.fsync(f.fileno())
+        other.stdin.write("done\n")
+        other.stdin.close()
+        other.wait()
+    finally:
+        os.unlink(path)
+    return mib
+
+
 def main():
     if len(sys.argv) not in (2, 3):
         sys.exit(__doc__)
@@ -287,6 +313,9 @@ def main():
         beside = write_beside_another(directory)
         want["nfs_write"] += beside
         want["nfs_sent"] += beside
+        mapped_beside = map_beside_another(directory)
+        want["nfs_fetched"] += mapped_beside
+        want["nfs_sent"] += mapped_beside
     print(f"moved: {want}", flush=True)
 
     time.sleep(2)  # one more report after the last byte

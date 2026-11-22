@@ -217,7 +217,8 @@ jobs:
           logged() { sudo journalctl -u netmon.service -o cat | grep -q "$1"; }
           for probe in kretprobe/nfs_file_read tracepoint/nfs/nfs_initiate_read \
             tracepoint/nfs/nfs_readpage_done tracepoint/nfs/nfs_file_write \
-            tracepoint/nfs/nfs_write_end tracepoint/nfs/nfs_update_folio \
+            tracepoint/nfs/nfs_writepage_setup \
+            tracepoint/nfs/nfs_direct_write_schedule_iovec \
             tracepoint/nfs/nfs_writeback_done; do
             logged "could not attach $probe" || continue
             for _ in $(seq 45); do

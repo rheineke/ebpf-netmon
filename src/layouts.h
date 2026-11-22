@@ -50,6 +50,13 @@ inline const std::vector<TracepointField> kNfsWritepageSetup = {
 	{"offset", offsetof(netmon_nfs_writepage_setup, offset), 8},
 	{"count", offsetof(netmon_nfs_writepage_setup, count), 4},
 };
+inline const std::vector<TracepointField> kNfsDirectWrite = {
+	{"dev", offsetof(netmon_nfs_direct_write, dev), 4},
+	{"fileid", offsetof(netmon_nfs_direct_write, fileid), 8},
+	{"fhandle", offsetof(netmon_nfs_direct_write, fhandle), 4},
+	{"offset", offsetof(netmon_nfs_direct_write, offset), 8},
+	{"count", offsetof(netmon_nfs_direct_write, count), 8},
+};
 inline const std::vector<TracepointField> kNfsWritebackDone = {
 	{"dev", offsetof(netmon_nfs_writeback_done, dev), 4},
 	{"fhandle", offsetof(netmon_nfs_writeback_done, fhandle), 4},
@@ -90,6 +97,10 @@ inline TracepointLayout layout_of(const std::string &section)
 	} else if (l.event == "nfs_file_write") {
 		l.fields = &kNfsFileWrite;
 		l.group = "nfs_sent";
+	} else if (l.event == "nfs_direct_write_schedule_iovec") {
+		l.fields = &kNfsDirectWrite;
+		l.group = "nfs_sent";
+		l.needs = "nfs_file_write";
 	} else if (l.event == "nfs_writepage_setup") {
 		l.fields = &kNfsWritepageSetup;
 		l.group = "nfs_sent";

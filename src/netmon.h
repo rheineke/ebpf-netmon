@@ -111,6 +111,19 @@ struct netmon_nfs_file_write {
 	int flags; /* IOCB_* */
 };
 
+/* nfs:nfs_direct_write_schedule_iovec, as an O_DIRECT write() starts its
+ * WRITEs: fhandle follows fileid here. */
+struct netmon_nfs_direct_write {
+	unsigned long long common;
+	unsigned int dev;
+	unsigned long long fileid;
+	unsigned int fhandle;
+	long long offset;
+	long long count;
+	long long error;
+	int flags;
+};
+
 struct netmon_nfs_writepage_setup {
 	unsigned long long common;
 	unsigned int dev;
