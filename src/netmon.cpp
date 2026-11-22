@@ -211,10 +211,11 @@ void print_table(const std::vector<Row> &rows, const Options &opts,
 	std::fflush(stdout);
 }
 
-// Returns false if the write failed, e.g. the disk is full.
+// Returns false if the write failed, e.g. the disk is full. Without sent,
+// rows leave out nfs_sent, which netmon isn't counting: null, not 0.
 bool print_json(std::FILE *out, std::time_t ts, const std::string &host,
 		const std::vector<Row> &rows, const Options &opts,
-		int interval_s)
+		int interval_s, bool sent)
 {
 	size_t n = rows_to_print(rows, opts);
 	for (size_t i = 0; i < n; ++i) {
@@ -225,15 +226,17 @@ bool print_json(std::FILE *out, std::time_t ts, const std::string &host,
 			"\"pid\":%u,\"uid\":%u,"
 			"\"comm\":\"%s\",\"tcp_tx\":%llu,\"tcp_rx\":%llu,"
 			"\"udp_tx\":%llu,\"udp_rx\":%llu,\"nfs_read\":%llu,"
-			"\"nfs_write\":%llu,\"nfs_fetched\":%llu,"
-			"\"nfs_sent\":%llu,\"scale\":%.17g}\n",
+			"\"nfs_write\":%llu,\"nfs_fetched\":%llu,",
 			static_cast<long long>(ts), host.c_str(), interval_s,
 			r.pid, r.uid, json_escape(r.comm).c_str(),
 			r.delta[NETMON_TCP_TX], r.delta[NETMON_TCP_RX],
 			r.delta[NETMON_UDP_TX], r.delta[NETMON_UDP_RX],
 			r.delta[NETMON_NFS_READ], r.delta[NETMON_NFS_WRITE],
-			r.delta[NETMON_NFS_FETCHED], r.delta[NETMON_NFS_SENT],
-			r.scale);
+			r.delta[NETMON_NFS_FETCHED]);
+		if (sent)
+			std::fprintf(out, "\"nfs_sent\":%llu,",
+				     r.delta[NETMON_NFS_SENT]);
+		std::fprintf(out, "\"scale\":%.17g}\n", r.scale);
 	}
 	return std::fflush(out) == 0 && !std::ferror(out);
 }
@@ -461,6 +464,8 @@ public:
 				err = errno;
 				if (p.link && !p.layout.group.empty())
 					quiet_reports_ = 2;
+				if (p.link && p.layout.group == "nfs_sent")
+					sent_since_ = Clock::now();
 			}
 			if (p.link && retry)
 				std::fprintf(stderr, "netmon: attached %s\n",
@@ -503,6 +508,10 @@ public:
 			sum.write_replies += c.write_replies;
 			sum.write_bytes += c.write_bytes;
 		}
+		// Pages written before netmon attached go out up to about 35 s
+		// later (writeback's 30 s, then its 5 s rounds).
+		bool quiet_writes =
+			Clock::now() - sent_since_ < std::chrono::minutes(1);
 		if (quiet_reports_ > 0) {
 			--quiet_reports_;
 		} else {
@@ -518,14 +527,16 @@ public:
 					sum.replies - unmatched_.replies,
 					sum.bytes - unmatched_.bytes,
 					nfs_reads_max_);
-			if (sum.write_replies > unmatched_.write_replies)
+			if (sum.write_replies > unmatched_.write_replies &&
+			    !quiet_writes)
 				std::fprintf(
 					stderr,
 					"netmon: %llu NFS WRITE replies (%llu "
 					"bytes) found no recorded writer "
 					"(pages written before netmon "
 					"attached, a write that was skipped, "
-					"or over %u chunks written since); "
+					"over %u MiBs written since, pNFS or "
+					"swap); "
 					"their bytes are not counted as "
 					"nfs_sent\n",
 					sum.write_replies -
@@ -535,6 +546,16 @@ public:
 					nfs_writers_max_);
 		}
 		unmatched_ = sum;
+	}
+
+	// Whether netmon counts nfs_sent: nfs_writeback_done is attached, which
+	// it is only with nfs_file_write there.
+	bool counts_sent() const
+	{
+		for (const Probe &p : probes_)
+			if (p.link && p.layout.event == "nfs_writeback_done")
+				return true;
+		return false;
 	}
 
 	// Logs calls each probe lost since the last check. The kernel tracks
@@ -622,6 +643,8 @@ private:
 	int unmatched_fd_;
 	unsigned int nfs_reads_max_;
 	unsigned int nfs_writers_max_;
+	using Clock = std::chrono::steady_clock;
+	Clock::time_point sent_since_{};  // when an nfs_sent probe attached
 	netmon_nfs_unmatched unmatched_{};
 	int quiet_reports_ = 0;  // reports before logging unmatched replies
 };
@@ -690,7 +713,8 @@ int run(netmon_bpf *skel, const Options &opts)
 		std::time_t ts = g_stop ? std::time(nullptr) : due;
 		std::FILE *out = opts.out_dir.empty() ? stdout : files.at(ts);
 		if (!out ||
-		    !print_json(out, ts, host, rows, opts, interval_s) ||
+		    !print_json(out, ts, host, rows, opts, interval_s,
+				probes.counts_sent()) ||
 		    (interfaces && !interfaces->write(ts, host, interval_s))) {
 			std::fprintf(stderr, "netmon: write failed\n");
 			return 1;

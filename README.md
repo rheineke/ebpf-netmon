@@ -230,20 +230,25 @@ thread (writeback, 30 s after a page was first dirtied, by default), or on
 `WRITE`. So netmon records each `write()`'s process (`nfs:nfs_file_write`)
 as the last writer of every MiB of the file it covers, and of the file, and
 charges each `WRITE`'s reply (`nfs:nfs_writeback_done`) to the last writer
-of the MiB it covers, or of the file. A store through a shared mapping
-(`nfs:nfs_update_folio`) records the file's writer only, since that
-tracepoint doesn't say where in the file. Processes writing the same MiB
-between two `WRITE`s are charged as the last one; one writing past 64 MiB
-in a single `write()` is the file's writer for the rest. `O_DIRECT` writes
-are sent at once, and count the same way. On a Pi 4 the counts matched the
+of the MiB it covers. Each page a `write()` fills (`nfs:nfs_write_end`)
+records it at its true position, an `O_APPEND` write's too. A store through
+a shared mapping (`nfs:nfs_update_folio`) doesn't say where in the file, so
+that process is the file's unplaced writer, charged instead of a MiB's
+writer who wrote before it; so is an `O_DIRECT` append. Processes writing
+the same file between two `WRITE`s, one through a mapping, are charged as
+the last one. `O_DIRECT` writes are sent at once; one past 64 MiB in a
+single `write()` leaves the rest to the file's last writer. On a Pi 4 the counts matched the
 kernel's to the byte, for `write()` with `fsync()`, writeback, a mapping and
 `O_DIRECT`, and for a minute of the NAS share.
 
-netmon remembers the last 16384 MiB written. Replies with no recorded
-writer, mostly pages written before netmon attached and sent later, are
-logged: `netmon: N NFS WRITE replies (B bytes) found no recorded writer`.
-`nfs:nfs_file_write` is newer than kernel 6.15; without it, netmon doesn't
-count `NFS_SENT` (the Raspberry Pi kernel, 6.18, has it).
+netmon remembers 16384 entries, a MiB written each and two per file.
+Replies with no recorded writer, mostly pages written before netmon attached
+and sent later, are logged after its first minute: `netmon: N NFS WRITE
+replies (B bytes) found no recorded writer`. pNFS writes, which name the
+data server's file handle, and swap over NFS never have one. The write
+tracepoints but `nfs:nfs_writeback_done` are new in kernel 6.18 (the
+Raspberry Pi's kernel, and CI's 7.0); without them netmon doesn't count
+`NFS_SENT`, and leaves `nfs_sent` out of its files, so it is null.
 
 To check it on a machine with an NFS mount (the directory is optional and
 must be writable):
@@ -253,7 +258,7 @@ sudo python3 tests/nfs_test.py FILE_ON_NFS [DIR_ON_NFS]
 ```
 
 CI runs it against a loopback NFS export; on a kernel without
-`nfs:nfs_file_write` it skips `NFS_SENT`. On a Pi 4 it matched exactly for
+`nfs:nfs_file_write` it would skip `NFS_SENT`. On a Pi 4 it matched exactly for
 the Synology NAS (read-only) and a loopback export (read and write).
 
 ## Capture

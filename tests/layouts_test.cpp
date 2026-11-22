@@ -59,14 +59,15 @@ const char *kFileWrite =
 	"\tfield:size_t count;\toffset:40;\tsize:8;\tsigned:0;\n"
 	"\tfield:int flags;\toffset:48;\tsize:4;\tsigned:1;\n";
 
-// events/nfs/nfs_update_folio/format
-const char *kUpdateFolio =
+// events/nfs/nfs_write_end/format, and nfs_update_folio's, the same class
+const char *kWriteEnd =
 	"\tfield:dev_t dev;\toffset:8;\tsize:4;\tsigned:0;\n"
 	"\tfield:u32 fhandle;\toffset:12;\tsize:4;\tsigned:0;\n"
 	"\tfield:u64 fileid;\toffset:16;\tsize:8;\tsigned:0;\n"
 	"\tfield:u64 version;\toffset:24;\tsize:8;\tsigned:0;\n"
 	"\tfield:loff_t offset;\toffset:32;\tsize:8;\tsigned:1;\n"
 	"\tfield:size_t count;\toffset:40;\tsize:8;\tsigned:0;\n";
+const char *kUpdateFolio = kWriteEnd;
 
 // events/nfs/nfs_writeback_done/format
 const char *kWritebackDone =
@@ -111,6 +112,8 @@ void test_nfs_layouts()
 
 	check(problems(kFileWrite, kNfsFileWrite).empty(),
 	      "nfs_file_write matches the struct netmon.bpf.c reads");
+	check(problems(kWriteEnd, kNfsWriteEnd).empty(),
+	      "nfs_write_end matches the struct netmon.bpf.c reads");
 	check(problems(kUpdateFolio, kNfsUpdateFolio).empty(),
 	      "nfs_update_folio matches the struct netmon.bpf.c reads");
 	check(problems(kWritebackDone, kNfsWritebackDone).empty(),
@@ -151,16 +154,18 @@ void test_layout_of()
 	TracepointLayout write = layout_of("tracepoint/nfs/nfs_file_write");
 	TracepointLayout wb = layout_of("tracepoint/nfs/nfs_writeback_done");
 	TracepointLayout folio = layout_of("tracepoint/nfs/nfs_update_folio");
+	TracepointLayout end = layout_of("tracepoint/nfs/nfs_write_end");
 	check(write.fields == &kNfsFileWrite &&
 		      wb.fields == &kNfsWritebackDone &&
-		      folio.fields == &kNfsUpdateFolio && !write.required &&
-		      !wb.required && !folio.required,
+		      folio.fields == &kNfsUpdateFolio &&
+		      end.fields == &kNfsWriteEnd && !write.required &&
+		      !wb.required && !folio.required && !end.required,
 	      "the NFS write tracepoints are optional");
 	check(write.group == "nfs_sent" && wb.group == write.group &&
-		      folio.group.empty(),
-	      "nfs_file_write and nfs_writeback_done are refused together");
+		      folio.group == write.group && end.group == write.group,
+	      "the NFS write tracepoints are refused together");
 	check(wb.needs == "nfs_file_write" && folio.needs == "nfs_file_write" &&
-		      write.needs.empty(),
+		      end.needs == "nfs_file_write" && write.needs.empty(),
 	      "the others wait for nfs_file_write");
 }
 

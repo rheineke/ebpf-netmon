@@ -96,9 +96,10 @@ netmon_nfs_read_retry(const struct netmon_nfs_readpage_done *r,
 
 /*
  * The records of nfs:nfs_file_write, at the start of each write() to an NFS
- * file (kernels after 6.15), nfs:nfs_update_folio, as a write() or a store through
- * a mapping dirties a page, and nfs:nfs_writeback_done, as the server
- * answers a WRITE. Checked against tracefs like the others.
+ * file, nfs:nfs_write_end, as a write() fills a page, nfs:nfs_update_folio,
+ * as a write() or a store through a mapping dirties one (these three since
+ * kernel 6.18), and nfs:nfs_writeback_done, as the server answers a WRITE.
+ * Checked against tracefs like the others.
  */
 struct netmon_nfs_file_write {
 	unsigned long long common;
@@ -109,6 +110,16 @@ struct netmon_nfs_file_write {
 	long long offset; /* the file position */
 	unsigned long long count; /* bytes to write */
 	int flags; /* IOCB_* */
+};
+
+struct netmon_nfs_write_end {
+	unsigned long long common;
+	unsigned int dev;
+	unsigned int fhandle;
+	unsigned long long fileid;
+	unsigned long long version;
+	long long offset; /* the file position */
+	unsigned long long count; /* bytes to copy into the page */
 };
 
 struct netmon_nfs_update_folio {
@@ -136,11 +147,13 @@ struct netmon_nfs_writeback_done {
 
 /*
  * The key of netmon.bpf.c's map of NFS writers: a file's chunk of
- * 1 << NETMON_NFS_CHUNK_SHIFT bytes, chunk = offset >> NETMON_NFS_CHUNK_SHIFT,
- * or with chunk NETMON_NFS_WHOLE_FILE, the file.
+ * 1 << NETMON_NFS_CHUNK_SHIFT bytes, chunk = offset >> NETMON_NFS_CHUNK_SHIFT;
+ * with chunk NETMON_NFS_WHOLE_FILE, the file's last writer; with
+ * NETMON_NFS_UNPLACED, its last writer at a position netmon doesn't know.
  */
 #define NETMON_NFS_CHUNK_SHIFT 20
 #define NETMON_NFS_WHOLE_FILE (~0ULL)
+#define NETMON_NFS_UNPLACED (~0ULL - 1)
 
 struct netmon_nfs_write_key {
 	unsigned long long fileid;

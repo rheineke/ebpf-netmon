@@ -130,6 +130,15 @@ else
       ENGINE = IcebergLocal('$warehouse/netmon/$table')"
   done
 fi
+# The views need the converter's columns: without one, replacing the live
+# view would fail halfway and leave it broken.
+for column in nfs_fetched nfs_sent; do
+  if ! clickhouse-client -q \
+    "SELECT $column FROM netmon_lake.\`netmon.traffic\` LIMIT 0" >/dev/null 2>&1; then
+    echo "netmon.traffic has no $column yet: run scripts/install_converter.sh first" >&2
+    exit 1
+  fi
+done
 sed -e "s|@RAW@|$raw|g" clickhouse/views.sql | clickhouse-client --multiquery
 clickhouse-client --user grafana -q \
   'SELECT host, count() AS rows, max(ts) AS latest FROM netmon.traffic_live GROUP BY host'
