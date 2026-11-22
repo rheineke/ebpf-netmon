@@ -93,9 +93,13 @@ for _ in $(seq 30); do
   sleep 2
 done
 rest=/etc/default/netmon-iceberg-rest
-# Only the tables' definitions: the warehouse's files stay.
-clickhouse-client -q 'DROP DATABASE IF EXISTS netmon_lake
-  SETTINGS iceberg_delete_data_on_drop = 0'
+lake=$(clickhouse-client -q \
+  "SELECT engine FROM system.databases WHERE name = 'netmon_lake'")
+# Drops only the tables' definitions: the warehouse's files stay.
+drop_lake() {
+  clickhouse-client -q 'DROP DATABASE IF EXISTS netmon_lake
+    SETTINGS iceberg_delete_data_on_drop = 0'
+}
 if [ -f $rest ]; then
   served=$(sudo sed -n 's/^WAREHOUSE=//p' $rest)
   if [ "$served" != "$warehouse" ]; then
@@ -103,6 +107,7 @@ if [ -f $rest ]; then
     exit 1
   fi
   echo "== Reading the tables through the REST catalog"
+  drop_lake
   # Only S3 needs credentials, but ClickHouse asks for them unless the engine
   # has a second argument; for local files that is the format.
   clickhouse-client --allow_database_iceberg=1 -q "
@@ -111,12 +116,17 @@ if [ -f $rest ]; then
     SETTINGS catalog_type = 'rest', warehouse = 'netmon'"
 else
   echo "== Reading the tables' newest metadata files"
+  if [ "$lake" = DataLakeCatalog ]; then
+    drop_lake
+  fi
   # Tables, not icebergLocal() in the views: Grafana's user may read a
-  # table, but a table function would need FILE.
-  clickhouse-client -q 'CREATE DATABASE netmon_lake'
+  # table, but a table function would need FILE. Replaced one at a time, so
+  # a table whose folder is missing (the share is down, or the converter
+  # hasn't made it yet) keeps its old definition and works again later.
+  clickhouse-client -q 'CREATE DATABASE IF NOT EXISTS netmon_lake'
   for table in traffic interfaces; do
     clickhouse-client -q "
-      CREATE TABLE netmon_lake.\`netmon.$table\`
+      CREATE OR REPLACE TABLE netmon_lake.\`netmon.$table\`
       ENGINE = IcebergLocal('$warehouse/netmon/$table')"
   done
 fi

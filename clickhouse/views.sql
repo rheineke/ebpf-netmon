@@ -3,9 +3,10 @@
 -- the REST catalog's, or IcebergLocal tables over their warehouse folders.
 -- The views of the tables are plain (SQL SECURITY INVOKER), so ClickHouse
 -- takes a query's time filter down to the table and opens only the days it
--- needs. Through a DEFINER view, 26.11 and later open every data file. So
--- readers need SELECT on netmon.* and netmon_lake.*. Only the views of raw
--- files run as netmon_views (users.d/grafana.xml), which may read files.
+-- needs. Through a view that runs as another user, 26.11 and later open
+-- every data file. So readers need SELECT on netmon.* and the two tables.
+-- Only the views of raw files run as netmon_views (users.d/grafana.xml),
+-- which may read files.
 CREATE DATABASE IF NOT EXISTS netmon;
 
 -- Hours the converter has loaded: the Iceberg table, at its current
@@ -49,13 +50,13 @@ WHERE hour >= toDate(now('UTC')) - 1
     AND NOT match(substring(_path, length('@RAW@') + 1), '/[.#@]')
     AND (folder, hour) NOT IN (
         SELECT DISTINCT arrayJoin([host, '']), toStartOfHour(ts)
-        FROM netmon.traffic
+        FROM netmon_lake.`netmon.traffic`
         WHERE ts >= toDate(now('UTC')) - 1
     )
     -- Rows, too: a renamed Pi's file has both names in it.
     AND (host, toStartOfHour(toDateTime(ts, 'UTC'))) NOT IN (
         SELECT DISTINCT host, toStartOfHour(ts)
-        FROM netmon.traffic
+        FROM netmon_lake.`netmon.traffic`
         WHERE ts >= toDate(now('UTC')) - 1
     )
 -- A line still being written is skipped, not an error.
@@ -98,12 +99,12 @@ WHERE hour >= toDate(now('UTC')) - 1
     AND NOT match(substring(_path, length('@RAW@') + 1), '/[.#@]')
     AND (folder, hour) NOT IN (
         SELECT DISTINCT arrayJoin([host, '']), toStartOfHour(ts)
-        FROM netmon.interfaces
+        FROM netmon_lake.`netmon.interfaces`
         WHERE ts >= toDate(now('UTC')) - 1
     )
     AND (host, toStartOfHour(toDateTime(ts, 'UTC'))) NOT IN (
         SELECT DISTINCT host, toStartOfHour(ts)
-        FROM netmon.interfaces
+        FROM netmon_lake.`netmon.interfaces`
         WHERE ts >= toDate(now('UTC')) - 1
     )
 SETTINGS input_format_allow_errors_num = 100;

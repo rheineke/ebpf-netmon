@@ -10,7 +10,8 @@
 load writes four hours of known traffic from two hosts, ending in the
 last finished hour, with their interfaces' counters, to DIR/raw, converts
 the first three into DIR/warehouse, and then spoils one of them, which the
-live views must not open. The converter's own next run would load the fourth.
+live views must not open, and pi-a's first hour again, ten days earlier,
+in Iceberg only. The converter's own next run would load the fourth.
 check runs every panel of grafana/dashboards/netmon.json through
 clickhouse-client, as Grafana's user, with Grafana's macros filled in, and
 checks the totals, so the live view must add the last hour from the raw
@@ -58,6 +59,7 @@ INTERFACES = {
 for counts in INTERFACES.values():
     counts.append(("veth1a2b3c", 10_000, 9, 10_000, 9))
 COVERAGE = {"pi-a": 1.0, "pi-b": 0.5}
+OLD_DAYS = 10  # old_hour's offset: outside the live views' last two days
 START = None  # the first hour; load picks it, the others read it from DIR
 CATALOG = os.environ.get("NETMON_TEST_CATALOG")
 
@@ -164,6 +166,25 @@ def load(test_dir):
     odd.write_text(json.dumps(row) + "\n")
 
 
+def old_hour(test_dir):
+    """Loads pi-a's first hour again, OLD_DAYS earlier, into each table but
+    not RAW: a day the live views, which look for hours not loaded yet in the
+    last two, must not open."""
+    sys.path.insert(0, str(ROOT / "tools"))
+    import pyarrow as pa
+    import to_iceberg
+
+    day = test_dir / "raw" / "pi-a" / f"{START:%Y-%m-%d}"
+    for kind in to_iceberg.KINDS:
+        rows = to_iceberg.read_rows(day / f"{START:%H}{kind.suffix}", kind)
+        for row in rows:
+            row["ts"] -= dt.timedelta(days=OLD_DAYS)
+        table = to_iceberg.open_table(test_dir / "warehouse", CATALOG, kind)
+        table.append(pa.Table.from_pylist(rows, schema=kind.arrow))
+        count = test_dir / f"iceberg_rows.{kind.name}"
+        count.write_text(str(int(count.read_text()) + len(rows)))
+
+
 def spoil_converted(test_dir):
     """Appends garbage to an hour already in Iceberg. The live view must skip
     that file without opening it: over 100 bad lines would fail its query."""
@@ -223,8 +244,9 @@ def check(test_dir):
     dash = json.loads((ROOT / "grafana/dashboards/netmon.json").read_text())
     per_host = HOURS * ROWS * SCALE  # each counter's weight per host
     iceberg = query("SELECT count() AS n FROM netmon.traffic")[0]["n"]
+    old = ROWS  # old_hour's
     nulls = "SELECT countIf(nfs_fetched IS NULL) AS n FROM netmon.traffic"
-    converted = 1 if int(iceberg) < 2 * HOURS * ROWS else 2  # of OLD_HOURS
+    converted = 1 if int(iceberg) - old < 2 * HOURS * ROWS else 2  # of OLD_HOURS
     check_eq(
         "rows without nfs_fetched, in Iceberg",
         int(query(nulls)[0]["n"]),
@@ -248,12 +270,12 @@ def check(test_dir):
     want = int((test_dir / "iceberg_rows.traffic").read_text())
     check_eq("Iceberg rows, as the converter left them", int(iceberg), want)
     live = query("SELECT count() AS n FROM netmon.traffic_live")[0]["n"]
-    check_eq("live rows", int(live), HOURS * ROWS * 2)
+    check_eq("live rows", int(live), HOURS * ROWS * 2 + old)
     iceberg = query("SELECT count() AS n FROM netmon.interfaces")[0]["n"]
     want = int((test_dir / "iceberg_rows.interfaces").read_text())
     check_eq("Iceberg interface rows, as the converter left them", int(iceberg), want)
     live = query("SELECT count() AS n FROM netmon.interfaces_live")[0]["n"]
-    check_eq("live interface rows", int(live), HOURS * ROWS * 2 * 3)
+    check_eq("live interface rows", int(live), (HOURS * ROWS * 2 + old) * 3)
     hosts = [r["host"] for r in query(dash["templating"]["list"][0]["query"])]
     check_eq("host variable", hosts, ["pi-a", "pi-b"])
     for panel in dash["panels"]:
@@ -334,22 +356,38 @@ def profile_events(sql):
 
 def check_pruned():
     """A query's time range reaches each Iceberg table through the views, so
-    a range with no rows opens none of its data files. A DEFINER view stops it
-    on ClickHouse 26.11 and later, which then open every file of the table."""
+    a range with no rows opens none of its data files, and the live views
+    look for hours not loaded yet in the last two days only. A view that runs
+    as another user stops the range on ClickHouse 26.11 and later, which then
+    open every file of the table, so only the views of raw files may."""
+    sql = "SELECT name, extract(create_table_query, 'SQL SECURITY ([A-Z]+)')"
+    sql += " AS s FROM system.tables WHERE database = 'netmon'"
+    got = {r["name"]: r["s"] for r in query(sql)}
+    want = {}
+    for table in ("traffic", "interfaces"):
+        want |= {table: "INVOKER", f"{table}_live": "INVOKER"}
+        want[f"{table}_raw"] = "DEFINER"
+    check_eq("views' SQL SECURITY", got, want)
     found = "IcebergMetadataReturnedObjectInfos"  # data files to read
     for table in ("traffic", "interfaces"):
         files = profile_events(f"SELECT max(ts) FROM netmon.{table}").get(found, 0)
-        check_eq(f"{table}: data files", files > 0, True)
-        for view in (table, f"{table}_live"):
-            sql = f"SELECT max(ts) FROM netmon.{view} WHERE ts < '2000-01-01'"
+        check_eq(f"{table}: data files", files > 1, True)  # old_hour's day too
+        for view in (table, f"{table}_live", f"{table}_raw"):
+            sql = f"SELECT max(ts) FROM netmon.{view}"
+            if view != f"{table}_raw":
+                sql += " WHERE ts < '2000-01-01'"
             events = profile_events(sql)
             pruned = events.get("IcebergPartitionPrunedFiles", 0)
             pruned += events.get("IcebergMinMaxIndexPrunedFiles", 0)
-            # The live views' subqueries read the last two days: at least all.
             name = f"{view}, no rows in range"
-            check_eq(f"{name}: {files} files pruned", pruned >= files, True)
             if view == table:
+                check_eq(f"{name}: {files} files pruned", pruned, files)
                 check_eq(f"{name}: files read", events.get(found, 0), 0)
+            elif view.endswith("_live"):
+                # Its raw rows' subqueries prune old_hour's day too.
+                check_eq(f"{name}: over {files} files pruned", pruned > files, True)
+            else:
+                check_eq(f"{view}: old_hour's day pruned", pruned > 0, True)
 
 
 def check_locked_down(test_dir):
@@ -378,12 +416,16 @@ def check_locked_down(test_dir):
             capture_output=True,
             text=True,
         )
-        check_eq(f"refused: {sql}", f"({error})" in out.stderr, True)
+        # Nightlies refuse writes for readonly before checking grants.
+        refused = f"({error})" in out.stderr
+        refused |= sql.startswith("INSERT") and "(READONLY)" in out.stderr
+        check_eq(f"refused: {sql}", refused, True)
     # The plugin sends its query timeout plus 5 s: 64 for panels, 34 for alerts.
     for seconds in (64, 34):
         sql = "SELECT count() AS n FROM netmon.traffic_live"
         sql += f" SETTINGS max_execution_time = {seconds}"
-        check_eq(f"max_execution_time {seconds}", query(sql)[0]["n"], HOURS * ROWS * 2)
+        want = HOURS * ROWS * 2 + ROWS  # and old_hour's
+        check_eq(f"max_execution_time {seconds}", query(sql)[0]["n"], want)
 
 
 def check_high_traffic(title, sql, limit):
@@ -485,6 +527,7 @@ if __name__ == "__main__":
     START = dt.datetime.fromisoformat((test_dir / "start").read_text())
     if sys.argv[1] == "load":
         convert(test_dir, HOURS - 1)  # the last hour stays raw
+        old_hour(test_dir)
         spoil_converted(test_dir)
     elif sys.argv[1] == "convert":
         convert(test_dir, HOURS)
