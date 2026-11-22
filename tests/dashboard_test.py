@@ -16,7 +16,9 @@ clickhouse-client, as Grafana's user, with Grafana's macros filled in, and
 checks the totals, so the live view must add the last hour from the raw
 files. It also runs every alert rule's query, and the high-traffic rule's
 over rows made for its window too, which needs the dev dependencies (uv
-sync). convert loads that hour too, and maintain compacts
+sync), and checks that a time range reaches the Iceberg tables through the
+views, which then open only its days. convert loads that hour too, and
+maintain compacts
 the table and expires its old snapshots, as a month later; the totals must
 not change. stray adds a copy of the table's first metadata file, numbered
 after the rest, which only a catalog read ignores.
@@ -230,13 +232,19 @@ def check(test_dir):
     )
     nulls = nulls.replace("netmon.traffic", "netmon.traffic_live")
     check_eq("rows without nfs_fetched, live", int(query(nulls)[0]["n"]), 2 * ROWS)
-    # The live view would hide a stale table, so check it by itself too.
+    # Through the REST catalog, or else the newest metadata file.
     if CATALOG:
-        sql = "SELECT create_table_query AS q FROM system.tables"
-        sql += " WHERE database = 'netmon' AND name = 'traffic'"
+        sql = "SELECT engine FROM system.databases WHERE name = 'netmon_lake'"
         check_eq(
-            "read through the REST catalog", "netmon_lake" in query(sql)[0]["q"], True
+            "read through the REST catalog", query(sql)[0]["engine"], "DataLakeCatalog"
         )
+    else:
+        sql = "SELECT name, engine FROM system.tables"
+        sql += " WHERE database = 'netmon_lake'"
+        got = {r["name"]: r["engine"] for r in query(sql)}
+        want = dict.fromkeys(("netmon.traffic", "netmon.interfaces"), "IcebergLocal")
+        check_eq("read as IcebergLocal tables", got, want)
+    # The live view would hide a stale table, so check it by itself too.
     want = int((test_dir / "iceberg_rows.traffic").read_text())
     check_eq("Iceberg rows, as the converter left them", int(iceberg), want)
     live = query("SELECT count() AS n FROM netmon.traffic_live")[0]["n"]
@@ -295,30 +303,78 @@ def check(test_dir):
             check_eq(f"{title}: pids", {r["pids"] for r in rows}, {1})
     check_bucket_rates(dash)
     check_alerts()
-    check_locked_down()
+    check_pruned()
+    check_locked_down(test_dir)
     print("PASS")
 
 
-def check_locked_down():
-    """Grafana's user can't reach files, URLs or its limits but by the views,
-    and can set the time limits Grafana's plugin asks for."""
+def profile_events(sql):
+    """Runs sql as Grafana's user; returns its profile events' totals."""
+    out = subprocess.run(
+        [
+            "clickhouse-client",
+            "--user",
+            "grafana",
+            "--print-profile-events",
+            "--profile-events-delay-ms=-1",
+            "-q",
+            sql,
+        ],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+    )
+    if out.returncode:
+        sys.exit(f"FAIL: {out.stderr.strip()}\n{sql}")
+    events = {}
+    for name, n in re.findall(r"\] (\w+): (\d+) \(increment\)", out.stderr):
+        events[name] = events.get(name, 0) + int(n)
+    return events
+
+
+def check_pruned():
+    """A query's time range reaches each Iceberg table through the views, so
+    a range with no rows opens none of its data files. A DEFINER view stops it
+    on ClickHouse 26.11 and later, which then open every file of the table."""
+    found = "IcebergMetadataReturnedObjectInfos"  # data files to read
+    for table in ("traffic", "interfaces"):
+        files = profile_events(f"SELECT max(ts) FROM netmon.{table}").get(found, 0)
+        check_eq(f"{table}: data files", files > 0, True)
+        for view in (table, f"{table}_live"):
+            sql = f"SELECT max(ts) FROM netmon.{view} WHERE ts < '2000-01-01'"
+            events = profile_events(sql)
+            pruned = events.get("IcebergPartitionPrunedFiles", 0)
+            pruned += events.get("IcebergMinMaxIndexPrunedFiles", 0)
+            # The live views' subqueries read the last two days: at least all.
+            name = f"{view}, no rows in range"
+            check_eq(f"{name}: {files} files pruned", pruned >= files, True)
+            if view == table:
+                check_eq(f"{name}: files read", events.get(found, 0), 0)
+
+
+def check_locked_down(test_dir):
+    """Grafana's user can't reach files, URLs or its limits but by the views
+    and the Iceberg tables, and can set the time limits Grafana's plugin
+    asks for."""
     denied, limited = "ACCESS_DENIED", "SETTING_CONSTRAINT_VIOLATION"
+    warehouse = test_dir.resolve() / "warehouse/netmon/traffic"
     probes = [
         ("SELECT count() FROM file('**/*.jsonl', 'LineAsString')", denied),
         ("INSERT INTO FUNCTION file('grafana.txt', 'LineAsString') SELECT 'x'", denied),
         ("SELECT * FROM url('http://127.0.0.1:8123/', 'LineAsString')", denied),
+        (f"SELECT count() FROM icebergLocal('{warehouse}')", denied),
         ("DROP VIEW netmon.traffic_live", denied),
         ("DROP VIEW netmon.interfaces_live", denied),
+        ("DROP VIEW netmon.traffic_raw", denied),
+        ("DROP TABLE netmon_lake.`netmon.traffic`", denied),
         ("SELECT 1 SETTINGS max_memory_usage = 0", limited),
         ("SELECT 1 SETTINGS max_execution_time = 0", limited),
         ("SELECT 1 SETTINGS max_execution_time = 600", limited),
     ]
-    if CATALOG:
-        probes.append(("SELECT count() FROM netmon_lake.`netmon.traffic`", denied))
-        probes.append(("SELECT count() FROM netmon_lake.`netmon.interfaces`", denied))
     for sql, error in probes:
         out = subprocess.run(
             ["clickhouse-client", "--user", "grafana", "-q", sql],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
         )

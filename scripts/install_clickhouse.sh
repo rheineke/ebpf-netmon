@@ -78,7 +78,7 @@ echo "== Configuring"
 sudo install -m 644 clickhouse/config.d/netmon.xml /etc/clickhouse-server/config.d/
 sudo install -m 644 clickhouse/users.d/grafana.xml /etc/clickhouse-server/users.d/
 cat <<XML | sudo tee /etc/clickhouse-server/config.d/netmon-warehouse.xml >/dev/null
-<!-- Written by install_clickhouse.sh: icebergLocal() and file() read only here. -->
+<!-- Written by install_clickhouse.sh: Iceberg tables and file() read only here. -->
 <clickhouse>
     <user_files_path>$files/</user_files_path>
 </clickhouse>
@@ -93,28 +93,33 @@ for _ in $(seq 30); do
   sleep 2
 done
 rest=/etc/default/netmon-iceberg-rest
-clickhouse-client -q 'DROP DATABASE IF EXISTS netmon_lake'
+# Only the tables' definitions: the warehouse's files stay.
+clickhouse-client -q 'DROP DATABASE IF EXISTS netmon_lake
+  SETTINGS iceberg_delete_data_on_drop = 0'
 if [ -f $rest ]; then
   served=$(sudo sed -n 's/^WAREHOUSE=//p' $rest)
   if [ "$served" != "$warehouse" ]; then
     echo "the REST catalog serves $served, not $warehouse" >&2
     exit 1
   fi
-  echo "== Reading the table through the REST catalog"
+  echo "== Reading the tables through the REST catalog"
   # Only S3 needs credentials, but ClickHouse asks for them unless the engine
   # has a second argument; for local files that is the format.
   clickhouse-client --allow_database_iceberg=1 -q "
     CREATE DATABASE netmon_lake
     ENGINE = DataLakeCatalog('http://127.0.0.1:8181/v1', 'auto')
     SETTINGS catalog_type = 'rest', warehouse = 'netmon'"
-  traffic="netmon_lake.\`netmon.traffic\`"
-  interfaces="netmon_lake.\`netmon.interfaces\`"
 else
-  traffic="icebergLocal('$warehouse/netmon/traffic')"
-  interfaces="icebergLocal('$warehouse/netmon/interfaces')"
+  echo "== Reading the tables' newest metadata files"
+  # Tables, not icebergLocal() in the views: Grafana's user may read a
+  # table, but a table function would need FILE.
+  clickhouse-client -q 'CREATE DATABASE netmon_lake'
+  for table in traffic interfaces; do
+    clickhouse-client -q "
+      CREATE TABLE netmon_lake.\`netmon.$table\`
+      ENGINE = IcebergLocal('$warehouse/netmon/$table')"
+  done
 fi
-sed -e "s|@TRAFFIC@|$traffic|g" -e "s|@INTERFACES@|$interfaces|g" \
-  -e "s|@RAW@|$raw|g" clickhouse/views.sql \
-  | clickhouse-client --multiquery
+sed -e "s|@RAW@|$raw|g" clickhouse/views.sql | clickhouse-client --multiquery
 clickhouse-client --user grafana -q \
   'SELECT host, count() AS rows, max(ts) AS latest FROM netmon.traffic_live GROUP BY host'

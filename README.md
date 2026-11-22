@@ -471,11 +471,13 @@ counter are null there. Upgrade the converter before netmon on any Pi that
 feeds it, too: an older converter loads a newer netmon's rows without the
 counters it doesn't know, and those hours aren't loaded again.
 
-ClickHouse listens on 127.0.0.1 only. It has two views of each table, the
+ClickHouse listens on 127.0.0.1 only. It has these views of each table, the
 processes' rows (`traffic`) and the interfaces' (`interfaces`):
 
-- `netmon.traffic` reads the Iceberg table with `icebergLocal`, up to the
-  last hour the converter loaded.
+- `netmon.traffic` reads the Iceberg table, up to the last hour the
+  converter loaded: through the REST catalog if there is one, or else the
+  newest metadata file. A query's time range reaches the table, so it opens
+  only those days' files.
 - `netmon.traffic_live` adds rows from the last two days of raw files in
   RAW for hours not yet in Iceberg, so it is as recent as the raw files:
   about a minute behind with the per-minute sync. It opens only the raw
@@ -490,8 +492,13 @@ processes' rows (`traffic`) and the interfaces' (`interfaces`):
 - `netmon.interfaces` and `netmon.interfaces_live` do the same for the
   interface files.
 
-Grafana's ClickHouse user, `grafana`, may only read these views; they read
-the files as `netmon_views`, which can't log in. ClickHouse's own `default`
+Grafana's ClickHouse user, `grafana`, may only read these views and the
+tables in `netmon_lake` that they read. Only `netmon.traffic_raw` and
+`netmon.interfaces_raw`, the live views' raw rows, read files: they run as
+`netmon_views`, which can't log in. The others run as their reader, because
+through a view that runs as another user, ClickHouse 26.11 and later don't
+pass the time range on to the table and read all of it: on a Pi 4, each
+read took 2 s longer for every month of history. ClickHouse's own `default`
 user keeps its passwordless login from this machine, for the installer, so
 don't give untrusted users a shell here.
 

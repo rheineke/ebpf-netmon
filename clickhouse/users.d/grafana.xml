@@ -1,6 +1,6 @@
-<!-- Grafana's user may only read the netmon views. The views read the raw
-     files and the Iceberg table as netmon_views, which can't log in. The
-     server listens on 127.0.0.1 only. -->
+<!-- Grafana's user may only read the netmon views and the Iceberg tables
+     (netmon_lake). The views of raw files read them as netmon_views, which
+     can't log in. The server listens on 127.0.0.1 only. -->
 <clickhouse>
     <profiles>
         <grafana>
@@ -26,6 +26,8 @@
             <quota>default</quota>
             <grants>
                 <query>GRANT SELECT ON netmon.*</query>
+                <!-- For the plain views of the tables (views.sql). -->
+                <query>GRANT SELECT ON netmon_lake.*</query>
             </grants>
         </grafana>
         <!-- The definer of the views; no networks, so no logins. -->
@@ -36,7 +38,7 @@
             <quota>default</quota>
             <grants>
                 <query>GRANT SELECT ON netmon.*</query>
-                <!-- The REST catalog's tables (install_rest_catalog.sh). -->
+                <!-- The Iceberg tables (install_clickhouse.sh). -->
                 <query>GRANT SELECT ON netmon_lake.*</query>
                 <query>GRANT FILE, CREATE TEMPORARY TABLE ON *.*</query>
             </grants>
