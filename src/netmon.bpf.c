@@ -294,14 +294,11 @@ int nfs_readpage_done(const struct netmon_nfs_readpage_done *r)
  * several writers may go out together. So netmon records who wrote where,
  * and nfs_writeback_done charges each WRITE's reply to the last writer of
  * the file's MiB it covers:
- * - nfs_write_end, for each page a write() fills, records the writer of the
- *   page's MiB, at its true position (an O_APPEND write's too);
+ * - nfs_writepage_setup, as a write() or a store through a mapping dirties
+ *   a page, records the process as the writer of the page's MiB, at its
+ *   file position (an O_APPEND write's true one);
  * - nfs_file_write records an O_DIRECT write()'s MiBs, which it sends at
- *   once, and every write()'s process as the file's writer, the fallback;
- * - a writer whose position isn't known, a store through a mapping
- *   (nfs_update_folio outside a write()) or an O_DIRECT append, is recorded
- *   as the file's unplaced writer, and charged instead of a MiB's writer
- *   that wrote before it.
+ *   once, and every write()'s process as the file's writer, the fallback.
  * Writers of the same MiB between two WRITEs are charged as the last; a
  * reply with no writer recorded (pages written before netmon attached) is
  * counted in nfs_unmatched.
@@ -310,11 +307,10 @@ struct nfs_writer {
 	__u32 tgid;
 	__u32 uid;
 	char comm[NETMON_COMM_LEN];
-	__u64 ns; /* when, for unplaced writers */
 };
 
 /*
- * 16384 entries: a MiB of a file each, and two per file written. LRU, so
+ * 16384 entries: a MiB of a file each, and one per file written. LRU, so
  * those written longest ago age out; each reply's lookups keep its alive.
  */
 struct {
@@ -324,21 +320,12 @@ struct {
 	__type(value, struct nfs_writer);
 } nfs_writers SEC(".maps");
 
-/*
- * The thread whose nfs_write_end ran last on this CPU: the nfs_update_folio
- * that follows in it is the same write(), not a store through a mapping.
- */
-struct {
-	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, 1);
-	__type(key, __u32);
-	__type(value, __u64);
-} nfs_write_end_thread SEC(".maps");
-
-/* An O_DIRECT write() records at most this many MiBs; the file's entry
- * covers the rest. */
+/* A write() or page records at most this many MiBs; for an O_DIRECT
+ * write(), the file's entry covers the rest. */
 #define NFS_WRITE_CHUNKS 64
-/* From the kernel's fs.h, as the format file prints them. */
+/* From the kernel's fs.h, as 6.18's format file prints them. An O_DIRECT
+ * RWF_APPEND write's position isn't known yet: it is the file's writer
+ * only. */
 #define IOCB_APPEND 0x10
 #define IOCB_DIRECT (1 << 17)
 
@@ -347,36 +334,31 @@ static __always_inline void current_writer(struct nfs_writer *w)
 	w->tgid = bpf_get_current_pid_tgid() >> 32;
 	w->uid = (__u32)bpf_get_current_uid_gid();
 	bpf_get_current_comm(w->comm, sizeof(w->comm));
-	w->ns = bpf_ktime_get_ns();
 }
 
-/* Records w as key's writer. If it already is, only its time changes, in
- * place: a lookup is cheaper than an update, and a write() fills many
- * pages. */
+/* Records w as key's writer, unless it already is: a lookup is cheaper
+ * than an update, and a write() dirties many pages. */
 static __always_inline void set_writer(const struct netmon_nfs_write_key *key,
 				       const struct nfs_writer *w)
 {
 	struct nfs_writer *found = bpf_map_lookup_elem(&nfs_writers, key);
-	if (found && found->tgid == w->tgid && found->uid == w->uid) {
-		found->ns = w->ns;
+	if (found && found->tgid == w->tgid && found->uid == w->uid)
 		return;
-	}
 	bpf_map_update_elem(&nfs_writers, key, w, BPF_ANY);
 }
 
-/* Records w as the writer of the MiBs of [offset, offset + count), up to
- * chunks of them. */
+/* Records w as the writer of the MiBs of [offset, offset + count). */
 static __always_inline void set_chunks(struct netmon_nfs_write_key *key,
 				       const struct nfs_writer *w,
 				       long long offset,
-				       unsigned long long count, int chunks)
+				       unsigned long long count)
 {
 	if (!count)
 		return;
 	__u64 first = netmon_nfs_chunk(offset);
 	__u64 last = netmon_nfs_chunk(offset + (long long)(count - 1));
 	for (int i = 0; i < NFS_WRITE_CHUNKS; i++) {
-		if (i >= chunks || first + i > last)
+		if (first + i > last)
 			break;
 		key->chunk = first + i;
 		set_writer(key, w);
@@ -396,19 +378,14 @@ int nfs_file_write_start(const struct netmon_nfs_file_write *r)
 	key.fhandle = r->fhandle;
 	key.chunk = NETMON_NFS_WHOLE_FILE;
 	set_writer(&key, &w);
-	if (!(r->flags & IOCB_DIRECT))
-		return 0; /* nfs_write_end places each page */
-	if (r->flags & IOCB_APPEND) { /* the position isn't known yet */
-		key.chunk = NETMON_NFS_UNPLACED;
-		set_writer(&key, &w);
-		return 0;
-	}
-	set_chunks(&key, &w, r->offset, r->count, NFS_WRITE_CHUNKS);
+	/* Buffered: nfs_writepage_setup places each page. */
+	if ((r->flags & IOCB_DIRECT) && !(r->flags & IOCB_APPEND))
+		set_chunks(&key, &w, r->offset, r->count);
 	return 0;
 }
 
-SEC("tracepoint/nfs/nfs_write_end")
-int nfs_write_end(const struct netmon_nfs_write_end *r)
+SEC("tracepoint/nfs/nfs_writepage_setup")
+int nfs_writepage_setup(const struct netmon_nfs_writepage_setup *r)
 {
 	struct nfs_writer w = {};
 	current_writer(&w);
@@ -416,34 +393,7 @@ int nfs_write_end(const struct netmon_nfs_write_end *r)
 	key.fileid = r->fileid;
 	key.dev = r->dev;
 	key.fhandle = r->fhandle;
-	/* A page, or a large folio, which spans at most two MiBs at most. */
-	set_chunks(&key, &w, r->offset, r->count, 2);
-	__u32 zero = 0;
-	__u64 *thread = bpf_map_lookup_elem(&nfs_write_end_thread, &zero);
-	if (thread)
-		*thread = bpf_get_current_pid_tgid();
-	return 0;
-}
-
-SEC("tracepoint/nfs/nfs_update_folio")
-int nfs_update_folio(const struct netmon_nfs_update_folio *r)
-{
-	__u32 zero = 0;
-	__u64 *thread = bpf_map_lookup_elem(&nfs_write_end_thread, &zero);
-	if (thread && *thread == bpf_get_current_pid_tgid()) {
-		*thread = 0; /* write()'s page: nfs_write_end placed it */
-		return 0;
-	}
-	struct nfs_writer w = {};
-	current_writer(&w);
-	struct netmon_nfs_write_key key = {};
-	key.fileid = r->fileid;
-	key.dev = r->dev;
-	key.fhandle = r->fhandle;
-	key.chunk = NETMON_NFS_UNPLACED;
-	set_writer(&key, &w);
-	key.chunk = NETMON_NFS_WHOLE_FILE;
-	set_writer(&key, &w);
+	set_chunks(&key, &w, r->offset, r->count);
 	return 0;
 }
 
@@ -472,11 +422,6 @@ int nfs_writeback_done(const struct netmon_nfs_writeback_done *r)
 	key.fileid = r->fileid;
 	key.dev = r->dev;
 	key.fhandle = r->fhandle;
-	key.chunk = NETMON_NFS_UNPLACED;
-	struct nfs_writer *unplaced = bpf_map_lookup_elem(&nfs_writers, &key);
-	struct nfs_writer up = {};
-	if (unplaced)
-		up = *unplaced;
 	long long offset = r->offset;
 	__u32 left = r->res_count; /* what mountstats counts as written */
 	int first_unmatched = 1;
@@ -487,25 +432,12 @@ int nfs_writeback_done(const struct netmon_nfs_writeback_done *r)
 		key.chunk = netmon_nfs_chunk(offset);
 		struct nfs_writer *found =
 			bpf_map_lookup_elem(&nfs_writers, &key);
-		struct nfs_writer w = {};
-		int have = 0;
-		if (found) {
-			w = *found;
-			have = 1;
-		}
-		if (unplaced && (!have || up.ns > w.ns)) {
-			w = up;
-			have = 1;
-		}
-		if (!have) {
+		if (!found) {
 			key.chunk = NETMON_NFS_WHOLE_FILE;
 			found = bpf_map_lookup_elem(&nfs_writers, &key);
-			if (found) {
-				w = *found;
-				have = 1;
-			}
 		}
-		if (have) {
+		if (found) {
+			struct nfs_writer w = *found;
 			add_bytes(w.tgid, w.uid, w.comm, NETMON_NFS_SENT, part,
 				  0);
 		} else {

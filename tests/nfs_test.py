@@ -8,15 +8,17 @@ Reads FILE_ON_NFS four times: with read() after dropping its cached pages,
 with sendfile() from the page cache, then memory-mapped and with O_DIRECT,
 each after dropping its pages again. If a writable directory is given, writes
 scratch files there three ways: write() then fsync(), stores through a
-mapping then msync(), and O_DIRECT, then two after another process wrote
-them: appended to with O_APPEND, and stored to through a mapping. It deletes
-them all. Passes when netmon's
+mapping then msync(), and O_DIRECT, then three that another process writes
+too: appended to with O_APPEND, stored to through a mapping, and written
+while the other's pages wait, both sent by this process's fsync(). It
+deletes them all. Passes when netmon's
 nfs_read and nfs_write for this process match the file bytes it read and
 wrote (read(), sendfile() and write(), not the mapped ones), nfs_fetched the
 bytes the server sent, the file once for each read but the cached one, and
-nfs_sent the bytes the server took for this process's writes only. Every
-process's nfs_sent must also add up to what the kernel counts the servers
-took on all NFS mounts (serverwritebytes in /proc/self/mountstats).
+nfs_sent the bytes the server took for this process's writes only. This
+process's and the other's nfs_sent must also add up to what the kernel counts
+the server took on the directory's mount (serverwritebytes in
+/proc/self/mountstats), which nothing else may write to meanwhile.
 
 On a kernel without the nfs:nfs_file_write tracepoint, netmon can't count
 nfs_sent, and the test says so and checks the rest.
@@ -143,41 +145,62 @@ def direct_write_file(directory):
         os.unlink(path)
 
 
-def server_written():
-    """The bytes the kernel counts NFS servers took, on every mount: netmon
-    counts them all. A mount listed twice (bind mounts share the counters)
-    counts once."""
-    seen = set()
+def server_written(directory):
+    """The bytes the kernel counts the server took on directory's mount."""
+    directory = os.path.realpath(directory)
+    best, written = "", None
     with open("/proc/self/mountstats") as f:
-        device = None
+        mount = None
         for line in f:
             words = line.split()
             if line.startswith("device "):
-                device = words[1] if "nfs" in line.split("fstype")[-1] else None
-            elif device and words[:1] == ["bytes:"]:
-                seen.add((device, line))
-    return sum(int(line.split()[6]) for _, line in seen)
+                mount = words[4] if "nfs" in line.split("fstype")[-1] else None
+            elif mount and words[:1] == ["bytes:"]:
+                inside = directory == mount or directory.startswith(
+                    mount.rstrip("/") + "/"
+                )
+                if inside and len(mount) > len(best):
+                    best, written = mount, int(words[6])
+    return written
 
 
 OTHER_WRITER = """
 import os, sys
 with open(sys.argv[1], "wb") as f:
     f.write(b"o" * int(sys.argv[2]))
-    os.fsync(f.fileno())
+    if sys.argv[3] == "fsync":
+        os.fsync(f.fileno())
+    else:  # hold the pages dirty until told
+        print("written", flush=True)
+        sys.stdin.readline()
 """
+OTHERS = []  # their pids
 
 
-def written_by_another(path, size):
-    """Another process writes path, so netmon has a writer for its MiBs."""
-    subprocess.run([sys.executable, "-c", OTHER_WRITER, path, str(size)], check=True)
+def written_by_another(path, size, then="fsync"):
+    """Another process writes path, so netmon has a writer for its MiBs.
+    Unless then is "fsync", returns it still running, holding them dirty."""
+    other = subprocess.Popen(
+        [sys.executable, "-c", OTHER_WRITER, path, str(size), then],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    OTHERS.append(other.pid)
+    if then == "fsync":
+        other.wait()
+        return None
+    other.stdout.readline()
+    return other
 
 
 def append_file(directory):
-    """O_APPEND after another process wrote the file: write() is called at
-    position 0, and the kernel moves it to the end."""
+    """O_APPEND after another process wrote the file, ending mid-MiB: write()
+    is called at position 0, and the kernel moves it to the end, in a MiB the
+    other process wrote."""
     path = scratch(directory, "append")
     try:
-        written_by_another(path, WRITE_BYTES)
+        written_by_another(path, WRITE_BYTES + (512 << 10))
         fd = os.open(path, os.O_WRONLY | os.O_APPEND)
         try:
             os.write(fd, b"a" * (64 << 10))
@@ -205,6 +228,24 @@ def mmap_after_another(directory):
     return WRITE_BYTES
 
 
+def write_beside_another(directory):
+    """Writes the second half of a file whose first half another process
+    wrote and holds dirty; this process's fsync() sends both."""
+    path = scratch(directory, "beside")
+    try:
+        other = written_by_another(path, WRITE_BYTES // 2, then="hold")
+        with open(path, "r+b") as f:
+            f.seek(WRITE_BYTES // 2)
+            f.write(b"b" * (WRITE_BYTES // 2))
+            os.fsync(f.fileno())
+        other.stdin.write("done\n")
+        other.stdin.close()
+        other.wait()
+    finally:
+        os.unlink(path)
+    return WRITE_BYTES // 2
+
+
 def main():
     if len(sys.argv) not in (2, 3):
         sys.exit(__doc__)
@@ -216,7 +257,7 @@ def main():
     )
     time.sleep(1.5)  # let the probes attach and the baseline read happen
     directory = sys.argv[2] if len(sys.argv) == 3 else None
-    written_before = server_written()
+    written_before = server_written(directory) if directory else None
 
     path = sys.argv[1]
     drop_cache(path)
@@ -243,10 +284,13 @@ def main():
         stored = mmap_after_another(directory)
         want["nfs_fetched"] += stored
         want["nfs_sent"] += stored
+        beside = write_beside_another(directory)
+        want["nfs_write"] += beside
+        want["nfs_sent"] += beside
     print(f"moved: {want}", flush=True)
 
     time.sleep(2)  # one more report after the last byte
-    written_after = server_written()
+    written_after = server_written(directory) if directory else None
     netmon.terminate()
     out, err = netmon.communicate(timeout=10)
     sys.stderr.write(err)
@@ -254,20 +298,23 @@ def main():
         print("skip: this kernel has no nfs:nfs_file_write, so no nfs_sent")
         want.pop("nfs_sent", None)
     counted = dict.fromkeys(want, 0)
-    sent_by_all = 0
+    sent_by_test = 0
     for line in out.splitlines():
         row = json.loads(line)
-        sent_by_all += row.get("nfs_sent", 0)  # left out while not counted
+        if row["pid"] in OTHERS + [os.getpid()]:
+            sent_by_test += row.get("nfs_sent", 0)  # left out while not counted
         if row["pid"] == os.getpid():
             for k in counted:
-                counted[k] += row[k]
+                counted[k] += row.get(k, 0)
     print(f"netmon counted: {counted}")
     if counted != want:
         sys.exit("FAIL: netmon disagrees with the NFS bytes moved")
     if "nfs_sent" in want:
         server = written_after - written_before
-        print(f"nfs_sent of every process {sent_by_all}, serverwritebytes {server}")
-        if sent_by_all != server:
+        print(
+            f"nfs_sent of this test's processes {sent_by_test}, serverwritebytes {server}"
+        )
+        if sent_by_test != server:
             sys.exit("FAIL: nfs_sent disagrees with the kernel's count")
     print("PASS")
 

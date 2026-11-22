@@ -43,17 +43,12 @@ inline const std::vector<TracepointField> kNfsFileWrite = {
 	{"count", offsetof(netmon_nfs_file_write, count), 8},
 	{"flags", offsetof(netmon_nfs_file_write, flags), 4},
 };
-inline const std::vector<TracepointField> kNfsWriteEnd = {
-	{"dev", offsetof(netmon_nfs_write_end, dev), 4},
-	{"fhandle", offsetof(netmon_nfs_write_end, fhandle), 4},
-	{"fileid", offsetof(netmon_nfs_write_end, fileid), 8},
-	{"offset", offsetof(netmon_nfs_write_end, offset), 8},
-	{"count", offsetof(netmon_nfs_write_end, count), 8},
-};
-inline const std::vector<TracepointField> kNfsUpdateFolio = {
-	{"dev", offsetof(netmon_nfs_update_folio, dev), 4},
-	{"fhandle", offsetof(netmon_nfs_update_folio, fhandle), 4},
-	{"fileid", offsetof(netmon_nfs_update_folio, fileid), 8},
+inline const std::vector<TracepointField> kNfsWritepageSetup = {
+	{"dev", offsetof(netmon_nfs_writepage_setup, dev), 4},
+	{"fhandle", offsetof(netmon_nfs_writepage_setup, fhandle), 4},
+	{"fileid", offsetof(netmon_nfs_writepage_setup, fileid), 8},
+	{"offset", offsetof(netmon_nfs_writepage_setup, offset), 8},
+	{"count", offsetof(netmon_nfs_writepage_setup, count), 4},
 };
 inline const std::vector<TracepointField> kNfsWritebackDone = {
 	{"dev", offsetof(netmon_nfs_writeback_done, dev), 4},
@@ -95,12 +90,8 @@ inline TracepointLayout layout_of(const std::string &section)
 	} else if (l.event == "nfs_file_write") {
 		l.fields = &kNfsFileWrite;
 		l.group = "nfs_sent";
-	} else if (l.event == "nfs_write_end") {
-		l.fields = &kNfsWriteEnd;
-		l.group = "nfs_sent";
-		l.needs = "nfs_file_write";
-	} else if (l.event == "nfs_update_folio") {
-		l.fields = &kNfsUpdateFolio;
+	} else if (l.event == "nfs_writepage_setup") {
+		l.fields = &kNfsWritepageSetup;
 		l.group = "nfs_sent";
 		l.needs = "nfs_file_write";
 	} else if (l.event == "nfs_writeback_done") {

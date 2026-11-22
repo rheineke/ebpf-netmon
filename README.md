@@ -227,21 +227,20 @@ process's writes: what the kernel counts as the mounts' server write bytes
 fills the page cache; the client sends the dirty pages later, from a kernel
 thread (writeback, 30 s after a page was first dirtied, by default), or on
 `fsync()` or `close()`, and pages of several writers can go out in one
-`WRITE`. So netmon records each `write()`'s process (`nfs:nfs_file_write`)
-as the last writer of every MiB of the file it covers, and of the file, and
-charges each `WRITE`'s reply (`nfs:nfs_writeback_done`) to the last writer
-of the MiB it covers. Each page a `write()` fills (`nfs:nfs_write_end`)
-records it at its true position, an `O_APPEND` write's too. A store through
-a shared mapping (`nfs:nfs_update_folio`) doesn't say where in the file, so
-that process is the file's unplaced writer, charged instead of a MiB's
-writer who wrote before it; so is an `O_DIRECT` append. Processes writing
-the same file between two `WRITE`s, one through a mapping, are charged as
-the last one. `O_DIRECT` writes are sent at once; one past 64 MiB in a
-single `write()` leaves the rest to the file's last writer. On a Pi 4 the counts matched the
-kernel's to the byte, for `write()` with `fsync()`, writeback, a mapping and
-`O_DIRECT`, and for a minute of the NAS share.
+`WRITE`. So netmon records the process that dirties each page
+(`nfs:nfs_writepage_setup`, for a `write()` or a store through a shared
+mapping) as the last writer of the file's MiB at the page's position, an
+`O_APPEND` write's true one, and charges each `WRITE`'s reply
+(`nfs:nfs_writeback_done`) to the last writer of the MiB it covers.
+Processes writing the same MiB between two `WRITE`s are charged as the last
+one. `O_DIRECT` writes are sent at once, and placed by `nfs:nfs_file_write`;
+one past 64 MiB in a single `write()`, or an `O_DIRECT` `RWF_APPEND` write,
+whose position isn't known yet, leaves its bytes to the file's last writer.
+On a Pi 4 the counts matched the kernel's to the byte, for `write()` with
+`fsync()`, writeback, a mapping, `O_DIRECT`, an `O_APPEND` write and two
+writers of one file, and for a minute of the NAS share.
 
-netmon remembers 16384 entries, a MiB written each and two per file.
+netmon remembers 16384 entries, a MiB written each and one per file.
 Replies with no recorded writer, mostly pages written before netmon attached
 and sent later, are logged after its first minute: `netmon: N NFS WRITE
 replies (B bytes) found no recorded writer`. pNFS writes, which name the
