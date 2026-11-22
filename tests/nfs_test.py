@@ -9,17 +9,17 @@ with sendfile() from the page cache, then memory-mapped and with O_DIRECT,
 each after dropping its pages again. If a writable directory is given, writes
 scratch files there three ways: write() then fsync(), stores through a
 mapping then msync(), and O_DIRECT, then five that another process writes
-too: appended to with O_APPEND, stored to through a mapping, rewritten with
-O_DIRECT, and written, or stored to through a mapping, while the other's
-pages wait, both sent by this process's fsync(). It deletes them all.
-Passes when netmon's
-nfs_read and nfs_write for this process match the file bytes it read and
-wrote (read(), sendfile() and write(), not the mapped ones), nfs_fetched the
-bytes the server sent, the file once for each read but the cached one, and
-nfs_sent the bytes the server took for this process's writes only. This
-process's and the other's nfs_sent must also add up to what the kernel counts
-the server took on the directory's mount (serverwritebytes in
-/proc/self/mountstats), which nothing else may write to meanwhile.
+too: appended to with O_APPEND, stored to through a mapping, rewritten and
+appended to with O_DIRECT while the other's pages wait, and written, or
+stored to through a mapping, while the other's pages wait, both sent by this
+process's fsync(). It deletes them all. Passes when netmon's nfs_read and
+nfs_write for this process match the file bytes it read and wrote (read(),
+sendfile() and write(), not the mapped ones), nfs_fetched the bytes the
+server sent, the file once for each read but the cached one, and nfs_sent the
+bytes the server took for this process's writes only. This process's and the
+other's nfs_sent must also add up to what the kernel counts the server took
+on the directory's mount (serverwritebytes in /proc/self/mountstats), which
+nothing else may write to meanwhile.
 
 On a kernel without the nfs:nfs_file_write tracepoint, netmon can't count
 nfs_sent, and the test says so and checks the rest.
@@ -252,19 +252,30 @@ def write_beside_another(directory):
 
 
 def direct_after_another(directory):
-    """Rewrites with O_DIRECT the MiBs another process wrote and sent: the
-    server's replies are this process's, not the MiBs' earlier writer's."""
+    """Rewrites with O_DIRECT the MiBs another process wrote and holds
+    dirty: the kernel sends the other's pages first, charged to the other,
+    then this process's. Then appends with O_DIRECT and RWF_APPEND, which
+    lands mid-MiB in the other's last MiB."""
     path = scratch(directory, "direct_other")
+    other = None
     try:
-        written_by_another(path, WRITE_BYTES)
+        other = written_by_another(path, WRITE_BYTES + (512 << 10), then="hold")
         fd = os.open(path, os.O_WRONLY | os.O_DIRECT)
         try:
             with mmap.mmap(-1, WRITE_BYTES) as buf:  # page-aligned
                 buf.write(b"r" * WRITE_BYTES)
-                return os.pwritev(fd, [buf], 0)
+                n = os.pwritev(fd, [buf], 0)
+            with mmap.mmap(-1, 64 << 10) as buf:
+                buf.write(b"p" * (64 << 10))
+                n += os.pwritev(fd, [buf], 0, os.RWF_APPEND)
+            return n
         finally:
             os.close(fd)
     finally:
+        if other:
+            other.stdin.write("done\n")
+            other.stdin.close()
+            other.wait()
         os.unlink(path)
 
 

@@ -298,8 +298,11 @@ int nfs_readpage_done(const struct netmon_nfs_readpage_done *r)
  *   a page, records the process as the writer of the page's MiB, at its
  *   file position (an O_APPEND write's true one);
  * - nfs_direct_write_schedule_iovec records an O_DIRECT write()'s MiBs, at
- *   its true position, after the kernel sent the file's dirty pages; its
- *   own count is still 0 there, so nfs_file_write keeps the length;
+ *   its true position; its own count is still 0 there, so nfs_file_write
+ *   keeps the length. The kernel has sent the file's dirty pages by then,
+ *   unless the file is already in O_DIRECT mode (an O_DIRECT read or write
+ *   and no buffered one since): then pages stored through a mapping in the
+ *   write's range go out after it and are charged to the O_DIRECT writer;
  * - nfs_file_write records every write()'s process as the file's writer,
  *   the fallback for a MiB with none recorded (pages written before netmon
  *   attached, or past an O_DIRECT write's first 64 MiB).
@@ -329,22 +332,32 @@ struct {
 
 /*
  * IOCB_DIRECT in kiocb.ki_flags (include/linux/fs.h, 6.18 and 7.0). Were
- * it renumbered, O_DIRECT writes would go to the file's writer, and
- * nfs_test's direct_after_another case would fail.
+ * it renumbered, O_DIRECT writes would go to each MiB's earlier writer,
+ * else the file's, and nfs_test's direct_after_another case would fail.
  */
 #define NETMON_IOCB_DIRECT (1 << 17)
 
+/* An O_DIRECT write() between nfs_file_write and schedule_iovec. */
+struct nfs_direct_pending {
+	__u64 fileid;
+	__u64 len;
+	__u32 dev;
+	__u32 fhandle;
+};
+
 /*
- * An O_DIRECT write()'s length, by thread, from nfs_file_write to
+ * O_DIRECT write()s by thread, from nfs_file_write to
  * nfs_direct_write_schedule_iovec in the same thread (an io_uring worker's
- * too). A write() that fails between them leaves its length for the
- * thread's next O_DIRECT write() to replace.
+ * too). The length is the one asked for: a write() a file size limit cuts
+ * short claims its whole range. One that fails between the two events
+ * leaves its entry, used only for the same file, until the thread's next
+ * O_DIRECT write() replaces it.
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__uint(max_entries, 1024);
 	__type(key, __u64);
-	__type(value, __u64);
+	__type(value, struct nfs_direct_pending);
 } nfs_direct_len SEC(".maps");
 
 static __always_inline void current_writer(struct nfs_writer *w)
@@ -398,8 +411,12 @@ int nfs_file_write_start(const struct netmon_nfs_file_write *r)
 	set_writer(&key, &w);
 	if (r->flags & NETMON_IOCB_DIRECT) {
 		__u64 tid = bpf_get_current_pid_tgid();
-		__u64 len = r->count;
-		bpf_map_update_elem(&nfs_direct_len, &tid, &len, BPF_ANY);
+		struct nfs_direct_pending p = {};
+		p.fileid = r->fileid;
+		p.len = r->count;
+		p.dev = r->dev;
+		p.fhandle = r->fhandle;
+		bpf_map_update_elem(&nfs_direct_len, &tid, &p, BPF_ANY);
 	}
 	return 0;
 }
@@ -408,11 +425,16 @@ SEC("tracepoint/nfs/nfs_direct_write_schedule_iovec")
 int nfs_direct_write(const struct netmon_nfs_direct_write *r)
 {
 	__u64 tid = bpf_get_current_pid_tgid();
-	__u64 *found = bpf_map_lookup_elem(&nfs_direct_len, &tid);
+	struct nfs_direct_pending *found =
+		bpf_map_lookup_elem(&nfs_direct_len, &tid);
 	if (!found)
 		return 0; /* swap over NFS, or a write() before attach */
-	__u64 len = *found;
+	__u64 len = found->len;
+	int same = found->fileid == r->fileid && found->dev == r->dev &&
+		   found->fhandle == r->fhandle;
 	bpf_map_delete_elem(&nfs_direct_len, &tid);
+	if (!same)
+		return 0; /* left by a failed write() to another file */
 	struct nfs_writer w = {};
 	current_writer(&w);
 	struct netmon_nfs_write_key key = {};

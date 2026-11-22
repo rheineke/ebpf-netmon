@@ -235,10 +235,13 @@ mapping) as the last writer of the file's MiB at the page's position, an
 Processes writing the same MiB between two `WRITE`s are charged as the last
 one, and a MiB's writer stays its writer until another writes it. `O_DIRECT`
 writes are sent at once, placed by `nfs:nfs_direct_write_schedule_iovec`
-after the kernel sends the file's dirty pages; past 64 MiB in one `write()`,
-the rest goes to each MiB's earlier writer, else the file's last writer
-(`nfs:nfs_file_write`). Pages written before netmon attached go to the
-file's next writer, if it has one.
+after the kernel sends the file's dirty pages, at the length the `write()`
+asked for; past 64 MiB in one `write()`, the rest goes to each MiB's
+earlier writer, else the file's last writer (`nfs:nfs_file_write`). A file
+already in `O_DIRECT` mode (an `O_DIRECT` read or write, and no buffered one
+since) isn't flushed first: pages stored through a mapping in the write's
+range go out after it, charged to the `O_DIRECT` writer. Pages written
+before netmon attached go to the file's next writer, if it has one.
 On a Pi 4 the counts matched the kernel's to the byte, for `write()` with
 `fsync()`, writeback, a mapping, `O_DIRECT`, an `O_APPEND` write and two
 writers of one file, and for a minute of the NAS share.
@@ -248,7 +251,8 @@ Replies with no writer recorded for the MiB or the file, mostly pages
 written before netmon attached and sent later, are logged after its first
 minute: `netmon: N NFS WRITE
 replies (B bytes) found no recorded writer`. pNFS writes, which name the
-data server's file handle, and swap over NFS never have one.
+data server's file handle, never have one, and swap over NFS has one only
+if netmon saw its swap file written.
 `nfs:nfs_file_write` and `nfs:nfs_writepage_setup` are new in kernel 6.18
 (the Raspberry Pi's kernel, and CI's 7.0); without them netmon doesn't count
 `NFS_SENT`, and leaves `nfs_sent` out of its files, so it is null.
